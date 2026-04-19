@@ -469,9 +469,8 @@ def run_monitor():
                         "first_seen":  ad["found_at"],
                     }
 
-                browser.stealth_get(ad["real_url"])
-                time.sleep(random.uniform(12, 20))
-                bypass_consent(driver)
+                link = driver.find_element(By.CSS_SELECTOR, f"a[href='{ad["real_url"]}']")
+                browser.bezier_move_to(link)  # человекоподобный клик
 
             if not ads:
                 logging.info("  (реклама не найдена)")
