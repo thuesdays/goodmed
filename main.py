@@ -468,8 +468,9 @@ def run_monitor():
                         "queries":     [query],
                         "first_seen":  ad["found_at"],
                     }
-
-                link = driver.find_element(By.CSS_SELECTOR, f"a[href='{ad["real_url"]}']")
+                url = ad["real_url"]
+                link = driver.find_element(By.CSS_SELECTOR, f"a[href='{url}']")
+                logging.info("Заходим на рекламу конкурента.")
                 browser.bezier_move_to(link)  # человекоподобный клик
 
             if not ads:
