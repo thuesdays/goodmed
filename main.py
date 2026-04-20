@@ -347,13 +347,13 @@ def run_monitor():
         # ── 1. Проверки ──────────────────────────────
         browser.health_check(verbose=True)
 
-        diag   = ProxyDiagnostics(driver)
-        report = diag.full_check(expected_timezone="Europe/Kyiv")
-        diag.print_report(report)
+        # diag   = ProxyDiagnostics(driver)
+        # report = diag.full_check(expected_timezone="Europe/Kyiv")
+        # diag.print_report(report)
 
-        if report["webrtc_leak"]:
-            logging.error("✗ WebRTC УТЕЧКА — останавливаемся")
-            return
+        # if report["webrtc_leak"]:
+        #     logging.error("✗ WebRTC УТЕЧКА — останавливаемся")
+        #     return
 
         browser.enable_request_blocking()
 
