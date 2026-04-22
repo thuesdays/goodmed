@@ -1,0 +1,52 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Competitors</div>
+      <div class="page-subtitle">All collected ad URLs (from the competitors table)</div>
+    </div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-label">Total records</div>
+      <div class="stat-value" id="comp-total">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Unique domains</div>
+      <div class="stat-value" id="comp-domains">—</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">By domain (aggregated)</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th>Mentions</th>
+          <th>Matched queries</th>
+          <th>First seen</th>
+          <th>Last seen</th>
+        </tr>
+      </thead>
+      <tbody id="competitors-tbody"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      Recent records <span class="badge" id="recent-badge">0</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Query</th>
+          <th>Domain</th>
+          <th>Google click URL</th>
+        </tr>
+      </thead>
+      <tbody id="recent-tbody"></tbody>
+    </table>
+  </div>
+</section>

@@ -1,15 +1,17 @@
 """
-session_quality.py — Мониторинг качества сессии профиля
+session_quality.py — Profile session health monitor
 
-Отслеживает метрики которые показывают насколько профиль "сгорел":
-- Частота капчи при запросах
-- Успешность поисков (находит результаты или пусто)
-- Время до результата
+Tracks metrics that show whether a profile is "burned":
+- Captcha frequency
+- Search success rate (finds results or empty)
+- Time to results
 - Consecutive failures
 
-На основе этих метрик профиль может быть помечен как "деградировавший"
-и пересоздан. Это то что делает профили у Dolphin долгоживущими —
-они следят за здоровьем и вовремя меняют отпечаток.
+Writes events to BOTH legacy JSON file AND the SQLite database (events table).
+
+Based on these metrics, a profile can be marked as "degraded" and
+recreated. This is what makes Dolphin-style profiles long-lived — they
+monitor health and swap fingerprint before it's too late.
 """
 
 import os
@@ -21,9 +23,9 @@ from dataclasses import dataclass, field, asdict
 
 @dataclass
 class SessionMetric:
-    """Одна запись метрики"""
+    """Single metric record"""
     timestamp:     str
-    event:         str          # "search_ok" | "captcha" | "search_fail" | "blocked"
+    event:         str   # search_ok | search_empty | captcha | captcha_solved | blocked | search_fail
     query:         str = ""
     results_count: int = 0
     duration_sec:  float = 0.0
@@ -32,82 +34,114 @@ class SessionMetric:
 
 class SessionQualityMonitor:
     """
-    Использование:
+    Usage:
         sqm = SessionQualityMonitor(browser.user_data_path)
 
-        # В цикле поиска
+        # In search loop
         sqm.record("search_ok", query=query, results_count=len(results))
         sqm.record("captcha", query=query)
 
-        # В начале запуска
-        health = sqm.get_health()
-        if health["status"] == "critical":
-            logging.warning("Профиль деградировал — пора пересоздавать")
+        # Before next run
+        should_abort, reason = sqm.should_abort()
+        if should_abort:
+            # recreate profile or switch IP
+            ...
+
+    Thresholds (softer than before to avoid premature blocking):
+        WARNING_CAPTCHA_RATE   = 0.30  (30% captcha in 24h → warning)
+        CRITICAL_CAPTCHA_RATE  = 0.70  (70% captcha in 24h → critical)
+        CRITICAL_BLOCKED_IN_ROW = 5    (5 consecutive blocks → critical)
+        MIN_SEARCHES_FOR_JUDGE  = 10   (need at least 10 searches before judging)
     """
 
-    # Пороги для определения статуса
-    CRITICAL_CAPTCHA_RATE = 0.5   # 50%+ капчи за последние 24ч → critical
-    WARNING_CAPTCHA_RATE  = 0.2   # 20%+ капчи → warning
-    CRITICAL_BLOCKED_IN_ROW = 3   # 3 блокировки подряд → critical
+    # Thresholds
+    CRITICAL_CAPTCHA_RATE   = 0.70   # 70%+ captcha in 24h → critical
+    WARNING_CAPTCHA_RATE    = 0.30   # 30%+ captcha → warning
+    CRITICAL_BLOCKED_IN_ROW = 5      # 5 blocks in a row → critical
+    MIN_SEARCHES_FOR_JUDGE  = 10     # need this many searches before we judge
 
     def __init__(self, profile_path: str):
         self.profile_path = profile_path
         self.metrics_file = os.path.join(profile_path, "session_quality.json")
-        self._metrics     = self._load()
+        self._metrics: list[dict] = []
+        self._load()
 
     # ──────────────────────────────────────────────────────────
-    # IO
+    # PERSISTENCE
     # ──────────────────────────────────────────────────────────
 
-    def _load(self) -> list[dict]:
-        if not os.path.exists(self.metrics_file):
-            return []
-        try:
-            with open(self.metrics_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+    def _load(self):
+        if os.path.exists(self.metrics_file):
+            try:
+                with open(self.metrics_file, "r", encoding="utf-8") as f:
+                    self._metrics = json.load(f)
+            except Exception as e:
+                logging.warning(f"[SessionQuality] Load error: {e}")
+                self._metrics = []
 
     def _save(self):
         try:
-            # Храним только последние 1000 записей
-            self._metrics = self._metrics[-1000:]
+            os.makedirs(os.path.dirname(self.metrics_file), exist_ok=True)
             with open(self.metrics_file, "w", encoding="utf-8") as f:
                 json.dump(self._metrics, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logging.debug(f"[SessionQuality] save: {e}")
+            logging.warning(f"[SessionQuality] Save error: {e}")
 
     # ──────────────────────────────────────────────────────────
-    # ЗАПИСЬ
+    # RECORDING EVENTS
     # ──────────────────────────────────────────────────────────
 
     def record(self, event: str, **kwargs):
         """
-        Регистрирует событие. Доступные event:
-        - search_ok: успешный поиск (results_count)
-        - search_empty: поиск без результатов
-        - captcha: появилась капча
-        - captcha_solved: капча решена
-        - blocked: IP/профиль заблокирован Google
-        - search_fail: ошибка поиска (details)
+        Register event. Supported types:
+        - search_ok:      successful search with results
+        - search_empty:   search returned no ads
+        - captcha:        captcha page appeared
+        - captcha_solved: captcha was solved successfully
+        - blocked:        IP/profile blocked by Google (hard)
+        - search_fail:    search failed (unrelated error)
+
+        Writes to BOTH legacy JSON file AND SQLite DB.
         """
         metric = SessionMetric(
-            timestamp=datetime.now().isoformat(timespec="seconds"),
-            event=event,
-            query=kwargs.get("query", ""),
-            results_count=kwargs.get("results_count", 0),
-            duration_sec=kwargs.get("duration_sec", 0.0),
-            details=kwargs.get("details", ""),
+            timestamp     = datetime.now().isoformat(timespec="seconds"),
+            event         = event,
+            query         = kwargs.get("query", ""),
+            results_count = kwargs.get("results_count", 0),
+            duration_sec  = kwargs.get("duration_sec", 0.0),
+            details       = kwargs.get("details", ""),
         )
         self._metrics.append(asdict(metric))
         self._save()
 
+        # Also write to SQLite (events table) — primary store for dashboard
+        try:
+            from db import get_db
+            run_id = None
+            try:
+                run_id = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
+            except Exception:
+                pass
+
+            profile_name = os.path.basename(self.profile_path.rstrip(os.sep))
+            get_db().event_record(
+                run_id        = run_id,
+                profile_name  = profile_name,
+                event_type    = event,
+                query         = metric.query or None,
+                details       = metric.details or None,
+                duration_sec  = metric.duration_sec,
+                results_count = metric.results_count,
+            )
+        except Exception as e:
+            logging.debug(f"[SessionQuality] DB write failed: {e}")
+
     # ──────────────────────────────────────────────────────────
-    # АНАЛИЗ ЗДОРОВЬЯ
+    # HEALTH ANALYSIS
     # ──────────────────────────────────────────────────────────
 
     def _metrics_within(self, hours: int) -> list[dict]:
-        """Метрики за последние N часов"""
+        """Return metrics from last N hours"""
         threshold = datetime.now() - timedelta(hours=hours)
         result = []
         for m in self._metrics:
@@ -121,27 +155,22 @@ class SessionQualityMonitor:
 
     def get_health(self) -> dict:
         """
-        Возвращает здоровье профиля:
-        - status: "healthy" | "warning" | "critical"
-        - captcha_rate_24h: доля запросов где была капча
-        - consecutive_blocks: блокировок подряд
-        - total_searches: всего поисков
-        - recommendations: что делать
+        Returns profile health:
+        - status: healthy | warning | critical
+        - various rates and counts
+        - recommendations list
         """
         recent_24h = self._metrics_within(24)
         recent_1h  = self._metrics_within(1)
 
-        # Базовые счётчики
-        searches   = sum(1 for m in recent_24h if m["event"] in ("search_ok", "search_empty"))
-        captchas   = sum(1 for m in recent_24h if m["event"] == "captcha")
-        blocks     = sum(1 for m in recent_24h if m["event"] == "blocked")
-        empty      = sum(1 for m in recent_24h if m["event"] == "search_empty")
+        searches = sum(1 for m in recent_24h if m["event"] in ("search_ok", "search_empty"))
+        captchas = sum(1 for m in recent_24h if m["event"] == "captcha")
+        empty    = sum(1 for m in recent_24h if m["event"] == "search_empty")
+        total    = searches + captchas
 
-        # Captcha rate
-        total_requests = searches + captchas + blocks
-        captcha_rate   = captchas / total_requests if total_requests > 0 else 0
+        captcha_rate = captchas / total if total > 0 else 0
 
-        # Consecutive блокировки (с конца)
+        # Consecutive blocks (from the end of metrics list)
         consecutive_blocks = 0
         for m in reversed(self._metrics):
             if m["event"] == "blocked":
@@ -149,43 +178,43 @@ class SessionQualityMonitor:
             elif m["event"] in ("search_ok",):
                 break
 
-        # Captcha rate за последний час — более чувствительно
+        # Captcha rate in last hour
         recent_searches_1h = sum(1 for m in recent_1h if m["event"] in ("search_ok", "search_empty"))
         recent_captchas_1h = sum(1 for m in recent_1h if m["event"] == "captcha")
         recent_total_1h    = recent_searches_1h + recent_captchas_1h
         captcha_rate_1h    = recent_captchas_1h / recent_total_1h if recent_total_1h > 0 else 0
 
-        # Определяем статус
+        # Determine status
         status = "healthy"
         recommendations = []
 
         if consecutive_blocks >= self.CRITICAL_BLOCKED_IN_ROW:
             status = "critical"
             recommendations.append(
-                f"⛔ {consecutive_blocks} блокировок подряд — пересоздай профиль"
+                f"{consecutive_blocks} consecutive blocks — recreate profile or switch IP"
             )
-        elif captcha_rate >= self.CRITICAL_CAPTCHA_RATE:
+        elif total >= self.MIN_SEARCHES_FOR_JUDGE and captcha_rate >= self.CRITICAL_CAPTCHA_RATE:
             status = "critical"
             recommendations.append(
-                f"⛔ Капча в {captcha_rate:.0%} запросов за 24ч — профиль сгорел"
+                f"Captcha in {captcha_rate:.0%} of searches (24h) — profile burned"
             )
-        elif captcha_rate_1h >= self.CRITICAL_CAPTCHA_RATE and recent_total_1h >= 5:
+        elif recent_total_1h >= 10 and captcha_rate_1h >= self.CRITICAL_CAPTCHA_RATE:
             status = "critical"
             recommendations.append(
-                f"⛔ Внезапный всплеск капчи: {captcha_rate_1h:.0%} за час"
+                f"Sudden captcha spike: {captcha_rate_1h:.0%} in the last hour"
             )
-        elif captcha_rate >= self.WARNING_CAPTCHA_RATE:
+        elif total >= self.MIN_SEARCHES_FOR_JUDGE and captcha_rate >= self.WARNING_CAPTCHA_RATE:
             status = "warning"
             recommendations.append(
-                f"⚠ Повышенная капча {captcha_rate:.0%} — сделай паузу на 30+ минут"
+                f"Elevated captcha rate {captcha_rate:.0%} — consider a 30-minute break"
             )
 
-        # Пустые результаты — возможно soft-block
-        if searches > 5 and empty / searches >= 0.8:
+        # Empty results — possible soft-block
+        if searches >= 10 and empty / searches >= 0.9:
             if status == "healthy":
                 status = "warning"
             recommendations.append(
-                f"⚠ {empty}/{searches} поисков пустые — возможен soft-block"
+                f"{empty}/{searches} searches returned empty — possible soft-block"
             )
 
         return {
@@ -203,42 +232,74 @@ class SessionQualityMonitor:
     def print_report(self):
         health = self.get_health()
 
-        icons = {"healthy": "✓", "warning": "⚠", "critical": "⛔"}
+        icons = {"healthy": "OK", "warning": "WARN", "critical": "CRIT"}
         icon  = icons.get(health["status"], "?")
 
-        print("\n" + "═" * 60)
-        print(f" ЗДОРОВЬЕ ПРОФИЛЯ  {icon}  {health['status'].upper()}")
-        print("═" * 60)
-        print(f" Поисков за 24ч:       {health['total_searches_24h']}")
-        print(f" Капч за 24ч:          {health['total_captchas_24h']}")
-        print(f" Rate капчи (24ч):     {health['captcha_rate_24h']:.1%}")
-        print(f" Rate капчи (1ч):      {health['captcha_rate_1h']:.1%}")
-        print(f" Пустых результатов:   {health['empty_results_24h']}")
-        print(f" Блокировок подряд:    {health['consecutive_blocks']}")
-        print(f" Записей в истории:    {health['total_in_log']}")
+        print("\n" + "=" * 60)
+        print(f" PROFILE HEALTH  [{icon}]  {health['status'].upper()}")
+        print("=" * 60)
+        print(f" Searches in 24h:     {health['total_searches_24h']}")
+        print(f" Captchas in 24h:     {health['total_captchas_24h']}")
+        print(f" Captcha rate 24h:    {health['captcha_rate_24h']:.1%}")
+        print(f" Captcha rate 1h:     {health['captcha_rate_1h']:.1%}")
+        print(f" Empty results 24h:   {health['empty_results_24h']}")
+        print(f" Consecutive blocks:  {health['consecutive_blocks']}")
+        print(f" Total records:       {health['total_in_log']}")
 
         if health["recommendations"]:
-            print("\n Рекомендации:")
+            print("\n Recommendations:")
             for rec in health["recommendations"]:
-                print(f"   {rec}")
-        print("═" * 60 + "\n")
+                print(f"   - {rec}")
+        print("=" * 60 + "\n")
 
     # ──────────────────────────────────────────────────────────
-    # УПРАВЛЕНИЕ
+    # CONTROL
     # ──────────────────────────────────────────────────────────
 
     def should_abort(self) -> tuple[bool, str]:
         """
-        Возвращает (should_abort, reason). True если следует остановить
-        работу на этом профиле прямо сейчас.
+        Returns (should_abort, reason).
+        True only if profile is DEFINITELY burned — be conservative to avoid
+        false positives on the first runs (when statistics are tiny).
+
+        Rules (conservative):
+        - Need at least MIN_SEARCHES_FOR_JUDGE searches before we can judge
+          captcha rate
+        - Consecutive blocks need to reach CRITICAL_BLOCKED_IN_ROW (5 now)
+        - "blocked" event is created only when captcha is NOT SOLVED, so
+          3-5 such events in a row is genuinely bad
         """
         health = self.get_health()
-        if health["status"] == "critical":
-            return True, health["recommendations"][0] if health["recommendations"] else "critical status"
-        return False, ""
+
+        # Only abort on hard critical
+        if health["status"] != "critical":
+            return False, ""
+
+        # If it's the very first session — no data yet, never abort
+        if health["total_in_log"] < 3:
+            return False, ""
+
+        return True, health["recommendations"][0] if health["recommendations"] else "critical status"
 
     def clear(self):
-        """Сбрасывает всю историю (например после пересоздания профиля)"""
+        """Reset history — after profile recreation"""
         self._metrics = []
         self._save()
-        logging.info("[SessionQuality] История очищена")
+        logging.info("[SessionQuality] History cleared")
+
+    def reset_consecutive_blocks(self):
+        """
+        Adds a synthetic 'search_ok' marker at the end to break the
+        chain of consecutive blocks. Useful when you know the root cause
+        (e.g. forgot to configure proxy) has been fixed.
+        """
+        self._metrics.append({
+            "timestamp":     datetime.now().isoformat(timespec="seconds"),
+            "event":         "search_ok",
+            "query":         "",
+            "results_count": 0,
+            "duration_sec":  0.0,
+            "details":       "manual_reset_marker",
+        })
+        self._save()
+        logging.info("[SessionQuality] Consecutive blocks reset")

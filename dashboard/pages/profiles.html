@@ -1,0 +1,108 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Profiles</div>
+      <div class="page-subtitle">All browser profiles — create, start, inspect, manage</div>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-primary" id="btn-create-profile">
+        <span>✨</span> Create profile
+      </button>
+      <div class="column-picker">
+        <button class="btn btn-secondary" id="column-picker-btn">Columns ▾</button>
+        <div class="column-picker-dropdown" id="column-picker-dropdown" style="display:none;"></div>
+      </div>
+      <button class="btn btn-secondary" id="reload-profiles-btn">↻ Reload</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="profiles-toolbar">
+      <input type="text" class="profiles-search" id="profiles-search"
+             placeholder="Search profile name…">
+      <div style="margin-left: auto; color: var(--text-muted); font-size: 12px;">
+        <span id="profiles-count">0</span> profile(s)
+      </div>
+    </div>
+    <table>
+      <thead id="profiles-thead"></thead>
+      <tbody id="profiles-tbody"></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ─── CREATE PROFILE MODAL ──────────────────────────────────── -->
+<div class="profile-modal" id="profile-create-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="profile-create-modal"></div>
+  <div class="profile-modal-content">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">✨ Create new profile</div>
+      <button class="profile-modal-close" data-close="profile-create-modal">×</button>
+    </div>
+
+    <div class="profile-modal-body">
+      <!-- Name + template -->
+      <div class="form-group">
+        <label class="form-label">Profile name</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" class="input" id="np-name" placeholder="profile_02" style="flex: 1;">
+          <button class="btn btn-secondary" id="np-name-random" title="Generate random name">🎲</button>
+        </div>
+        <div class="form-hint">Unique identifier. Used as folder name and SHA256 seed for fingerprint.</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Device template</label>
+        <select class="select" id="np-template">
+          <option value="auto">Auto (random from all)</option>
+          <!-- populated by JS -->
+        </select>
+        <div class="form-hint">
+          Determines the pool of plausible UA / screen / GPU / fonts.
+          "Auto" picks one randomly so each profile looks different.
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Preferred language</label>
+        <select class="select" id="np-language">
+          <option value="uk-UA">Ukrainian (uk-UA)</option>
+          <option value="ru-RU">Russian (ru-RU)</option>
+          <option value="en-US">English (en-US)</option>
+          <option value="pl-PL">Polish (pl-PL)</option>
+        </select>
+      </div>
+
+      <!-- Preview of generated fingerprint -->
+      <div class="form-group">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <label class="form-label" style="margin: 0;">Fingerprint preview</label>
+          <button class="btn btn-secondary btn-small" id="np-preview-btn">
+            🔮 Preview
+          </button>
+        </div>
+        <div class="fingerprint-preview" id="np-preview-panel" style="display: none;"></div>
+      </div>
+
+      <!-- Options -->
+      <div class="form-group">
+        <div class="checkbox-row">
+          <input type="checkbox" id="np-enrich" checked>
+          <label for="np-enrich">
+            Enrich on first run (history, bookmarks, top sites)
+            <span class="badge-recommended">recommended</span>
+          </label>
+        </div>
+        <div class="form-hint">
+          Seeds a realistic browsing history. Without this, first visit to Google
+          looks like a brand-new browser (detection signal).
+        </div>
+      </div>
+    </div>
+
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="profile-create-modal">Cancel</button>
+      <button class="btn btn-primary" id="np-create-btn">Create profile</button>
+    </div>
+  </div>
+</div>

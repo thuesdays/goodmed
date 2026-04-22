@@ -1,0 +1,73 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Profile detail</div>
+      <div class="page-subtitle">Selected profile's fingerprint and health</div>
+    </div>
+    <select class="select" id="profile-selector" style="width: 240px;"></select>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Main settings (active profile)</div>
+    <div class="form-group">
+      <label class="form-label">Chromium binary path</label>
+      <input type="text" class="input" data-config="browser.binary_path"
+             placeholder="chrome-win64/chrome.exe">
+      <div class="form-hint">
+        Relative or absolute path to your Chromium build with C++ patches.
+        Default: <code>chrome-win64/chrome.exe</code> (looks in the project folder).
+      </div>
+    </div>
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">Active profile name</label>
+        <input type="text" class="input" data-config="browser.profile_name">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Preferred language</label>
+        <input type="text" class="input" data-config="browser.preferred_language"
+               placeholder="uk-UA">
+      </div>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-auto-session" data-config="browser.auto_session">
+      <label for="cfg-auto-session">Auto save/restore session</label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-enrich" data-config="browser.enrich_on_create">
+      <label for="cfg-enrich">Enrich new profiles with fake history/bookmarks</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      Self-check <span class="badge" id="selfcheck-badge">—</span>
+      <div style="margin-left: auto; display: flex; gap: 8px;">
+        <button class="btn btn-secondary" id="reset-health-btn"
+                style="font-size: 11px; padding: 6px 12px;">Reset blocks</button>
+        <button class="btn btn-secondary" id="clear-history-btn"
+                style="font-size: 11px; padding: 6px 12px;">Clear history</button>
+        <button class="btn btn-danger" id="delete-profile-btn"
+                style="font-size: 11px; padding: 6px 12px;">Delete profile</button>
+      </div>
+    </div>
+    <div id="selfcheck-time" class="muted" style="margin-bottom: 12px;"></div>
+    <div class="selfcheck-grid" id="selfcheck-grid"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      Current fingerprint (payload)
+      <div style="margin-left: auto;">
+        <button class="btn btn-primary btn-small" id="regen-fp-btn">
+          🎲 Regenerate fingerprint
+        </button>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Generates a fresh deterministic fingerprint using a new seed. Useful when
+      the current one is flagged. Old fingerprint is <strong>overwritten</strong>.
+    </div>
+    <pre class="json-view" id="fingerprint-view">Loading...</pre>
+  </div>
+</section>

@@ -1,4 +1,11 @@
+# Ghost Shell Browser — dependencies
+
 undetected-chromedriver>=3.5.5
 selenium>=4.15.0
 requests>=2.31.0
 PyYAML>=6.0
+psutil>=5.9.0                    # watchdog PID discovery
+
+# Dashboard
+flask>=3.0.0
+flask-cors>=4.0.0

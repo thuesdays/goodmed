@@ -1,0 +1,133 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Scheduler</div>
+      <div class="page-subtitle">
+        Automatic monitoring runs across selected profiles
+      </div>
+    </div>
+    <div class="btn-group">
+      <button class="btn btn-secondary" id="sched-refresh-btn">↻ Refresh</button>
+      <button class="btn" id="sched-start-btn" style="background: var(--healthy);">
+        <span>▶</span> <span>Start scheduler</span>
+      </button>
+      <button class="btn btn-danger" id="sched-stop-btn" style="display:none;">
+        <span>■</span> <span>Stop scheduler</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Status card -->
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-label">Status</div>
+      <div class="stat-value" id="sched-status-value">—</div>
+      <div class="stat-delta" id="sched-status-sub">idle</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Runs today</div>
+      <div class="stat-value" id="sched-runs-today">—</div>
+      <div class="stat-delta" id="sched-runs-target">of target</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Next run at</div>
+      <div class="stat-value" id="sched-next-run" style="font-size: 20px;">—</div>
+      <div class="stat-delta" id="sched-next-in">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Last profile</div>
+      <div class="stat-value" id="sched-last-profile" style="font-size: 20px;">—</div>
+    </div>
+  </div>
+
+  <!-- Profile selection -->
+  <div class="card">
+    <div class="card-title">
+      Profiles to cycle through
+      <span class="badge" id="sched-profile-count">0</span>
+    </div>
+    <div class="muted" style="margin-bottom: 14px;">
+      Check the profiles you want the scheduler to run. Leave empty to use
+      the single "active profile" from Profile detail page. Each iteration
+      picks one profile according to the selection mode below.
+    </div>
+    <div id="sched-profiles-list"
+         style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px;">
+    </div>
+
+    <div class="form-group" style="margin-top: 18px;">
+      <label class="form-label">Selection mode</label>
+      <select class="select" data-config="scheduler.selection_mode" style="max-width: 240px;">
+        <option value="random">Random (more natural)</option>
+        <option value="round-robin">Round-robin (even distribution)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- Schedule settings -->
+  <div class="card">
+    <div class="card-title">Schedule</div>
+    <div class="input-row-3">
+      <div class="form-group">
+        <label class="form-label">Runs per day</label>
+        <input type="number" class="input"
+               data-config="scheduler.target_runs_per_day" min="1" max="500">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Active hour start</label>
+        <input type="number" class="input"
+               data-config="scheduler.active_hours.0" min="0" max="23">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Active hour end</label>
+        <input type="number" class="input"
+               data-config="scheduler.active_hours.1" min="1" max="24">
+      </div>
+    </div>
+    <div class="input-row-3">
+      <div class="form-group">
+        <label class="form-label">Min gap (sec)</label>
+        <input type="number" class="input"
+               data-config="scheduler.min_interval_sec" min="30">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Max gap (sec)</label>
+        <input type="number" class="input"
+               data-config="scheduler.max_interval_sec" min="60">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Extra jitter (%)</label>
+        <input type="number" class="input"
+               data-config="scheduler.jitter_percent" min="0" max="100">
+      </div>
+    </div>
+    <div class="form-hint">
+      Base interval = remaining time in window / remaining runs. It gets a
+      50–150% base randomization, then an extra <code>±jitter%</code> on top.
+      With 30 runs between 07:00–20:00 the average gap is ~26 min; with 25%
+      extra jitter each actual gap lands in ~10 min – 60 min.
+    </div>
+  </div>
+
+  <!-- Failure handling -->
+  <div class="card">
+    <div class="card-title">Failure handling</div>
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">Max consecutive fails</label>
+        <input type="number" class="input"
+               data-config="scheduler.max_consecutive_fails" min="1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Long pause (sec) after threshold</label>
+        <input type="number" class="input"
+               data-config="scheduler.fail_pause_sec" min="60">
+      </div>
+    </div>
+    <div class="form-hint">
+      After N consecutive runs exit with non-zero code, scheduler sleeps
+      for the long pause duration. Between 1 and N-1 consecutive fails an
+      exponential backoff (×2, ×4, ×8…) is applied to the interval.
+    </div>
+  </div>
+</section>

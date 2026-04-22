@@ -1,19 +1,29 @@
 """
-main.py — Мониторинг контекстной рекламы конкурентов по брендовым запросам
+main.py — Competitor ad monitoring via Ghost Shell browser
 
-Стратегия:
-1. Открываем браузер (с обязательной init-навигацией в start() для активации инъекций)
-2. Идём на google.com СНАЧАЛА (тёплый сайт, проверяем сеть, решаем consent/captcha)
-3. Для каждого запроса — открываем stealth_get с прямым URL поиска с
-   параметрами &gl=ua&hl=uk — реклама появляется СРАЗУ
-4. Если рекламы нет — refresh-loop: обновляем каждые 10-15с до появления
-   (макс N попыток)
-5. Собираем domain/title/clean_url/google_click_url
-6. ВСЕ google_click_url (кроме нашего домена) — пишем в append-файл
-7. В конце — JSON + CSV отчёт
+Simplified flow (trusting custom Chromium C++ patches):
+  1. First run only: inject Google consent cookies for instant trust
+  2. For each query from config:
+     - Open google.com/search?q=<query>&gl=ua&hl=uk directly (no form typing)
+     - Wait for SERP to render
+     - Parse ad blocks (TreeWalker JS)
+     - For each ad: run configured post_ad actions (visit domain, dwell, scroll)
+     - Save everything to SQLite
+  3. Save session on exit (cookies + localStorage)
+  4. Next run: restore session, start from step 2 (no warmup needed)
+
+Custom actions are defined in config.actions.post_ad as a list of dicts:
+  [
+    {type: "visit",   probability: 0.3,  dwell_min: 5, dwell_max: 15},
+    {type: "scroll",  min_scrolls: 1, max_scrolls: 3},
+    {type: "back",    delay_sec: 2}
+  ]
+
+On matched target_domains, the actions.on_target_domain list is used instead.
 """
 
 import os
+import sys
 import re
 import time
 import random
@@ -23,41 +33,72 @@ import requests
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 from ghost_shell_browser import GhostShellBrowser
 from proxy_diagnostics import ProxyDiagnostics
 from session_quality import SessionQualityMonitor
-from tab_manager import TabManager
 from config import Config
-from stealth_improvements import QueryRateLimiter, interact_with_serp
+from db import get_db
+from log_banners import (
+    log_run_start, log_run_end, log_query_result,
+    log_payload_summary, log_step, log_error_banner,
+)
+
 
 # ──────────────────────────────────────────────────────────────
-# КОНФИГУРАЦИЯ — загружаем из config.yaml (с fallback defaults)
+# Configuration — read from DB
 # ──────────────────────────────────────────────────────────────
 
-CFG = Config.load("config.yaml")
+CFG = Config.load()
+DB  = get_db()
 
-SEARCH_QUERIES     = CFG.get("search.queries")
-MY_DOMAINS         = CFG.get("search.my_domains")
-TWOCAPTCHA_API_KEY = CFG.get("captcha.twocaptcha_key", "")
-PROXY              = CFG.get("proxy.url")
-PROFILE_NAME       = CFG.get("browser.profile_name")
-IS_ROTATING_PROXY  = CFG.get("proxy.is_rotating", True)
-ROTATION_API_URL   = CFG.get("proxy.rotation_api_url")
+SEARCH_QUERIES       = CFG.get("search.queries")
+MY_DOMAINS           = CFG.get("search.my_domains", [])
+TARGET_DOMAINS       = CFG.get("search.target_domains", [])
 
-# Параметры refresh-loop для поиска рекламы
-REFRESH_MIN_SEC       = 10   # минимум между обновлениями
-REFRESH_MAX_SEC       = 15   # максимум
-REFRESH_MAX_ATTEMPTS  = 4    # максимум обновлений на один запрос
+# Proxy selection — pool with random pick or single URL
+PROXY_USE_POOL       = CFG.get("proxy.use_pool", False)
+PROXY_POOL_URLS      = CFG.get("proxy.pool_urls", []) or []
+PROXY_SINGLE         = CFG.get("proxy.url", "")
 
-# Файл куда пишутся ВСЕ google_click_url кроме нашего домена
-COMPETITOR_URLS_FILE  = "competitor_urls.txt"
+if PROXY_USE_POOL and PROXY_POOL_URLS:
+    PROXY = random.choice([p for p in PROXY_POOL_URLS if p.strip()])
+    logging.info(f"[main] Picked random proxy from pool: {PROXY[:50]}...")
+else:
+    PROXY = PROXY_SINGLE
 
-import sys
+PROFILE_NAME         = os.environ.get("GHOST_SHELL_PROFILE") or CFG.get("browser.profile_name")
+IS_ROTATING_PROXY    = CFG.get("proxy.is_rotating", True)
+ROTATION_API_URL     = CFG.get("proxy.rotation_api_url")
+PREFERRED_LANGUAGE   = CFG.get("browser.preferred_language", "uk-UA")
+EXPECTED_COUNTRY     = CFG.get("browser.expected_country",    "Ukraine")
+EXPECTED_TIMEZONE    = CFG.get("browser.expected_timezone",   "Europe/Kyiv")
+GEO_MISMATCH_MODE    = CFG.get("browser.geo_mismatch_mode",   "warn")
+# geo_mismatch_mode values:
+#   "abort"  — refuse to run if exit country != expected
+#   "rotate" — try rotating proxy up to N times to find expected country
+#   "warn"   — just log a warning and continue
 
+REFRESH_MIN_SEC      = CFG.get("search.refresh_min_sec", 10)
+REFRESH_MAX_SEC      = CFG.get("search.refresh_max_sec", 15)
+REFRESH_MAX_ATTEMPTS = CFG.get("search.refresh_max_attempts", 4)
+
+POST_AD_ACTIONS          = CFG.get("actions.post_ad", [])
+ON_TARGET_DOMAIN_ACTIONS = CFG.get("actions.on_target_domain", [])
+
+# run_id passed via env from dashboard, or created standalone
+RUN_ID = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
+if RUN_ID is None:
+    RUN_ID = DB.run_start(PROFILE_NAME, proxy_url=PROXY)
+    logging.info(f"[main] Created standalone run #{RUN_ID}")
+
+# Dup file for manual inspection
+COMPETITOR_URLS_FILE = "competitor_urls.txt"
+
+
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -66,33 +107,20 @@ logging.basicConfig(
 )
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("selenium").setLevel(logging.WARNING)
+# undetected_chromedriver dumps a 25-line C++ stacktrace on failure.
+# We catch the exception at a higher level with a readable summary.
+logging.getLogger("undetected_chromedriver").setLevel(logging.WARNING)
 
 
 # ──────────────────────────────────────────────────────────────
-# СОСТОЯНИЕ СТРАНИЦЫ
+# PAGE STATE HELPERS
 # ──────────────────────────────────────────────────────────────
-
-def page_state(driver) -> str:
-    try:
-        url = driver.current_url
-    except Exception:
-        return "dead"
-    if "sorry/index" in url or "/sorry/" in url:
-        return "captcha"
-    if "consent.google.com" in url:
-        return "consent"
-    if "/search" in url and "q=" in url:
-        return "search_results"
-    if url.startswith("https://www.google.") or url == "about:blank" or url.startswith("data:"):
-        return "home"
-    return "other"
-
 
 def is_offline_page(driver) -> bool:
-    """Проверка не показал ли Chrome 'Вы в режиме офлайн'"""
+    """Detect Chrome offline page ('Check your internet connection' etc.)"""
     try:
         title = (driver.title or "").lower()
-        if any(m in title for m in ("офлайн", "offline", "недоступно")):
+        if any(m in title for m in ("offline", "не в мережі", "не в сети")):
             return True
         body_text = driver.execute_script(
             "return (document.body && document.body.innerText || '').substring(0, 300).toLowerCase();"
@@ -107,94 +135,45 @@ def is_offline_page(driver) -> bool:
         return False
 
 
-def bypass_consent(driver):
-    if page_state(driver) != "consent":
-        return
-    logging.info("🍪 Принимаем куки...")
+def is_captcha_page(driver) -> bool:
+    """
+    Detect Google captcha / 'unusual traffic' block pages.
+    These land on /sorry/index or contain a recaptcha challenge.
+    """
     try:
-        btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//*[contains(text(),'Принять все') or contains(text(),'Accept all') or contains(text(),'Прийняти все')]"
-            ))
-        )
-        btn.click()
-        time.sleep(random.uniform(2, 4))
+        url = (driver.current_url or "").lower()
+        if "/sorry/" in url or "recaptcha" in url:
+            return True
+        title = (driver.title or "").lower()
+        if any(m in title for m in (
+            "unusual traffic",
+            "підозрілий трафік",
+            "подозрительный трафик",
+            "before you continue to google",
+            "are you a robot",
+        )):
+            return True
+        # DOM-level check: captcha iframe / form
+        found = driver.execute_script("""
+            return !!(
+                document.querySelector('iframe[src*="recaptcha"]') ||
+                document.querySelector('#captcha-form') ||
+                document.querySelector('#recaptcha') ||
+                document.querySelector('div.g-recaptcha') ||
+                (document.body && /unusual traffic|невичайний трафік|нетипичный трафик/i
+                    .test(document.body.innerText.substring(0, 500)))
+            );
+        """)
+        return bool(found)
     except Exception:
-        pass
-
-
-def solve_captcha(driver) -> bool:
-    if page_state(driver) != "captcha":
-        return True
-    if not TWOCAPTCHA_API_KEY or TWOCAPTCHA_API_KEY == "ВАШ_КЛЮЧ":
-        logging.warning("2Captcha API ключ не задан")
         return False
-    logging.info("⚠️ Капча — решаем через 2Captcha...")
-    try:
-        wait = WebDriverWait(driver, 10)
-        el = wait.until(EC.presence_of_element_located((
-            By.CSS_SELECTOR, "div.g-recaptcha, div[data-sitekey]"
-        )))
-        sitekey = el.get_attribute("data-sitekey") or el.get_attribute("data-s")
-        if not sitekey:
-            return False
-        create = requests.get(
-            f"https://2captcha.com/in.php?key={TWOCAPTCHA_API_KEY}"
-            f"&method=userrecaptcha&googlekey={sitekey}&pageurl={driver.current_url}&json=1"
-        ).json()
-        if create.get("status") != 1:
-            return False
-        task_id = create["request"]
-        time.sleep(20)
-        for _ in range(24):
-            poll = requests.get(
-                f"https://2captcha.com/res.php?key={TWOCAPTCHA_API_KEY}"
-                f"&action=get&id={task_id}&json=1"
-            ).json()
-            if poll.get("status") == 1:
-                token = poll["request"]
-                driver.execute_script(
-                    "document.getElementById('g-recaptcha-response').value = arguments[0];",
-                    token
-                )
-                time.sleep(5)
-                return True
-            time.sleep(5)
-    except Exception as e:
-        logging.error(f"Капча: {e}")
-    return False
-
-
-# ──────────────────────────────────────────────────────────────
-# ПРЯМОЙ URL ПОИСКА ДЛЯ РЕКЛАМЫ
-# ──────────────────────────────────────────────────────────────
-
-def build_search_url(query: str) -> str:
-    """
-    Строит прямой URL Google-поиска — МИНИМАЛИСТИЧНЫЙ,
-    как будто юзер ввёл запрос в поле и нажал Enter.
-
-    КРИТИЧНО: не добавляем pws=0, adtest=on и другие "служебные"
-    параметры — они включают Google Ads Preview режим (страница с
-    желтым предупреждением "призначена для випробовування"), при
-    котором НАСТОЯЩАЯ реклама не показывается.
-
-    gl/hl тоже лучше не добавлять — Google сам определяет локаль
-    по IP прокси и Accept-Language. Лишние параметры выглядят
-    подозрительно (настоящие юзеры так не делают).
-    """
-    return f"https://www.google.com/search?q={quote(query)}"
 
 
 def is_ads_preview_page(driver) -> bool:
     """
-    Детектирует страницу Google Ads Preview:
-    "Ця сторінка призначена для випробовування рекламних оголошень Google Ads"
-
-    Эта страница появляется когда URL содержит служебные параметры типа
-    pws=0 или adtest=on. Настоящей рекламы на ней нет, поэтому парсер
-    её не должен считать валидной.
+    Detect the Google Ads Preview warning page.
+    This appears when URL has service params like pws=0 or adtest=on.
+    We use a clean URL, but still check as a safety net.
     """
     try:
         body_text = driver.execute_script(
@@ -204,80 +183,30 @@ def is_ads_preview_page(driver) -> bool:
             "ця сторінка призначена для випробовування",
             "this page is for testing google ads",
             "эта страница предназначена для тестирования",
-            "google ads preview",
         ]
         return any(m in body_text for m in markers)
     except Exception:
         return False
 
 
-def do_manual_search(browser, query: str) -> bool:
+# ──────────────────────────────────────────────────────────────
+# SEARCH URL
+# ──────────────────────────────────────────────────────────────
+
+def build_search_url(query: str) -> str:
     """
-    Fallback: вводит запрос в поле поиска вручную (как юзер).
-    Возвращает True если поиск выполнен успешно.
+    Clean Google search URL — no service params to avoid Ads Preview page.
+    Location and language come from IP + Accept-Language header.
     """
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    driver = browser.driver
-    try:
-        # Убеждаемся что мы на google.com
-        if "google.com" not in driver.current_url or "/search" in driver.current_url:
-            browser.stealth_get("https://www.google.com/")
-            time.sleep(random.uniform(2, 4))
-            bypass_consent(driver)
-
-        search_box = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "q"))
-        )
-        WebDriverWait(driver, 5).until(EC.visibility_of(search_box))
-
-        browser.bezier_move_to(search_box)
-        time.sleep(random.uniform(0.4, 0.9))
-
-        # Фокус
-        focused = driver.execute_script(
-            "return document.activeElement === arguments[0];", search_box
-        )
-        if not focused:
-            driver.execute_script("arguments[0].focus();", search_box)
-            time.sleep(0.3)
-
-        # Очистка поля
-        search_box.send_keys(Keys.CONTROL + "a")
-        search_box.send_keys(Keys.BACKSPACE)
-        time.sleep(random.uniform(0.3, 0.7))
-
-        # Печать
-        browser.human_type(search_box, query)
-        time.sleep(random.uniform(0.5, 1.2))
-
-        # Проверка что текст ввёлся
-        typed_value = driver.execute_script("return arguments[0].value;", search_box)
-        if query not in typed_value:
-            driver.execute_script(
-                "arguments[0].value = arguments[1]; "
-                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
-                search_box, query
-            )
-            time.sleep(0.3)
-
-        search_box.send_keys(Keys.RETURN)
-        time.sleep(random.uniform(3, 5))
-        return True
-    except Exception as e:
-        logging.error(f"  do_manual_search: {e}")
-        return False
+    return f"https://www.google.com/search?q={quote(query)}"
 
 
 # ──────────────────────────────────────────────────────────────
-# ИЗВЛЕЧЕНИЕ РЕКЛАМНЫХ БЛОКОВ
+# AD PARSER
 # ──────────────────────────────────────────────────────────────
 
 def extract_real_url(href: str) -> str:
-    """Распарсить параметр adurl/url/q из Google-редиректа"""
+    """Parse adurl/url/q parameter from Google redirect URL"""
     if not href:
         return ""
     try:
@@ -294,7 +223,6 @@ def extract_real_url(href: str) -> str:
 
 
 def extract_domain(url: str) -> str:
-    """Извлекает домен без www."""
     if not url:
         return ""
     try:
@@ -308,14 +236,9 @@ def extract_domain(url: str) -> str:
 
 def parse_ads(driver, query: str) -> list[dict]:
     """
-    Извлекает ТОЛЬКО рекламные блоки со страницы результатов.
-    Возвращает для каждой: title, display_url, clean_url, google_click_url, domain
+    Extract ad blocks from SERP using TreeWalker + data-text-ad fallback.
+    Returns list of {query, title, display_url, clean_url, google_click_url, domain, found_at}.
     """
-    state = page_state(driver)
-    if state != "search_results":
-        logging.warning(f"  Не на странице результатов: state={state}")
-        return []
-
     js_script = r"""
     const SPONSORED_MARKERS = [
         'Sponsored', 'Реклама', 'Спонсировано', 'Спонсоване',
@@ -324,7 +247,7 @@ def parse_ads(driver, query: str) -> list[dict]:
 
     const adBlocks = new Set();
 
-    // Способ 1: поиск по метке "Sponsored" / "Реклама"
+    // Method 1: find "Sponsored" / "Реклама" label via TreeWalker
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
     let node;
     while (node = walker.nextNode()) {
@@ -343,7 +266,7 @@ def parse_ads(driver, query: str) -> list[dict]:
         }
     }
 
-    // Способ 2: data-text-ad атрибут
+    // Method 2: data-text-ad attribute
     document.querySelectorAll('div[data-text-ad]').forEach(el => adBlocks.add(el));
 
     const results = [];
@@ -360,8 +283,6 @@ def parse_ads(driver, query: str) -> list[dict]:
         let cleanUrl       = '';
 
         const allLinks = block.querySelectorAll('a[href]');
-
-        // Сначала ищем ссылки через Google-редирект
         for (const link of allLinks) {
             const href = link.href || '';
             if (href.includes('/aclk?') || href.includes('googleadservices.com')) {
@@ -374,7 +295,6 @@ def parse_ads(driver, query: str) -> list[dict]:
                 }
             }
         }
-
         if (!googleClickUrl) {
             for (const link of allLinks) {
                 const href = link.href || '';
@@ -387,9 +307,9 @@ def parse_ads(driver, query: str) -> list[dict]:
 
         if (googleClickUrl || displayUrl) {
             results.push({
-                title:           title,
-                displayUrl:      displayUrl,
-                googleClickUrl:  googleClickUrl,
+                title: title,
+                displayUrl: displayUrl,
+                googleClickUrl: googleClickUrl,
                 cleanFromDataRw: cleanUrl,
             });
         }
@@ -401,7 +321,7 @@ def parse_ads(driver, query: str) -> list[dict]:
     try:
         raw_ads = driver.execute_script(js_script) or []
     except Exception as e:
-        logging.warning(f"  Ошибка JS-парсинга: {e}")
+        logging.warning(f"  JS parse error: {e}")
         return []
 
     ads = []
@@ -414,7 +334,7 @@ def parse_ads(driver, query: str) -> list[dict]:
             display_url      = raw.get("displayUrl", "")
             title            = raw.get("title", "")
 
-            # Чистый URL в порядке приоритета
+            # Clean URL priority: data-rw > parsed aclk > display
             clean_url = ""
             if clean_from_rw and clean_from_rw.startswith("http"):
                 clean_url = clean_from_rw
@@ -434,20 +354,19 @@ def parse_ads(driver, query: str) -> list[dict]:
                         clean_url = "https://" + first
 
             domain = extract_domain(clean_url) or extract_domain(display_url)
-
             if not domain:
                 continue
 
-            # Фильтр: Google-внутренние
+            # Filter Google internal domains
             if any(g in domain for g in ("google.com", "google.ua", "googleusercontent.com")):
                 continue
 
-            # Фильтр: наши домены
+            # Filter our own domains
             if any(my in domain for my in MY_DOMAINS):
-                logging.info(f"  · [наш] {domain} — {title[:50]}")
+                logging.info(f"  - [own] {domain} — {title[:50]}")
                 continue
 
-            # Дедупликация по домену в рамках одного запроса
+            # Dedup within query
             if domain in seen_domains:
                 continue
             seen_domains.add(domain)
@@ -460,83 +379,155 @@ def parse_ads(driver, query: str) -> list[dict]:
                 "google_click_url":  google_click_url,
                 "domain":            domain,
                 "found_at":          datetime.now().isoformat(timespec="seconds"),
+                "is_target":         any(t in domain for t in TARGET_DOMAINS),
             })
-            logging.info(f"  ✓ {domain} — {title[:60]}")
+            mark = "★" if ads[-1]["is_target"] else "·"
+            logging.info(f"  {mark} {domain} — {title[:60]}")
 
         except Exception as e:
-            logging.debug(f"  Ошибка обработки блока: {e}")
+            logging.debug(f"  block processing error: {e}")
 
     return ads
 
 
 # ──────────────────────────────────────────────────────────────
-# ПОИСК ПО ОДНОМУ ЗАПРОСУ С REFRESH-LOOP
+# POST-AD ACTIONS — user-defined pipeline
 # ──────────────────────────────────────────────────────────────
 
-def search_with_refresh_loop(browser, query: str, sqm, current_ip: str | None = None):
+def execute_action(browser, action: dict, ad: dict):
     """
-    Поиск с refresh-loop для появления рекламы.
+    Execute one user-configured action after an ad was found.
 
-    Стратегия:
-    1. Пробуем прямой URL (быстро)
-    2. Если Google показал Ads Preview страницу — делаем ручной ввод (надёжнее)
-    3. Парсим рекламу
-    4. Нет рекламы → refresh через 10-15с (макс N попыток)
+    Supported action types:
+      - visit:   navigate to ad's clean_url (with probability gate)
+      - dwell:   wait N seconds on current page
+      - scroll:  human-scroll the page
+      - back:    go back in history
+      - close_tab: close this tab (if opened in new tab)
+    """
+    driver = browser.driver
+    act_type = action.get("type")
+
+    try:
+        if act_type == "visit":
+            probability = float(action.get("probability", 1.0))
+            if random.random() > probability:
+                logging.info(f"    skip visit (probability {probability})")
+                return
+
+            # Prefer google_click_url — this is the tracked /aclk? link that
+            # signals a REAL ad click to Google. Fall back to clean_url if
+            # for some reason it wasn't captured.
+            url = ad.get("google_click_url") or ad.get("clean_url")
+            if not url:
+                return
+            logging.info(f"    → visit {url[:80]}")
+
+            # Open in new tab to keep SERP alive
+            original = driver.current_window_handle
+            driver.execute_script(f"window.open('{url}', '_blank');")
+            time.sleep(1.5)
+            new_handle = [h for h in driver.window_handles if h != original][-1]
+            driver.switch_to.window(new_handle)
+
+            dwell_min = float(action.get("dwell_min", 5))
+            dwell_max = float(action.get("dwell_max", 15))
+            time.sleep(random.uniform(dwell_min, dwell_max))
+
+            try:
+                browser.human_scroll(1, 2)
+            except Exception:
+                pass
+
+            driver.close()
+            driver.switch_to.window(original)
+
+        elif act_type == "dwell":
+            min_sec = float(action.get("min_sec", 2))
+            max_sec = float(action.get("max_sec", 6))
+            t = random.uniform(min_sec, max_sec)
+            logging.info(f"    → dwell {t:.1f}s")
+            time.sleep(t)
+
+        elif act_type == "scroll":
+            n_min = int(action.get("min_scrolls", 1))
+            n_max = int(action.get("max_scrolls", 3))
+            logging.info(f"    → scroll {n_min}..{n_max}")
+            try:
+                browser.human_scroll(n_min, n_max)
+            except Exception:
+                driver.execute_script(f"window.scrollBy(0, {random.randint(200, 500)});")
+
+        elif act_type == "back":
+            delay = float(action.get("delay_sec", 1))
+            logging.info(f"    → back (delay {delay}s)")
+            time.sleep(delay)
+            driver.back()
+
+        else:
+            logging.warning(f"    unknown action type: {act_type}")
+
+    except Exception as e:
+        logging.warning(f"    action {act_type} failed: {e}")
+
+
+def run_post_ad_pipeline(browser, ad: dict):
+    """Run the configured action pipeline for one ad"""
+    # Choose which pipeline to use
+    pipeline = ON_TARGET_DOMAIN_ACTIONS if ad.get("is_target") else POST_AD_ACTIONS
+    if not pipeline:
+        return
+
+    for action in pipeline:
+        if not action.get("enabled", True):
+            continue
+        execute_action(browser, action, ad)
+
+
+# ──────────────────────────────────────────────────────────────
+# SEARCH LOOP
+# ──────────────────────────────────────────────────────────────
+
+def search_query(browser, query: str, sqm: SessionQualityMonitor,
+                 current_ip: str = None) -> list[dict]:
+    """
+    Single query execution:
+    - Open direct search URL
+    - Refresh-loop until ads appear (or max attempts)
+    - Parse & return ads
     """
     driver = browser.driver
     url = build_search_url(query)
-    logging.info(f"🌐 Прямой URL: {url}")
+    logging.info(f"🔎 {query}  →  {url}")
 
-    # Первый переход
     try:
         browser.stealth_get(url, referer="https://www.google.com/")
     except Exception as e:
-        logging.error(f"  stealth_get провален: {e}")
+        logging.error(f"  navigation failed: {e}")
         return []
 
-    time.sleep(random.uniform(3, 5))
+    time.sleep(random.uniform(2, 4))
 
-    # Проверка Ads Preview — если появилось, переходим на ручной ввод
-    if is_ads_preview_page(driver):
-        logging.warning(
-            "  ⚠ Google показал Ads Preview страницу — переходим на ручной ввод"
-        )
-        if not do_manual_search(browser, query):
-            logging.error("  ручной ввод тоже провалился")
-            return []
-        time.sleep(random.uniform(2, 4))
-
-    attempt = 0
-    while True:
-        attempt += 1
-
-        # Офлайн
+    for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
         if is_offline_page(driver):
-            logging.error("  ✗ Офлайн-страница. Прокси сломался")
+            logging.error("  ✗ offline page — proxy broken")
             return []
 
-        bypass_consent(driver)
-
-        # Капча
-        if page_state(driver) == "captcha":
-            sqm.record("captcha", query=query, details=f"refresh_attempt_{attempt}")
+        # Captcha — the killer scenario. Don't retry, don't refresh
+        # (that makes the captcha mark heavier). Report the IP as burned
+        # so the rotator picks something else for next run.
+        if is_captcha_page(driver):
+            logging.error("  ✗ CAPTCHA — Google flagged this session")
+            sqm.record("captcha", query=query, url=driver.current_url)
             if current_ip:
                 browser.report_rotating(current_ip, success=False, captcha=True)
-            if not solve_captcha(driver):
-                sqm.record("blocked", query=query)
-                logging.warning(f"  Капча не решена")
-                return []
-            sqm.record("captcha_solved", query=query)
+            return []
 
-        # Снова проверка Ads Preview — на случай refresh
         if is_ads_preview_page(driver):
-            logging.warning(f"  ⚠ Ads Preview на попытке {attempt} — ручной ввод")
-            if not do_manual_search(browser, query):
-                return []
-            time.sleep(random.uniform(2, 4))
-            continue
+            logging.warning("  ✗ Ads Preview page (unexpected) — skipping")
+            return []
 
-        # Ждём загрузки контейнеров
+        # Wait for SERP containers
         try:
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((
@@ -548,30 +539,17 @@ def search_with_refresh_loop(browser, query: str, sqm, current_ip: str | None = 
             pass
         time.sleep(random.uniform(1.5, 3))
 
-        # Скролл — реклама часто подгружается при взаимодействии
-        try:
-            browser.human_scroll(1, 2)
-        except Exception:
-            pass
-        time.sleep(random.uniform(0.5, 1.5))
-
-        # Парсим рекламу
         ads = parse_ads(driver, query)
-
         if ads:
-            logging.info(f"  ✓ Реклама найдена на попытке {attempt}: {len(ads)} блоков")
+            logging.info(f"  ✓ {len(ads)} ads on attempt {attempt}")
             return ads
 
-        # Рекламы нет
         if attempt >= REFRESH_MAX_ATTEMPTS:
-            logging.info(f"  ✗ За {attempt} попыток реклама не появилась")
+            logging.info(f"  ✗ no ads after {attempt} attempts")
             return []
 
         wait_sec = random.uniform(REFRESH_MIN_SEC, REFRESH_MAX_SEC)
-        logging.info(
-            f"  🔄 Рекламы нет, попытка {attempt}/{REFRESH_MAX_ATTEMPTS} — "
-            f"обновляем через {wait_sec:.0f}с"
-        )
+        logging.info(f"  ↻ attempt {attempt}/{REFRESH_MAX_ATTEMPTS} — refresh in {wait_sec:.0f}s")
         time.sleep(wait_sec)
 
         try:
@@ -584,278 +562,415 @@ def search_with_refresh_loop(browser, query: str, sqm, current_ip: str | None = 
 
         time.sleep(random.uniform(2, 4))
 
+    return []
+
 
 # ──────────────────────────────────────────────────────────────
-# ЗАПИСЬ URL В ФАЙЛ (APPEND)
+# STORAGE
 # ──────────────────────────────────────────────────────────────
 
-def append_competitor_urls(ads: list[dict], filepath: str = COMPETITOR_URLS_FILE):
-    """
-    Дописывает все google_click_url в файл (append).
-    Фильтр наших доменов уже сделан в parse_ads — сюда приходят только чужие.
-    Формат строки: <timestamp>\t<query>\t<domain>\t<google_click_url>
-    """
+def save_ads(ads: list[dict]):
+    """Save ads to DB + duplicate file"""
     if not ads:
         return
 
-    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+    for ad in ads:
+        try:
+            DB.competitor_add(
+                run_id           = RUN_ID,
+                query            = ad["query"],
+                domain           = ad["domain"],
+                title            = ad.get("title"),
+                display_url      = ad.get("display_url"),
+                clean_url        = ad.get("clean_url"),
+                google_click_url = ad.get("google_click_url"),
+            )
+        except Exception as e:
+            logging.warning(f"  DB competitor_add: {e}")
 
-    with open(filepath, "a", encoding="utf-8") as f:
-        for ad in ads:
-            google_url = ad.get("google_click_url", "")
-            if not google_url:
-                continue
-            line = "\t".join([
-                ad["found_at"],
-                ad["query"],
-                ad["domain"],
-                google_url,
-            ])
-            f.write(line + "\n")
+    # Also append to flat file for easy grep
+    try:
+        with open(COMPETITOR_URLS_FILE, "a", encoding="utf-8") as f:
+            for ad in ads:
+                google_url = ad.get("google_click_url", "")
+                if not google_url:
+                    continue
+                line = "\t".join([ad["found_at"], ad["query"], ad["domain"], google_url])
+                f.write(line + "\n")
+    except Exception as e:
+        logging.debug(f"  file write error: {e}")
 
-    logging.info(f"  📝 Записано в {filepath}: {len(ads)} URL")
+    logging.info(f"  💾 saved {len(ads)} ads (DB + {COMPETITOR_URLS_FILE})")
+
+
+def print_summary(all_ads: list[dict]):
+    """Print final report grouped by domain"""
+    if not all_ads:
+        logging.info("\n=== No competitors found ===")
+        return
+
+    from collections import defaultdict
+    by_domain = defaultdict(lambda: {"count": 0, "queries": set(), "title": ""})
+    for ad in all_ads:
+        d = by_domain[ad["domain"]]
+        d["count"] += 1
+        d["queries"].add(ad["query"])
+        if not d["title"]:
+            d["title"] = ad["title"]
+
+    logging.info("")
+    logging.info("=" * 68)
+    logging.info(f" COMPETITOR REPORT — {len(by_domain)} unique advertisers ".center(68))
+    logging.info("=" * 68)
+
+    ranked = sorted(by_domain.items(), key=lambda x: -x[1]["count"])
+    for i, (domain, info) in enumerate(ranked, 1):
+        is_target = any(t in domain for t in TARGET_DOMAINS)
+        mark = "★" if is_target else " "
+        logging.info(f"[{i}] {mark} {domain}")
+        logging.info(f"     {info['title'][:60]}")
+        logging.info(f"     queries: {', '.join(sorted(info['queries']))}")
+        logging.info("")
 
 
 # ──────────────────────────────────────────────────────────────
-# ОСНОВНАЯ ЛОГИКА
+# MAIN
 # ──────────────────────────────────────────────────────────────
 
 def run_monitor():
-    competitors: dict[str, dict] = {}
+    all_ads: list[dict] = []
 
     with GhostShellBrowser(
-        profile_name      = PROFILE_NAME,
-        proxy_str         = PROXY,
-        device_template   = CFG.get("browser.device_template"),
-        auto_session      = CFG.get("browser.auto_session", True),
-        is_rotating_proxy = IS_ROTATING_PROXY,
-        rotation_api_url  = ROTATION_API_URL,
-        enrich_on_create  = CFG.get("browser.enrich_on_create", True),
+        profile_name       = PROFILE_NAME,
+        proxy_str          = PROXY,
+        auto_session       = CFG.get("browser.auto_session", True),
+        is_rotating_proxy  = IS_ROTATING_PROXY,
+        rotation_api_url   = ROTATION_API_URL,
+        enrich_on_create   = CFG.get("browser.enrich_on_create", True),
+        preferred_language = PREFERRED_LANGUAGE,
+        run_id             = RUN_ID,
     ) as browser:
 
         driver = browser.driver
         browser.setup_profile_logging()
 
-        # ── Мониторинг профиля ───────────────────────
+        # 1. Profile health sanity check (soft: never aborts on first runs)
         sqm = SessionQualityMonitor(browser.user_data_path)
         should_abort, reason = sqm.should_abort()
         if should_abort:
-            logging.error(f"⛔ Профиль деградировал: {reason}")
-            logging.error(f"   Удали nk_session/ и fingerprint.json в {browser.user_data_path}")
-            return
+            logging.warning(f"  ⚠ profile health: {reason}")
+            logging.warning(f"    (proceeding anyway — disable this check if too strict)")
 
-        # ── 1. Проверки ──────────────────────────────
+        # 2. Fingerprint self-check (writes to DB + profile file)
         browser.health_check(verbose=True)
 
-        # Диагностика прокси — ВАЖНО делать ПОСЛЕ init nav в start()
-        # (чтобы браузер уже был инициализирован)
+        # 3. Proxy diagnostics with geo-mismatch detection.
         diag = ProxyDiagnostics(driver, proxy_url=PROXY)
-        report = diag.full_check(expected_timezone="Europe/Kyiv")
+        report = diag.full_check(
+            expected_timezone = EXPECTED_TIMEZONE,
+            expected_country  = EXPECTED_COUNTRY,
+        )
         diag.print_report(report)
 
-        if report["webrtc_leak"]:
-            logging.error("✗ WebRTC УТЕЧКА — останавливаемся")
+        if report.get("webrtc_leak"):
+            logging.error("✗ WebRTC leak detected — aborting")
             return
 
-        # ── 2. Блокировка трекеров ───────────────────
-        browser.enable_request_blocking()
-
-        # ── 3. Идём на google.com СНАЧАЛА ─────────
-        # Это тёплый сайт (cookies уже есть), проверяем что сеть работает,
-        # решаем consent если нужно
-        logging.info("🏠 Идём на google.com для инициализации сессии...")
-        browser.stealth_get("https://www.google.com/")
-        time.sleep(random.uniform(3, 5))
-
-        if is_offline_page(driver):
-            logging.error("✗ Google показал офлайн — прокси проблема, выходим")
-            return
-
-        bypass_consent(driver)
-        if page_state(driver) == "captcha":
-            if not solve_captcha(driver):
-                logging.warning("Капча на входе не решена")
-
-        # ── 4. Прогрев ТОЛЬКО для нового профиля ─────
-        if not os.path.exists(browser.session_dir):
-            logging.info("📥 Новый профиль — гибридный прогрев")
-            browser.warmup_profile(depth="hybrid")
-        else:
-            logging.info("✓ Сессия восстановлена — быстрый прогрев через cookies")
-            browser.warmup_profile(depth="fast")
-
-        # ── 5. Фоновые вкладки (как у живого юзера) ──
-        tabs = TabManager(browser)
-        if CFG.get("behavior.open_background_tabs", True):
-            bg_range = CFG.get("behavior.bg_tabs_count", [2, 4])
-            tabs.open_background_tabs(count=random.randint(bg_range[0], bg_range[1]))
-
-        # ── 6. Фиксируем IP для rotating-прокси ──────
-        current_ip = None
-        if IS_ROTATING_PROXY:
-            current_ip = browser.check_and_rotate_if_burned()
-            if current_ip:
-                logging.info(f"🌐 Работаем с IP: {current_ip}")
-
-        # Rate limiter для избежания частых запросов
-        rate_limiter = QueryRateLimiter()
-
-        # ── 7. ЦИКЛ ПОИСКА ───────────────────────────
-        for i, query in enumerate(SEARCH_QUERIES):
-            if not browser.is_alive():
-                logging.error("Окно закрыто — выходим")
-                break
-
-            # Проверка rate limit ПЕРЕД запросом
-            rate_limiter.wait_if_needed()
-
-            logging.info("")
-            logging.info("=" * 60)
-            logging.info(f"🔎 Запрос {i+1}/{len(SEARCH_QUERIES)}: {query}")
-            logging.info("=" * 60)
-
-            search_started = time.time()
-            rate_limiter.record_query(query, ip=current_ip)
-
-            # Поиск с refresh-loop
-            ads = search_with_refresh_loop(browser, query, sqm, current_ip=current_ip)
-
-            duration = time.time() - search_started
-
-            # После парсинга — взаимодействие с выдачей (даже если рекламы нет)
-            # Это сигнал "живой юзер прочитал страницу"
-            try:
-                interact_with_serp(browser, dwell_min=2, dwell_max=6)
-            except Exception:
-                pass
-
-            # Метрика результата
-            if ads:
-                sqm.record("search_ok", query=query,
-                           results_count=len(ads), duration_sec=duration)
-                if IS_ROTATING_PROXY and current_ip:
-                    browser.report_rotating(current_ip, success=True, captcha=False)
-            else:
-                sqm.record("search_empty", query=query, duration_sec=duration)
-
-            # ЗАПИСЬ ССЫЛОК В ФАЙЛ
-            append_competitor_urls(ads, COMPETITOR_URLS_FILE)
-
-            # Собираем в сводку конкурентов
-            for ad in ads:
-                domain = ad["domain"]
-                if domain in competitors:
-                    if query not in competitors[domain]["queries"]:
-                        competitors[domain]["queries"].append(query)
+        # Geo mismatch handling. Happens when rotating proxy returns an exit
+        # in a country that doesn't match our profile locale (e.g. AR vs UA).
+        # This causes Google to serve wrong-locale SERPs and triggers anti-bot
+        # heuristics because the fingerprint says "Ukrainian user" but the IP
+        # is foreign.
+        if report.get("geo_mismatch"):
+            actual = report.get("actual_country")
+            logging.warning(
+                f"⚠ Exit country mismatch: expected {EXPECTED_COUNTRY!r}, "
+                f"got {actual!r}"
+            )
+            if GEO_MISMATCH_MODE == "abort":
+                logging.error(
+                    f"  (geo_mismatch_mode=abort — skipping this run to "
+                    f"preserve query budget)"
+                )
+                return
+            elif GEO_MISMATCH_MODE == "rotate" and IS_ROTATING_PROXY:
+                MAX_ROTATE_TRIES = 5
+                rotated_to_country = None
+                for attempt in range(1, MAX_ROTATE_TRIES + 1):
+                    logging.info(
+                        f"  ↻ rotating proxy, attempt {attempt}/"
+                        f"{MAX_ROTATE_TRIES}…"
+                    )
+                    try:
+                        browser.force_rotate_ip()
+                    except Exception as e:
+                        logging.warning(f"    rotate failed: {e}")
+                        break
+                    time.sleep(random.uniform(2, 4))
+                    report2 = diag.full_check(
+                        expected_timezone = EXPECTED_TIMEZONE,
+                        expected_country  = EXPECTED_COUNTRY,
+                    )
+                    if not report2.get("geo_mismatch"):
+                        rotated_to_country = report2.get("actual_country")
+                        logging.info(f"  ✓ rotated into {rotated_to_country}")
+                        report = report2
+                        break
                 else:
-                    competitors[domain] = {
-                        "domain":           domain,
-                        "title":            ad["title"],
-                        "display_url":      ad["display_url"],
-                        "clean_url":        ad["clean_url"],
-                        "google_click_url": ad["google_click_url"],
-                        "queries":          [query],
-                        "first_seen":       ad["found_at"],
-                    }
+                    logging.error(
+                        f"  (still in wrong country after "
+                        f"{MAX_ROTATE_TRIES} rotations — aborting)"
+                    )
+                    return
+            else:
+                logging.warning(
+                    "  (geo_mismatch_mode=warn — proceeding despite mismatch; "
+                    "detection risk is elevated)"
+                )
 
-            # Между запросами
-            tabs.maybe_switch_around(probability=0.3)
-            if CFG.get("behavior.idle_pauses", True):
-                browser.idle_pause(kind="random")
-            time.sleep(random.uniform(8, 15))
-
-        tabs.close_all_background()
-
-        # ── 8. ИТОГИ ──────────────────────────────────
-        print_report(competitors)
-        save_report(competitors)
-
-        if IS_ROTATING_PROXY:
-            tracker = browser.get_rotating_tracker()
-            if tracker:
-                tracker.print_stats()
-
-        # HTML dashboard
+        # 4. Tracker blocking
         try:
-            from dashboard import (
-                collect_profile_stats, collect_latest_competitors,
-                collect_proxy_stats, generate_html
+            browser.enable_request_blocking()
+        except Exception:
+            pass
+
+        # 5. First-run cookie seed (only once per profile, on the very first launch)
+        is_fresh_profile = not os.path.exists(browser.session_dir)
+        if is_fresh_profile:
+            logging.info("🌱 Fresh profile — seeding Google consent cookies...")
+            try:
+                browser.stealth_get("https://www.google.com/")
+                time.sleep(random.uniform(3, 5))
+
+                if is_offline_page(driver):
+                    logging.error("✗ Google offline — proxy broken")
+                    return
+
+                # Accept consent if shown
+                try:
+                    btn = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((
+                            By.XPATH,
+                            "//*[contains(text(),'Accept all') or contains(text(),'Принять все') or contains(text(),'Прийняти все')]"
+                        ))
+                    )
+                    btn.click()
+                    time.sleep(random.uniform(2, 4))
+                    logging.info("  🍪 consent accepted")
+                except Exception:
+                    pass
+
+                # Quick cookie seeding (non-blocking)
+                try:
+                    from cookie_warmer import CookieWarmer
+                    CookieWarmer(driver).fast_warmup()
+                except Exception as e:
+                    logging.debug(f"  cookie warmer: {e}")
+
+            except Exception as e:
+                logging.warning(f"  initial navigation: {e}")
+        else:
+            logging.info("✓ existing session — skipping cookie seed")
+
+        # 6. Auto-rotate on start — gets a fresh random Ukrainian IP before
+        # we touch Google. Skip if proxy is non-rotating (e.g. static ISP IP).
+        current_ip = None
+        auto_rotate = CFG.get("proxy.auto_rotate_on_start", True)
+        if IS_ROTATING_PROXY:
+            if auto_rotate:
+                try:
+                    log_step("rotating IP", "auto_rotate_on_start=True")
+                    new_ip = browser.force_rotate_ip()
+                    if new_ip:
+                        current_ip = new_ip
+                        logging.info(f"🌐 rotated to IP: {current_ip}")
+                except Exception as e:
+                    logging.warning(f"  auto-rotate failed: {e}")
+            # Regardless of auto-rotate: check health + unburn stale IPs
+            try:
+                if current_ip is None:
+                    current_ip = browser.check_and_rotate_if_burned()
+                    if current_ip:
+                        logging.info(f"🌐 working with IP: {current_ip}")
+            except Exception as e:
+                logging.debug(f"  rotation check: {e}")
+
+        # ─── STARTUP BANNER (pretty summary of this run's context) ──
+        try:
+            exit_ip_geo = None
+            if current_ip:
+                row = DB.ip_get(current_ip) if hasattr(DB, "ip_get") else None
+                if row:
+                    exit_ip_geo = {"country": row.get("country"),
+                                   "org":     row.get("org")}
+            log_run_start(
+                run_id            = RUN_ID,
+                profile_name      = PROFILE_NAME,
+                payload           = getattr(browser, "last_payload", None),
+                proxy_url         = PROXY,
+                exit_ip           = current_ip,
+                exit_ip_geo       = exit_ip_geo,
+                queries           = SEARCH_QUERIES,
+                target_domains    = MY_DOMAINS,
+                chrome_path       = browser.browser_path,
+                rotating          = IS_ROTATING_PROXY,
+                rotation_provider = DB.config_get("proxy.rotation_provider"),
             )
-            generate_html(
-                profiles    = collect_profile_stats(),
-                competitors = collect_latest_competitors(),
-                proxy_stats = collect_proxy_stats(),
-            )
+            if getattr(browser, "last_payload", None):
+                log_payload_summary(browser.last_payload,
+                                    level=logging.INFO)
         except Exception as e:
-            logging.debug(f"Dashboard: {e}")
+            logging.debug(f"banner render: {e}")
+
+        # ─── MAIN SEARCH LOOP (wrapped in watchdog) ──────────
+        from watchdog import BrowserWatchdog
+
+        max_stall = CFG.get("watchdog.max_stall_sec", 180)
+        check_every = CFG.get("watchdog.check_interval_sec", 15)
+
+        with BrowserWatchdog(
+            driver         = driver,
+            run_id         = RUN_ID,
+            profile_name   = PROFILE_NAME,
+            max_stall_sec  = max_stall,
+            check_interval = check_every,
+        ) as dog:
+
+            for i, query in enumerate(SEARCH_QUERIES, 1):
+                dog.heartbeat()
+
+                if not browser.is_alive():
+                    logging.warning("⚠ Chrome window was closed — stopping run")
+                    break
+
+                t0 = time.time()
+                try:
+                    ads = search_query(browser, query, sqm,
+                                       current_ip=current_ip)
+                except Exception as e:
+                    # Catch "chrome not reachable" / "session deleted" / etc
+                    # — these mean the browser died mid-query (user closed it,
+                    # or it crashed). Don't try to continue with a dead driver.
+                    err_str = str(e).lower()
+                    if any(tok in err_str for tok in (
+                            "chrome not reachable",
+                            "session deleted",
+                            "no such window",
+                            "invalid session id",
+                            "disconnected: not connected to devtools")):
+                        logging.warning(
+                            f"⚠ Chrome died during query {i}/"
+                            f"{len(SEARCH_QUERIES)} — stopping run "
+                            f"({type(e).__name__})"
+                        )
+                        break
+                    raise
+                duration = time.time() - t0
+                dog.heartbeat()
+
+                # Compact one-line result per query
+                competitors_count = sum(
+                    1 for a in (ads or [])
+                    if not any(my in (a.get("domain") or "")
+                               for my in MY_DOMAINS)
+                )
+                my_matched = any(
+                    any(my in (a.get("domain") or "") for my in MY_DOMAINS)
+                    for a in (ads or [])
+                )
+                log_query_result(
+                    idx               = i,
+                    total             = len(SEARCH_QUERIES),
+                    query             = query,
+                    ads_found         = len(ads or []),
+                    competitors_found = competitors_count,
+                    duration_sec      = duration,
+                    my_domain_matched = my_matched,
+                )
+
+                # Record metrics
+                if ads:
+                    sqm.record("search_ok", query=query,
+                               results_count=len(ads), duration_sec=duration)
+                    if IS_ROTATING_PROXY and current_ip:
+                        browser.report_rotating(current_ip, success=True)
+                else:
+                    sqm.record("search_empty", query=query, duration_sec=duration)
+
+                # Save and run action pipeline per ad (can take a while → pause)
+                save_ads(ads)
+                if ads:
+                    with dog.pause(f"action pipeline for {len(ads)} ads"):
+                        for ad in ads:
+                            run_post_ad_pipeline(browser, ad)
+
+                all_ads.extend(ads)
+
+                # Gap between queries
+                if i < len(SEARCH_QUERIES):
+                    gap = random.uniform(6, 12)
+                    logging.info(f"… waiting {gap:.0f}s before next query")
+                    time.sleep(gap)
+
+        # Final summary
+        print_summary(all_ads)
 
 
 # ──────────────────────────────────────────────────────────────
-# ОТЧЁТ
+# ENTRY POINT
 # ──────────────────────────────────────────────────────────────
-
-def print_report(competitors: dict):
-    logging.info("")
-    logging.info("╔" + "═" * 68 + "╗")
-    logging.info("║" + " ИТОГОВЫЙ ОТЧЁТ — КОНКУРЕНТЫ В КОНТЕКСТНОЙ РЕКЛАМЕ ".center(68) + "║")
-    logging.info("╚" + "═" * 68 + "╝")
-
-    if not competitors:
-        logging.info("Конкурентов не обнаружено.")
-        return
-
-    logging.info(f"Найдено уникальных рекламодателей: {len(competitors)}")
-    logging.info("")
-
-    sorted_items = sorted(
-        competitors.values(),
-        key=lambda c: (-len(c["queries"]), c["domain"])
-    )
-
-    for i, c in enumerate(sorted_items, 1):
-        logging.info(f"[{i}] {c['domain']}")
-        if c["title"]:
-            logging.info(f"    Заголовок:  {c['title']}")
-        if c["display_url"]:
-            logging.info(f"    Display:    {c['display_url']}")
-        if c.get("clean_url"):
-            logging.info(f"    Clean URL:  {c['clean_url']}")
-        if c.get("google_click_url"):
-            logging.info(f"    Google ref: {c['google_click_url'][:120]}...")
-        logging.info(f"    Запросы:    {', '.join(c['queries'])}")
-        logging.info("")
-
-
-def save_report(competitors: dict):
-    """Сохраняет отчёт в JSON и CSV"""
-    if not competitors:
-        return
-
-    reports_dir = "reports"
-    os.makedirs(reports_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    json_path = os.path.join(reports_dir, f"competitors_{timestamp}.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(list(competitors.values()), f, indent=2, ensure_ascii=False)
-    logging.info(f"📄 JSON отчёт: {json_path}")
-
-    csv_path = os.path.join(reports_dir, f"competitors_{timestamp}.csv")
-    with open(csv_path, "w", encoding="utf-8-sig") as f:
-        f.write("Домен;Заголовок;Display URL;Clean URL;Google Click URL;Запросы;Впервые замечен\n")
-        for c in competitors.values():
-            row = [
-                c["domain"],
-                (c["title"] or "").replace(";", ","),
-                (c["display_url"] or "").replace(";", ","),
-                (c.get("clean_url") or "").replace(";", ","),
-                (c.get("google_click_url") or "").replace(";", ","),
-                "|".join(c["queries"]),
-                c["first_seen"],
-            ]
-            f.write(";".join(row) + "\n")
-    logging.info(f"📊 CSV отчёт: {csv_path}")
-
 
 if __name__ == "__main__":
-    run_monitor()
+    exit_code = 0
+    error_msg = None
+    run_started_at = time.time()
+    try:
+        run_monitor()
+    except KeyboardInterrupt:
+        exit_code = 130
+        error_msg = "Interrupted by user (Ctrl+C)"
+        logging.warning(error_msg)
+    except Exception as e:
+        exit_code = 1
+        error_msg = f"{type(e).__name__}: {e}"
+        # Short structured banner rather than a 50-line Python traceback
+        log_error_banner("RUN FAILED", error_msg)
+        # Full trace only at DEBUG — shows up in the profile log file
+        logging.debug("Full traceback:", exc_info=True)
+    finally:
+        run_duration = time.time() - run_started_at
+
+        if RUN_ID:
+            stats_dict = {}
+            try:
+                summary = DB.events_summary(profile_name=PROFILE_NAME, hours=24)
+                stats_dict = {
+                    "queries_done":  summary.get("search_ok", 0) + summary.get("search_empty", 0),
+                    "queries_total": len(SEARCH_QUERIES),
+                    "total_ads":     summary.get("search_ok", 0),
+                    "captchas":      summary.get("captcha", 0),
+                    "empty_results": summary.get("search_empty", 0),
+                }
+                DB.run_finish(
+                    RUN_ID,
+                    exit_code    = exit_code,
+                    error        = error_msg,
+                    total_queries= stats_dict["queries_done"],
+                    total_ads    = stats_dict["total_ads"],
+                    captchas     = stats_dict["captchas"],
+                )
+            except Exception as e:
+                logging.error(f"[main] run_finish error: {e}")
+
+            try:
+                log_run_end(
+                    run_id       = RUN_ID,
+                    duration_sec = run_duration,
+                    exit_code    = exit_code,
+                    stats        = stats_dict,
+                    error        = error_msg,
+                )
+            except Exception as e:
+                logging.debug(f"end banner: {e}")
+
+        sys.exit(exit_code)

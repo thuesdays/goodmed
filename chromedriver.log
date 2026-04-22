@@ -1,0 +1,154 @@
+[1776861472.097][INFO]: Starting ChromeDriver 149.0.7805.0 (0000000000000000000000000000000000000000-0000000000000000000000000000000000000000) on port 61950
+[1776861472.097][INFO]: Please see https://chromedriver.chromium.org/security-considerations for suggestions on keeping ChromeDriver safe.
+[1776861472.101][INFO]: ChromeDriver was started successfully on port 61950
+[1776861472.176][INFO]: [d18b169c3876162953bb3b86f75940be] COMMAND InitSession {
+   "capabilities": {
+      "alwaysMatch": {
+         "browserName": "chrome",
+         "goog:chromeOptions": {
+            "args": [ "--no-sandbox", "--no-first-run", "--disable-crash-reporter", "--disable-breakpad", "--window-position=100,100", "--window-size=1280,800", "--user-data-dir=C:\\Users\\N_KOVG~1\\AppData\\Local\\Temp\\chr-smoke-ixh5u2d7" ],
+            "binary": "F:\\projects\\goodmedika\\chrome_win64\\chrome.exe",
+            "extensions": [  ]
+         },
+         "pageLoadStrategy": "normal"
+      },
+      "firstMatch": [ {
+      } ]
+   }
+}
+[1776861472.177][INFO]: Populating Preferences file: {
+   "alternate_error_pages": {
+      "enabled": false
+   },
+   "autofill": {
+      "enabled": false
+   },
+   "browser": {
+      "check_default_browser": false
+   },
+   "distribution": {
+      "import_bookmarks": false,
+      "import_history": false,
+      "import_search_engine": false,
+      "make_chrome_default_for_user": false,
+      "skip_first_run_ui": true
+   },
+   "dns_prefetching": {
+      "enabled": false
+   },
+   "profile": {
+      "content_settings": {
+         "pattern_pairs": {
+            "https://*,*": {
+               "media-stream": {
+                  "audio": "Default",
+                  "video": "Default"
+               }
+            }
+         }
+      },
+      "default_content_setting_values": {
+         "geolocation": 1
+      },
+      "default_content_settings": {
+         "geolocation": 1,
+         "mouselock": 1,
+         "notifications": 1,
+         "popups": 1,
+         "ppapi-broker": 1
+      },
+      "password_manager_enabled": false
+   },
+   "safebrowsing": {
+      "enabled": false
+   },
+   "search": {
+      "suggest_enabled": false
+   },
+   "translate": {
+      "enabled": false
+   }
+}
+[1776861472.177][INFO]: Populating Local State file: {
+   "background_mode": {
+      "enabled": false
+   },
+   "ssl": {
+      "rev_checking": {
+         "enabled": false
+      }
+   }
+}
+[1776861472.178][INFO]: ChromeDriver supports communication with Chrome via pipes. This is more reliable and more secure.
+[1776861472.178][INFO]: Use the --remote-debugging-pipe Chrome switch instead of the default --remote-debugging-port to enable this communication mode.
+[1776861472.178][INFO]: Launching chrome: "F:\projects\goodmedika\chrome_win64\chrome.exe" --allow-pre-commit-input --disable-background-networking --disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-breakpad --disable-client-side-phishing-detection --disable-crash-reporter --disable-default-apps --disable-features=IgnoreDuplicateNavs,Prewarm --disable-hang-monitor --disable-popup-blocking --disable-prompt-on-repost --disable-sync --enable-automation --enable-logging=stderr --log-level=0 --no-first-run --no-sandbox --no-service-autorun --password-store=basic --remote-debugging-port=0 --test-type=webdriver --use-mock-keychain --user-data-dir="C:\Users\N_KOVG~1\AppData\Local\Temp\chr-smoke-ixh5u2d7" --window-position=100,100 --window-size=1280,800
+[25504:22300:0422/153752.285:WARNING:chrome\browser\signin\account_consistency_mode_manager.cc:74] Desktop Identity Consistency cannot be enabled as no OAuth client ID and client secret have been configured.
+
+DevTools listening on ws://127.0.0.1:61954/devtools/browser/9002fc95-3a07-4a62-bb76-d560ec1b7acb
+[1776861472.686][INFO]: resolved localhost to ["::1","127.0.0.1"]
+[25504:22300:0422/153752.743:INFO:CONSOLE:1] "undetected chromedriver 1337!", source:  (1)
+[1776861472.756][INFO]: [d18b169c3876162953bb3b86f75940be] RESPONSE InitSession {
+   "capabilities": {
+      "acceptInsecureCerts": false,
+      "browserName": "chrome",
+      "browserVersion": "149.0.7805.0",
+      "chrome": {
+         "chromedriverVersion": "149.0.7805.0 (0000000000000000000000000000000000000000-0000000000000000000000000000000000000000)",
+         "userDataDir": "C:\\Users\\N_KOVG~1\\AppData\\Local\\Temp\\chr-smoke-ixh5u2d7"
+      },
+      "fedcm:accounts": true,
+      "goog:chromeOptions": {
+         "debuggerAddress": "localhost:61954"
+      },
+      "goog:processID": 25504,
+      "networkConnectionEnabled": false,
+      "pageLoadStrategy": "normal",
+      "platformName": "windows",
+      "proxy": {
+      },
+      "setWindowRect": true,
+      "strictFileInteractability": false,
+      "timeouts": {
+         "implicit": 0,
+         "pageLoad": 300000,
+         "script": 30000
+      },
+      "unhandledPromptBehavior": "dismiss and notify",
+      "webauthn:extension:credBlob": true,
+      "webauthn:extension:largeBlob": true,
+      "webauthn:extension:minPinLength": true,
+      "webauthn:extension:prf": true,
+      "~~~": "..."
+   },
+   "sessionId": "d18b169c3876162953bb3b86f75940be"
+}
+[1776861472.757][INFO]: [d18b169c3876162953bb3b86f75940be] COMMAND Navigate {
+   "url": "https://www.google.com"
+}
+[1776861472.757][INFO]: Waiting for pending navigations...
+[1776861472.757][INFO]: Done waiting for pending navigations. Status: ok
+[25504:22300:0422/153752.891:INFO:CONSOLE:1] "undetected chromedriver 1337!", source:  (1)
+[25504:22300:0422/153752.944:INFO:CONSOLE:1] "undetected chromedriver 1337!", source:  (1)
+[1776861472.954][INFO]: Waiting for pending navigations...
+[1776861473.668][INFO]: Done waiting for pending navigations. Status: ok
+[1776861473.668][INFO]: [d18b169c3876162953bb3b86f75940be] RESPONSE Navigate
+[1776861473.669][INFO]: [d18b169c3876162953bb3b86f75940be] COMMAND GetTitle {
+}
+[1776861473.669][INFO]: Waiting for pending navigations...
+[1776861473.670][INFO]: Done waiting for pending navigations. Status: ok
+[1776861473.674][INFO]: Waiting for pending navigations...
+[1776861473.675][INFO]: Done waiting for pending navigations. Status: ok
+[1776861473.675][INFO]: [d18b169c3876162953bb3b86f75940be] RESPONSE GetTitle "Google"
+[1776861473.675][INFO]: [d18b169c3876162953bb3b86f75940be] COMMAND GetUrl {
+}
+[1776861473.675][INFO]: Waiting for pending navigations...
+[1776861473.676][INFO]: Done waiting for pending navigations. Status: ok
+[1776861473.678][INFO]: Waiting for pending navigations...
+[1776861473.679][INFO]: Done waiting for pending navigations. Status: ok
+[1776861473.679][INFO]: [d18b169c3876162953bb3b86f75940be] RESPONSE GetUrl "https://www.google.com/"
+[25504:22300:0422/153756.963:ERROR:components\device_event_log\device_event_log_impl.cc:202] [15:37:56.966] USB: usb_service_win.cc:108 SetupDiGetDeviceProperty({{A45C254E-DF1C-4EFD-8020-67D146A850E0}, 6}) failed: Element not found. (0x490)
+[25504:27940:0422/153757.395:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: PHONE_REGISTRATION_ERROR
+[25504:27940:0422/153757.412:ERROR:google_apis\gcm\engine\registration_request.cc:291] Registration response error message: DEPRECATED_ENDPOINT
+[1776861483.681][INFO]: [d18b169c3876162953bb3b86f75940be] COMMAND Quit {
+}
+[1776861483.681][INFO]: [d18b169c3876162953bb3b86f75940be] RESPONSE Quit

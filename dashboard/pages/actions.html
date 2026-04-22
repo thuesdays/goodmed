@@ -1,0 +1,67 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Actions</div>
+      <div class="page-subtitle">What to do after finding an ad on the SERP</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      Default (every competitor ad)
+      <span class="badge" id="post-ad-count">0</span>
+    </div>
+    <div class="muted" style="margin-bottom: 14px;">
+      Runs for every detected ad unless its domain is in "Target domains"
+      (Search page). Actions execute in order.
+    </div>
+    <div id="post-ad-list" class="action-list"></div>
+    <div class="add-action-btn" id="add-post-ad-btn">+ Add action</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      On target domain match
+      <span class="badge" id="target-action-count">0</span>
+    </div>
+    <div class="muted" style="margin-bottom: 14px;">
+      Runs instead of the default pipeline when an ad's domain matches a
+      target domain. Use this for competitors you want to study deeper —
+      longer visits, more scrolls, etc.
+    </div>
+    <div id="target-action-list" class="action-list"></div>
+    <div class="add-action-btn" id="add-target-action-btn">+ Add action</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Supported action types</div>
+    <table>
+      <thead>
+        <tr><th>Type</th><th>Parameters</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>visit</strong></td>
+          <td class="muted">probability (0–1), dwell_min, dwell_max</td>
+          <td>Open the ad's google_click_url in a new tab, wait, close tab
+              (uses clean_url as fallback)</td>
+        </tr>
+        <tr>
+          <td><strong>dwell</strong></td>
+          <td class="muted">min_sec, max_sec</td>
+          <td>Wait N seconds on current page (simulates reading)</td>
+        </tr>
+        <tr>
+          <td><strong>scroll</strong></td>
+          <td class="muted">min_scrolls, max_scrolls</td>
+          <td>Human-like mouse-wheel scroll</td>
+        </tr>
+        <tr>
+          <td><strong>back</strong></td>
+          <td class="muted">delay_sec</td>
+          <td>Navigate browser history back</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>

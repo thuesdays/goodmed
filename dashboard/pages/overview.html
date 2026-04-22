@@ -1,0 +1,106 @@
+<section>
+  <!-- Hero panel with headline stats + trends -->
+  <div class="ov-hero">
+    <div class="ov-hero-greeting">Ghost Shell</div>
+    <div class="ov-hero-title" id="ov-hero-title">Dashboard</div>
+    <div class="ov-hero-sub" id="ov-hero-sub">Loading overview…</div>
+
+    <div class="ov-hero-stats">
+      <div class="ov-hero-stat">
+        <div class="ov-hero-stat-label">Searches (24h)</div>
+        <div class="ov-hero-stat-value" id="hero-searches">—</div>
+        <div class="ov-hero-stat-trend" id="hero-searches-trend">—</div>
+      </div>
+      <div class="ov-hero-stat">
+        <div class="ov-hero-stat-label">Ads found (24h)</div>
+        <div class="ov-hero-stat-value" id="hero-ads">—</div>
+        <div class="ov-hero-stat-trend" id="hero-ads-trend">—</div>
+      </div>
+      <div class="ov-hero-stat">
+        <div class="ov-hero-stat-label">Captchas (24h)</div>
+        <div class="ov-hero-stat-value" id="hero-captchas">—</div>
+        <div class="ov-hero-stat-trend" id="hero-captchas-trend">—</div>
+      </div>
+      <div class="ov-hero-stat">
+        <div class="ov-hero-stat-label">Success rate</div>
+        <div class="ov-hero-stat-value" id="hero-rate">—</div>
+        <div class="ov-hero-stat-trend" id="hero-rate-trend">—</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Secondary stat grid (totals) -->
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-label">Total searches (all time)</div>
+      <div class="stat-value" id="stat-searches">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Total ads tracked</div>
+      <div class="stat-value" id="stat-ads">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Unique competitors</div>
+      <div class="stat-value" id="stat-competitors">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Active profiles</div>
+      <div class="stat-value" id="stat-profiles">—</div>
+    </div>
+  </div>
+
+  <!-- Split: daily chart + recent activity -->
+  <div class="ov-grid">
+    <div class="card">
+      <div class="card-title">Searches (last 7 days)</div>
+      <canvas id="chart-daily" height="120"></canvas>
+    </div>
+    <div class="card">
+      <div class="card-title">Recent activity</div>
+      <div class="ov-activity" id="ov-activity">
+        <div class="empty-state" style="padding: 20px 0;">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Top competitors -->
+  <div class="card">
+    <div class="card-title">
+      Top competitors
+      <span class="badge" id="top-competitors-badge">0</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th>Ad title</th>
+          <th>Queries matched</th>
+          <th>Last seen</th>
+        </tr>
+      </thead>
+      <tbody id="top-competitors-tbody">
+        <tr><td colspan="4" class="empty-state">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Health overview for each profile -->
+  <div class="card">
+    <div class="card-title">Profile health</div>
+    <table>
+      <thead>
+        <tr>
+          <th>Profile</th>
+          <th>Template</th>
+          <th>Self-check</th>
+          <th>Searches 24h</th>
+          <th>Captcha rate</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="profile-health-tbody">
+        <tr><td colspan="6" class="empty-state">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>

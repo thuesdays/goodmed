@@ -1,0 +1,223 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Proxy</div>
+      <div class="page-subtitle">Connection settings, live diagnostics and IP tracking</div>
+    </div>
+  </div>
+
+  <!-- ─── LIVE DIAGNOSTICS ─────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🛰  Live proxy diagnostics</div>
+
+    <div class="proxy-live" id="proxy-live-panel">
+      <div class="proxy-live-header">
+        <div>
+          <div class="proxy-live-label">Current exit IP</div>
+          <div class="proxy-live-ip" id="proxy-live-ip">—</div>
+        </div>
+        <div class="proxy-live-actions">
+          <button class="btn btn-secondary" id="btn-refresh-ip">🔄 Refresh</button>
+          <button class="btn btn-primary"   id="btn-rotate-ip">⚡ Rotate IP</button>
+        </div>
+      </div>
+
+      <div class="proxy-live-grid">
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">Country</div>
+          <div class="proxy-live-cell-value" id="proxy-live-country">—</div>
+        </div>
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">City</div>
+          <div class="proxy-live-cell-value" id="proxy-live-city">—</div>
+        </div>
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">Timezone</div>
+          <div class="proxy-live-cell-value" id="proxy-live-tz">—</div>
+        </div>
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">ASN / Provider</div>
+          <div class="proxy-live-cell-value" id="proxy-live-asn">—</div>
+        </div>
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">IP type</div>
+          <div class="proxy-live-cell-value" id="proxy-live-iptype">—</div>
+        </div>
+        <div class="proxy-live-cell">
+          <div class="proxy-live-cell-label">Detection risk</div>
+          <div class="proxy-live-cell-value" id="proxy-live-risk">—</div>
+        </div>
+      </div>
+
+      <div class="proxy-live-checks">
+        <div class="proxy-live-check" id="check-geo">
+          <span class="check-icon">○</span>
+          <span>Geo match (expected <span id="expected-country">Ukraine</span>)</span>
+        </div>
+        <div class="proxy-live-check" id="check-tz">
+          <span class="check-icon">○</span>
+          <span>Timezone match (expected <span id="expected-tz">Europe/Kyiv</span>)</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Rotation test -->
+    <div class="proxy-rotation-test">
+      <div class="proxy-rotation-header">
+        <div class="proxy-rotation-title">Rotation test</div>
+        <div class="proxy-rotation-controls">
+          <label class="form-label" for="rotation-count" style="margin: 0; color: var(--text-2);">
+            Requests:
+          </label>
+          <select id="rotation-count" class="select" style="width: 80px;">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="30">30</option>
+          </select>
+          <button class="btn btn-secondary" id="btn-rotation-test">🧪 Run test</button>
+        </div>
+      </div>
+      <div class="form-hint" style="margin-top: 0;">
+        Runs N requests through the proxy and shows each exit. Use this to
+        verify the country filter actually works as configured.
+      </div>
+      <div id="rotation-test-results"></div>
+    </div>
+  </div>
+
+  <!-- ─── MODE ─────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Mode</div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-use-pool" data-config="proxy.use_pool">
+      <label for="cfg-use-pool">Use proxy pool (pick random on every run)</label>
+    </div>
+    <div class="form-hint">
+      When enabled, one proxy URL is picked at random from the pool below.
+    </div>
+
+    <div class="checkbox-row" style="margin-top: 12px;">
+      <input type="checkbox" id="cfg-auto-rotate" data-config="proxy.auto_rotate_on_start">
+      <label for="cfg-auto-rotate">
+        Auto-rotate IP at start of every run
+        <span class="badge-recommended">recommended</span>
+      </label>
+    </div>
+    <div class="form-hint">
+      Forces a fresh random exit IP for each run. Prevents re-using a
+      stale IP across runs, which Google picks up as automation.
+    </div>
+  </div>
+
+  <!-- ─── GEO LOCK ─────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Geo lock</div>
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">Expected exit country</label>
+        <input type="text" class="input" data-config="browser.expected_country"
+               placeholder="Ukraine">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Expected timezone</label>
+        <input type="text" class="input" data-config="browser.expected_timezone"
+               placeholder="Europe/Kyiv">
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">When the exit doesn't match</label>
+      <select class="select" data-config="browser.geo_mismatch_mode"
+              style="max-width: 260px;">
+        <option value="rotate">Rotate up to 5 times, then abort</option>
+        <option value="abort">Abort immediately</option>
+        <option value="warn">Warn but proceed</option>
+      </select>
+      <div class="form-hint">
+        If the rotating proxy returns an exit in the wrong country, the
+        browser fingerprint (locale, timezone) mismatches the IP — Google
+        flags this immediately.
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── SINGLE PROXY ─────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Single proxy URL (used when pool is disabled)</div>
+    <div class="form-group">
+      <input type="text" class="input"
+             data-config="proxy.url"
+             placeholder="user:pass@host:port">
+      <div class="form-hint">Format: username:password@host:port</div>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-is-rotating" data-config="proxy.is_rotating">
+      <label for="cfg-is-rotating">This endpoint rotates exit IPs</label>
+    </div>
+  </div>
+
+  <!-- ─── ROTATION API ─────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Rotation API (for forced IP change on captcha)</div>
+    <div class="form-group">
+      <label class="form-label">Provider</label>
+      <select class="select" data-config="proxy.rotation_provider" style="max-width: 240px;">
+        <option value="none">None — wait for auto-rotation</option>
+        <option value="asocks">asocks (URL-based auth)</option>
+        <option value="brightdata">Bright Data (Bearer token)</option>
+        <option value="generic">Generic (X-API-Key header)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Rotation API URL</label>
+      <input type="text" class="input" data-config="proxy.rotation_api_url"
+             placeholder="https://api.asocks.com/v2/proxy/refresh/12345">
+    </div>
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">API key (optional)</label>
+        <input type="password" class="input" data-config="proxy.rotation_api_key">
+      </div>
+      <div class="form-group">
+        <label class="form-label">HTTP method</label>
+        <select class="select" data-config="proxy.rotation_method">
+          <option value="GET">GET</option>
+          <option value="POST">POST</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── POOL ─────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">Proxy pool (one per line)</div>
+    <textarea class="textarea" rows="8"
+              data-config="proxy.pool_urls" data-config-list="true"
+              placeholder="user1:pass1@host1:port&#10;user2:pass2@host2:port"></textarea>
+    <div class="form-hint">
+      Paste multiple proxies. When "Use pool" is enabled above, a random one
+      is picked each run.
+    </div>
+  </div>
+
+  <!-- ─── IP STATS ─────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">
+      IP statistics <span class="badge" id="ip-count">0</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>IP</th>
+          <th>Country</th>
+          <th>Provider</th>
+          <th>Uses</th>
+          <th>Captchas</th>
+          <th>Rate</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="ips-tbody"></tbody>
+    </table>
+  </div>
+</section>

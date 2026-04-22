@@ -1,0 +1,56 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Search</div>
+      <div class="page-subtitle">Queries and domain filters</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Queries (one per line)</div>
+    <textarea class="textarea" rows="6"
+              data-config="search.queries" data-config-list="true"
+              placeholder="brand&#10;brand alternative spelling"></textarea>
+    <div class="form-hint">Queries to monitor for competitor ads</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Own domains (excluded from competitors)</div>
+    <textarea class="textarea" rows="4"
+              data-config="search.my_domains" data-config-list="true"
+              placeholder="goodmedika.com.ua&#10;goodmedika.ua"></textarea>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Target domains (triggers "on target domain" actions)</div>
+    <textarea class="textarea" rows="4"
+              data-config="search.target_domains" data-config-list="true"
+              placeholder="apteka24.ua&#10;med-magazin.ua"></textarea>
+    <div class="form-hint">
+      When ad domain matches any entry here, the special action pipeline
+      on the Actions page will run instead of the default one.
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Refresh behavior (when no ads on SERP)</div>
+    <div class="input-row-3">
+      <div class="form-group">
+        <label class="form-label">Refresh min (sec)</label>
+        <input type="number" class="input" data-config="search.refresh_min_sec" min="5" max="60">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Refresh max (sec)</label>
+        <input type="number" class="input" data-config="search.refresh_max_sec" min="5" max="120">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Max attempts per query</label>
+        <input type="number" class="input" data-config="search.refresh_max_attempts" min="1" max="10">
+      </div>
+    </div>
+    <div class="form-hint">
+      If a SERP loads but has no ads, the monitor refreshes every N seconds
+      until ads appear (or max attempts reached).
+    </div>
+  </div>
+</section>

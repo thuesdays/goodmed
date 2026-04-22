@@ -1,0 +1,40 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Behavior</div>
+      <div class="page-subtitle">Real-user emulation options</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Naturalness</div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-bg-tabs" data-config="behavior.open_background_tabs">
+      <label for="cfg-bg-tabs">Open background tabs</label>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Disabled by default — the C++ stealth patches already handle most detection vectors.
+      Enable only if you see capture ban rates climbing.
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-idle" data-config="behavior.idle_pauses">
+      <label for="cfg-idle">Idle pauses (simulate user getting distracted)</label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="cfg-pre-target" data-config="behavior.pre_target_warmup">
+      <label for="cfg-pre-target">Pre-target warmup (neutral search before the real one)</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Captcha</div>
+    <div class="form-group">
+      <label class="form-label">2Captcha API key</label>
+      <input type="password" class="input" data-config="captcha.twocaptcha_key">
+      <div class="form-hint">
+        Leave empty if you don't want automatic captcha solving.
+        With properly-patched Chromium, captchas should rarely appear.
+      </div>
+    </div>
+  </div>
+</section>

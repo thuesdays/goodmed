@@ -1,126 +1,134 @@
 """
-session_manager.py — Управление cookies, localStorage и сессией
+session_manager.py — Cookie and storage I/O for a Selenium driver.
 
-Позволяет:
-- Экспортировать cookies из активного браузера в JSON
-- Импортировать cookies из JSON, Netscape-формата или реального Chrome
-- Сохранять/загружать localStorage и sessionStorage
-- Быстро "оживлять" профиль cookies из настоящего браузера
+Main responsibilities (kept intentionally small):
+  - export_cookies() / import_cookies() — session portability via JSON
+  - export_storage() / import_storage() — localStorage + sessionStorage
+  - import_from_chrome() — one-shot copy of cookies from the installed
+    real Chrome profile (useful to warm a fresh Ghost Shell profile with
+    a known-good Google session)
+
+Note: The full round-trip save/restore on browser open/close is handled
+by GhostShellBrowser._auto_save_session / _restore_session. This module
+is useful for manual operations and the "seed from real Chrome" flow.
 """
 
 import os
 import json
-import sqlite3
 import shutil
 import time
 import logging
 import tempfile
+import sqlite3
 from datetime import datetime
 
 
 class SessionManager:
     """
-    Использование:
+    Usage:
         sm = SessionManager(browser.driver)
 
-        # Экспорт текущей сессии
+        # Export current session
         sm.export_cookies("sessions/my_session.json")
         sm.export_storage("sessions/my_session_storage.json")
 
-        # Импорт
+        # Import later
         sm.import_cookies("sessions/my_session.json")
         sm.import_storage("sessions/my_session_storage.json")
 
-        # Импорт из реального Chrome
+        # Seed from real Chrome (Chrome MUST be closed — DB is locked otherwise)
         sm.import_from_chrome(domain_filter=["google.com", "youtube.com"])
     """
 
     def __init__(self, driver):
         self.driver = driver
 
-    # ──────────────────────────────────────────────────────────
-    # COOKIES — EXPORT / IMPORT
-    # ──────────────────────────────────────────────────────────
+    # ─── Cookies ───────────────────────────────────────────
 
     def export_cookies(self, filepath: str) -> int:
-        """Экспортирует все cookies текущей сессии в JSON"""
         cookies = self.driver.get_cookies()
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(cookies, f, indent=2, ensure_ascii=False)
-        logging.info(f"[Session] Экспортировано {len(cookies)} cookies → {filepath}")
+        logging.info(f"[Session] Exported {len(cookies)} cookies → {filepath}")
         return len(cookies)
 
     def import_cookies(self, filepath: str, domain_filter: list = None) -> int:
-        """
-        Импортирует cookies из JSON через CDP Network.setCookie.
-        Это работает мгновенно и не требует навигации на сайты.
-        """
+        """Import cookies from JSON. Navigates to each domain so it can
+        legally set cookies for that scope."""
         if not os.path.exists(filepath):
-            logging.warning(f"[Session] Файл не найден: {filepath}")
+            logging.warning(f"[Session] File not found: {filepath}")
             return 0
 
         with open(filepath, "r", encoding="utf-8") as f:
             cookies = json.load(f)
 
+        domains = set()
+        for c in cookies:
+            d = (c.get("domain") or "").lstrip(".")
+            if not d:
+                continue
+            if domain_filter and not any(f in d for f in domain_filter):
+                continue
+            domains.add(d)
+
         imported = 0
-        for cookie in cookies:
+        for domain in domains:
             try:
-                domain = cookie.get("domain", "")
-                if domain_filter and not any(d in domain for d in domain_filter):
-                    continue
+                self.driver.get(f"https://{domain}")
+                time.sleep(1)
+                for c in cookies:
+                    cd = (c.get("domain") or "").lstrip(".")
+                    if cd != domain:
+                        continue
+                    if domain_filter and not any(f in cd for f in domain_filter):
+                        continue
 
-                # Подготовка параметров для CDP Network.setCookie
-                params = {
-                    "name":   cookie["name"],
-                    "value":  cookie["value"],
-                    "domain": domain,
-                    "path":   cookie.get("path", "/"),
-                    "secure": cookie.get("secure", False),
-                    "httpOnly": cookie.get("httpOnly", False),
-                }
-                if "expiry" in cookie:
-                    params["expires"] = int(cookie["expiry"])
-                if "sameSite" in cookie:
-                    ss = cookie["sameSite"]
-                    if ss in ("None", "Lax", "Strict"):
-                        params["sameSite"] = ss
-
-                self.driver.execute_cdp_cmd("Network.setCookie", params)
-                imported += 1
+                    # Keep only fields Selenium accepts
+                    clean = {k: v for k, v in c.items()
+                             if k in ("name", "value", "domain", "path",
+                                      "secure", "httpOnly", "expiry", "sameSite")}
+                    if "expiry" in clean:
+                        try:
+                            clean["expiry"] = int(clean["expiry"])
+                        except (ValueError, TypeError):
+                            clean.pop("expiry", None)
+                    try:
+                        self.driver.add_cookie(clean)
+                        imported += 1
+                    except Exception as e:
+                        logging.debug(f"[Session] could not set {c.get('name')}: {e}")
             except Exception as e:
-                logging.debug(f"[Session] Ошибка импорта куки {cookie.get('name')}: {e}")
+                logging.debug(f"[Session] error on {domain}: {e}")
 
-        logging.info(f"[Session] Импортировано {imported} cookies через CDP")
+        logging.info(f"[Session] Imported {imported} cookies")
         return imported
 
-    # ──────────────────────────────────────────────────────────
-    # LOCALSTORAGE / SESSIONSTORAGE
-    # ──────────────────────────────────────────────────────────
+    # ─── localStorage / sessionStorage ────────────────────
 
     def export_storage(self, filepath: str) -> dict:
-        """Экспортирует localStorage текущего домена"""
         try:
-            local  = self.driver.execute_script("return Object.assign({}, localStorage);")
+            local   = self.driver.execute_script("return Object.assign({}, localStorage);")
             session = self.driver.execute_script("return Object.assign({}, sessionStorage);")
         except Exception as e:
-            logging.error(f"[Session] Ошибка чтения storage: {e}")
+            logging.error(f"[Session] storage read error: {e}")
             return {}
 
         data = {
-            "url":           self.driver.current_url,
-            "localStorage":  local,
+            "url":            self.driver.current_url,
+            "localStorage":   local,
             "sessionStorage": session,
-            "timestamp":     datetime.now().isoformat(),
+            "timestamp":      datetime.now().isoformat(timespec="seconds"),
         }
         os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        logging.info(f"[Session] Storage экспортирован ({len(local)} local + {len(session)} session)")
+        logging.info(
+            f"[Session] Storage exported ({len(local)} local + {len(session)} session)"
+        )
         return data
 
     def import_storage(self, filepath: str, navigate_first: bool = True) -> int:
-        """Импортирует localStorage/sessionStorage. Важно — на правильном домене."""
         if not os.path.exists(filepath):
             return 0
         with open(filepath, "r", encoding="utf-8") as f:
@@ -134,7 +142,8 @@ class SessionManager:
         for key, value in (data.get("localStorage") or {}).items():
             try:
                 self.driver.execute_script(
-                    "localStorage.setItem(arguments[0], arguments[1]);", key, value
+                    "localStorage.setItem(arguments[0], arguments[1]);",
+                    key, value,
                 )
                 count += 1
             except Exception:
@@ -142,17 +151,16 @@ class SessionManager:
         for key, value in (data.get("sessionStorage") or {}).items():
             try:
                 self.driver.execute_script(
-                    "sessionStorage.setItem(arguments[0], arguments[1]);", key, value
+                    "sessionStorage.setItem(arguments[0], arguments[1]);",
+                    key, value,
                 )
                 count += 1
             except Exception:
                 pass
-        logging.info(f"[Session] Импортировано {count} элементов storage")
+        logging.info(f"[Session] Imported {count} storage entries")
         return count
 
-    # ──────────────────────────────────────────────────────────
-    # ИМПОРТ ИЗ РЕАЛЬНОГО CHROME
-    # ──────────────────────────────────────────────────────────
+    # ─── Seed from real Chrome (one-time) ─────────────────
 
     def import_from_chrome(
         self,
@@ -160,33 +168,39 @@ class SessionManager:
         chrome_profile_path: str = None,
     ) -> int:
         """
-        Импортирует cookies из установленного Chrome на этом ПК.
-        ВНИМАНИЕ: Chrome должен быть ЗАКРЫТ чтобы БД не была залочена.
+        Import cookies from the user's installed Chrome (Default profile
+        unless otherwise specified). CHROME MUST BE CLOSED — otherwise
+        the Cookies SQLite file is locked by the OS and the copy fails.
 
-        domain_filter — список доменов для импорта (напр. ["google.com", "youtube.com"])
+        Note: Chrome encrypts most cookies via DPAPI on Windows. This
+        method does NOT decrypt them — it copies only plaintext `value`
+        rows. This is still useful for non-sensitive cookies (e.g. locale,
+        consent, cf_clearance). For full DPAPI decryption you need a
+        separate tool.
         """
         if chrome_profile_path is None:
-            # Стандартный путь Chrome на Windows
             appdata = os.environ.get("LOCALAPPDATA", "")
             chrome_profile_path = os.path.join(
                 appdata, "Google", "Chrome", "User Data", "Default"
             )
 
+        # Newer Chrome stores cookies in <Profile>/Network/Cookies
         cookies_db = os.path.join(chrome_profile_path, "Network", "Cookies")
         if not os.path.exists(cookies_db):
-            cookies_db = os.path.join(chrome_profile_path, "Cookies")  # старый путь
-
+            cookies_db = os.path.join(chrome_profile_path, "Cookies")
         if not os.path.exists(cookies_db):
-            logging.error(f"[Session] БД cookies Chrome не найдена: {cookies_db}")
+            logging.error(f"[Session] Chrome cookies DB not found: {cookies_db}")
             return 0
 
-        # Копируем БД во временный файл — не трогаем оригинал
+        # Copy to temp so we don't risk corrupting the real DB
         with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copy2(cookies_db, tmp_path)
         except PermissionError:
-            logging.error("[Session] Не удалось скопировать БД — Chrome открыт?")
+            logging.error("[Session] Could not copy Chrome DB — is Chrome running?")
+            try: os.remove(tmp_path)
+            except OSError: pass
             return 0
 
         cookies = []
@@ -194,21 +208,18 @@ class SessionManager:
             conn = sqlite3.connect(tmp_path)
             cur  = conn.cursor()
             query = """
-                SELECT host_key, name, value, path, expires_utc, is_secure, is_httponly, samesite
+                SELECT host_key, name, value, path, expires_utc,
+                       is_secure, is_httponly, samesite
                 FROM cookies
             """
             for row in cur.execute(query):
                 domain = row[0].lstrip(".")
-                if domain_filter and not any(d in domain for d in domain_filter):
+                if domain_filter and not any(f in domain for f in domain_filter):
+                    continue
+                if not row[2]:       # skip rows with empty plaintext value (encrypted)
                     continue
 
-                # Chrome хранит encrypted_value отдельно — в этом примере только незашифрованные
-                # Для полного импорта нужна расшифровка через DPAPI (Windows)
-                if not row[2]:
-                    continue  # пропускаем зашифрованные
-
-                # expires_utc — microseconds с 1601-01-01
-                # Переводим в Unix timestamp
+                # expires_utc = microseconds since 1601-01-01 → Unix timestamp
                 expiry = None
                 if row[4]:
                     expiry = int(row[4] / 1_000_000 - 11644473600)
@@ -228,50 +239,49 @@ class SessionManager:
                 if expiry:
                     cookie["expiry"] = expiry
                 cookies.append(cookie)
-
             conn.close()
         finally:
             try: os.remove(tmp_path)
-            except: pass
+            except OSError: pass
 
         if not cookies:
-            logging.warning("[Session] Не нашли незашифрованных cookies для импорта")
-            logging.warning("          Chrome шифрует cookies через DPAPI — нужна отдельная расшифровка")
+            logging.warning(
+                "[Session] No plaintext cookies found to import. "
+                "Chrome encrypts most cookies via DPAPI — you'd need a "
+                "decryption tool for the rest."
+            )
             return 0
 
-        # Сохраняем и импортируем
+        # Write to a temp JSON and reuse import_cookies()
         tmp_json = tempfile.mktemp(suffix=".json")
         with open(tmp_json, "w", encoding="utf-8") as f:
             json.dump(cookies, f, ensure_ascii=False)
         try:
-            imported = self.import_cookies(tmp_json, domain_filter=domain_filter)
+            return self.import_cookies(tmp_json, domain_filter=domain_filter)
         finally:
             try: os.remove(tmp_json)
-            except: pass
-        return imported
+            except OSError: pass
 
-    # ──────────────────────────────────────────────────────────
-    # СОХРАНЕНИЕ ПОЛНОЙ СЕССИИ
-    # ──────────────────────────────────────────────────────────
+    # ─── Full-session bundle helpers ──────────────────────
 
     def save_full_session(self, directory: str):
-        """Сохраняет cookies + storage + текущий URL в папку"""
+        """Save cookies + storage + URL/title metadata to a directory."""
         os.makedirs(directory, exist_ok=True)
         self.export_cookies(os.path.join(directory, "cookies.json"))
         self.export_storage(os.path.join(directory, "storage.json"))
         info = {
             "url":       self.driver.current_url,
             "title":     self.driver.title,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         with open(os.path.join(directory, "info.json"), "w", encoding="utf-8") as f:
             json.dump(info, f, indent=2, ensure_ascii=False)
-        logging.info(f"[Session] Полная сессия сохранена: {directory}")
+        logging.info(f"[Session] Full session saved → {directory}")
 
     def restore_full_session(self, directory: str):
-        """Восстанавливает cookies + storage из папки"""
+        """Restore cookies + storage from a directory (reverse of save_full_session)."""
         if not os.path.exists(directory):
-            raise ValueError(f"Папка сессии не найдена: {directory}")
+            raise ValueError(f"Session directory not found: {directory}")
         self.import_cookies(os.path.join(directory, "cookies.json"))
         self.import_storage(os.path.join(directory, "storage.json"))
-        logging.info(f"[Session] Сессия восстановлена из {directory}")
+        logging.info(f"[Session] Session restored from {directory}")

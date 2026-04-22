@@ -1,0 +1,56 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Run history</div>
+      <div class="page-subtitle">All monitoring runs stored in the database</div>
+    </div>
+    <button class="btn btn-secondary" id="reload-runs-btn">Reload</button>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat">
+      <div class="stat-label">Total runs</div>
+      <div class="stat-value" id="runs-total">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Successful</div>
+      <div class="stat-value" id="runs-success">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Failed</div>
+      <div class="stat-value" id="runs-failed">—</div>
+    </div>
+  </div>
+
+  <!-- Clear history toolbar -->
+  <div class="history-toolbar">
+    <div class="history-toolbar-label">🗑 Clear run history:</div>
+    <select id="clear-runs-scope" class="select">
+      <option value="30">Older than 30 days</option>
+      <option value="7">Older than 7 days</option>
+      <option value="1">Older than 1 day</option>
+      <option value="all">All runs (dangerous)</option>
+    </select>
+    <button class="btn-danger" id="btn-clear-runs">Clear</button>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Runs list</div>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Started</th>
+          <th>Profile</th>
+          <th>Duration</th>
+          <th>Requests</th>
+          <th>Ads</th>
+          <th>Captchas</th>
+          <th>Exit</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="runs-tbody"></tbody>
+    </table>
+  </div>
+</section>

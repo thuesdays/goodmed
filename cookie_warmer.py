@@ -1,19 +1,19 @@
 """
-cookie_warmer.py — Мгновенный прогрев через готовые cookies
+cookie_warmer.py — Мгновенный прогрев via готовые cookies
 
-Вместо реальных посещений сайтов (2-5 минут) устанавливает через CDP
-правдоподобные cookies которые характерны для активного браузера:
+Вместо real посещений сайтов (2-5 минут) устанавливает via CDP
+правдоподобные cookies that характерны for активного browserа:
 
-- Consent cookies Google/YouTube (как будто юзер принял согласие раньше)
-- NID cookie Google (идентификатор сессии)
+- Consent cookies Google/YouTube (as будто юзер onнял согласие earlier)
+- NID cookie Google (идентификатор sessions)
 - Preference cookies (языки, регион)
-- localStorage для крупных сайтов
+- localStorage for крупных сайтов
 
-Это даёт тот же сигнал "я тут уже бывал" без траты времени на реальный прогрев.
+Это yesёт тот же сигнал "я here already бывал" without траты времени на real прогрев.
 
-ВАЖНО: cookies тут сгенерированы по правильному формату но со случайными
-значениями — они не валидны для авторизации. Они работают как "присутствие",
-а не "авторизация". Google видит что браузер имеет историю настроек.
+ВАЖНО: cookies here сгенерированы по correctlyму формату но со случайными
+значениями — они не валидны for авторизации. Они работают as "onсутствие",
+а не "авторизация". Google видит that browser имеет историю настроек.
 """
 
 import time
@@ -29,7 +29,7 @@ def _random_string(length: int, alphabet: str = None) -> str:
 
 
 def _future_timestamp(days: int) -> int:
-    """Unix timestamp через N дней"""
+    """Unix timestamp via N дней"""
     return int(time.time() + days * 86400)
 
 
@@ -39,11 +39,11 @@ def _future_timestamp(days: int) -> int:
 
 def google_cookies() -> list[dict]:
     """
-    Cookies что устанавливает Google для активного юзера.
-    Имитируем профиль который уже раньше заходил на google.com.
+    Cookies that устанавливает Google for активного юзера.
+    Имитируем профиль that already earlier заходил на google.com.
     """
     return [
-        # Consent — был принят какое-то время назад
+        # Consent — был onнят asое-то время назад
         {
             "name":   "CONSENT",
             "value":  f"YES+cb.{datetime.now().strftime('%Y%m%d')}-{random.randint(10,17)}-p0.uk+FX+{random.randint(100,999)}",
@@ -80,7 +80,7 @@ def google_cookies() -> list[dict]:
             "sameSite": "None",
             "expiry": _future_timestamp(30),
         },
-        # AEC — ещё один consent-related
+        # AEC — still один consent-related
         {
             "name":   "AEC",
             "value":  _random_string(80),
@@ -121,7 +121,7 @@ def youtube_cookies() -> list[dict]:
             "path":   "/",
             "secure": True,
             "httpOnly": True,
-            # Session cookie — без expiry
+            # Session cookie — without expiry
         },
         {
             "name":   "PREF",
@@ -135,7 +135,7 @@ def youtube_cookies() -> list[dict]:
 
 
 def common_analytics_cookies() -> list[dict]:
-    """Google Analytics + общие трекеры — эти есть почти у каждого"""
+    """Google Analytics + общие трекеры — these is почти у each"""
     ga_id = f"GA1.2.{random.randint(1000000000, 9999999999)}.{int(time.time()) - random.randint(86400*7, 86400*60)}"
     return [
         {
@@ -161,16 +161,16 @@ def common_analytics_cookies() -> list[dict]:
 
 class CookieWarmer:
     """
-    Использование:
+    Usage:
         warmer = CookieWarmer(browser.driver)
-        warmer.fast_warmup()   # 5-10 секунд вместо 2-5 минут
+        warmer.fast_warmup()   # 5-10 секунд instead of 2-5 минут
     """
 
     def __init__(self, driver):
         self.driver = driver
 
     def _inject_cookies_via_cdp(self, cookies: list[dict]):
-        """Устанавливает cookies через CDP Network.setCookie — без посещения страницы"""
+        """Устанавливает cookies via CDP Network.setCookie — without посещения страницы"""
         # Включаем Network domain
         try:
             self.driver.execute_cdp_cmd("Network.enable", {})
@@ -196,15 +196,15 @@ class CookieWarmer:
                 self.driver.execute_cdp_cmd("Network.setCookie", params)
                 injected += 1
             except Exception as e:
-                logging.debug(f"[CookieWarmer] Не удалось установить {c['name']}: {e}")
+                logging.debug(f"[CookieWarmer] Не уyesлось установить {c['name']}: {e}")
         return injected
 
     def fast_warmup(self):
         """
-        Быстрый прогрев: устанавливаем cookies без реальных посещений.
-        Занимает 3-5 секунд вместо 2-5 минут.
+        Быстрый прогрев: устанавливаем cookies without real посещений.
+        Overнимает 3-5 секунд instead of 2-5 минут.
         """
-        logging.info("[CookieWarmer] ⚡ Быстрый прогрев через cookies...")
+        logging.info("[CookieWarmer] ⚡ Быстрый прогрев via cookies...")
         started = time.time()
 
         all_cookies = (
@@ -215,18 +215,18 @@ class CookieWarmer:
 
         count = self._inject_cookies_via_cdp(all_cookies)
 
-        # Также добавляем записи в localStorage для Google/YouTube
-        # Это делается через посещение — но очень короткое
+        # Также добавляем записи в localStorage for Google/YouTube
+        # Это делается via посещение — но очень короткое
         self._seed_local_storage()
 
         duration = time.time() - started
-        logging.info(f"[CookieWarmer] ✓ Установлено {count} cookies за {duration:.1f}с")
+        logging.info(f"[CookieWarmer] ✓ Installed {count} cookies in {duration:.1f}с")
 
     def _seed_local_storage(self):
-        """Засеиваем localStorage — только на текущей странице (без переходов)"""
+        """Overсеиваем localStorage — only на текущей странице (without переходов)"""
         try:
             # Мы не будем прыгать по доменам, просто посеем базовые вещи
-            # если мы уже на google.com
+            # if мы already на google.com
             if "google.com" in self.driver.current_url:
                 data = {
                     "_grecaptcha":            _random_string(30),
@@ -241,23 +241,23 @@ class CookieWarmer:
             pass
 
     # ──────────────────────────────────────────────────────────
-    # ГИБРИДНЫЙ ПРОГРЕВ — быстрый + короткие посещения
+    # ГИБРИДНЫЙ ПРОГРЕВ — fast + короткие посещения
     # ──────────────────────────────────────────────────────────
 
     def hybrid_warmup(self, short_visits: bool = True):
         """
-        Гибридный: сначала cookies, потом 1-2 коротких реальных посещения
-        для максимальной достоверности. Занимает 20-30 секунд.
+        Гибридный: сначала cookies, then 1-2 коротких real посещения
+        for максимальной достоверности. Overнимает 20-30 секунд.
         """
         self.fast_warmup()
 
         if not short_visits:
             return
 
-        logging.info("[CookieWarmer] Дополняем короткими посещениями...")
+        logging.info("[CookieWarmer] Supplementing with short visits...")
 
-        # Первым делом идём на google.com — он самый "тёплый" (cookies уже есть)
-        # и с него проверяем что сеть вообще работает
+        # Первым делом идём на google.com — он самый "тёплый" (cookies already is)
+        # и с него проверяем that сеть вообще works
         quick_sites = [
             "https://www.google.com/",
             "https://www.youtube.com/",
@@ -266,13 +266,13 @@ class CookieWarmer:
         for url in quick_sites[:2]:
             try:
                 self.driver.get(url)
-                # Ждём загрузки document (не networkidle — слишком строго)
+                # Waiting loading document (не networkidle — слишком строго)
                 self._wait_page_ready(timeout=15)
 
-                # Проверяем что не показалась офлайн-страница
+                # Проверяем that не whileзалась офлайн-страница
                 if self._is_offline_page():
-                    logging.warning(f"[CookieWarmer] {url} показал офлайн — пропускаем визиты")
-                    # Возвращаемся на blank чтобы не оставлять офлайн-страницу
+                    logging.warning(f"[CookieWarmer] {url} whileзал офлайн — пропускаем визиты")
+                    # Возвращаемся на blank thatбы не оставлять офлайн-страницу
                     try:
                         self.driver.get("about:blank")
                     except Exception:
@@ -290,7 +290,7 @@ class CookieWarmer:
                 logging.debug(f"[CookieWarmer] {url}: {e}")
 
     def _wait_page_ready(self, timeout: int = 15):
-        """Ждём document.readyState === complete"""
+        """Waiting document.readyState === complete"""
         started = time.time()
         while time.time() - started < timeout:
             try:
@@ -303,9 +303,9 @@ class CookieWarmer:
         return False
 
     def _is_offline_page(self) -> bool:
-        """Проверяет что Chrome не показал офлайн-страницу"""
+        """Проверяет that Chrome не whileзал офлайн-страницу"""
         try:
-            # Офлайн-страницы Chrome имеют специфичный title или текст
+            # Офлайн-страницы Chrome имеют специфичный title or текст
             title = (self.driver.title or "").lower()
             if any(marker in title for marker in ("офлайн", "offline", "недоступно")):
                 return True
@@ -314,9 +314,9 @@ class CookieWarmer:
                 "return (document.body && document.body.innerText || '').substring(0, 200).toLowerCase();"
             )
             offline_markers = [
-                "підключіться до інтернету", "connect to the internet",
+                "підключіться до інтерnoу", "connect to the internet",
                 "в режимі офлайн", "you're offline", "you are offline",
-                "нет соединения", "подключитесь к интернету",
+                "no соединения", "подключитесь к интерnoу",
             ]
             return any(m in body_text for m in offline_markers)
         except Exception:
