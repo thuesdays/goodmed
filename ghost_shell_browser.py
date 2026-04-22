@@ -283,6 +283,19 @@ class GhostShellBrowser:
         # --disable-blink-features=AutomationControlled REMOVED - redundant
         # with C++ patches and is itself a detection marker.
 
+        # ── Keep Chrome "active" even when not foreground ───────────
+        # Without these, if the user alt-tabs away or the window gets
+        # occluded, Chrome reduces document.visibilityState to "hidden",
+        # throttles timers and rAF, and some Google analytics scripts
+        # treat the page as "user not looking" — which hurts ad-click
+        # quality signals.
+        # The Selenium ActionChains API works via CDP and doesn't need
+        # OS focus, but keeping the page in "visible" state ensures
+        # real mousemove events don't get discarded as irrelevant.
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-background-timer-throttling")
+
         # Defensive: force the window to be visible on the primary desktop.
         options.add_argument("--window-position=100,100")
         options.add_argument("--start-maximized")

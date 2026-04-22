@@ -85,8 +85,57 @@ REFRESH_MIN_SEC      = CFG.get("search.refresh_min_sec", 10)
 REFRESH_MAX_SEC      = CFG.get("search.refresh_max_sec", 15)
 REFRESH_MAX_ATTEMPTS = CFG.get("search.refresh_max_attempts", 4)
 
-POST_AD_ACTIONS          = CFG.get("actions.post_ad", [])
-ON_TARGET_DOMAIN_ACTIONS = CFG.get("actions.on_target_domain", [])
+# ──────────────────────────────────────────────────────────────
+# BEHAVIOR TIMING — all configurable from dashboard Behavior page.
+# Every sleep/delay in the monitor run reads from these values, so
+# users can dial the whole pipeline from calm (long delays) to
+# aggressive (short) without touching code.
+# ──────────────────────────────────────────────────────────────
+BEHAVIOR = {
+    # Delay after first page load, before we start looking for ads
+    "initial_load_min":     CFG.get("behavior.initial_load_min",     2.0),
+    "initial_load_max":     CFG.get("behavior.initial_load_max",     4.0),
+
+    # Delay between SERP being ready and reading its contents
+    "serp_settle_min":      CFG.get("behavior.serp_settle_min",      1.5),
+    "serp_settle_max":      CFG.get("behavior.serp_settle_max",      3.0),
+
+    # Delay after driver.refresh() before we re-check page state
+    "post_refresh_min":     CFG.get("behavior.post_refresh_min",     2.0),
+    "post_refresh_max":     CFG.get("behavior.post_refresh_max",     4.0),
+
+    # Delay after an IP rotation, before re-running geo diagnostics
+    "post_rotate_min":      CFG.get("behavior.post_rotate_min",      2.0),
+    "post_rotate_max":      CFG.get("behavior.post_rotate_max",      4.0),
+
+    # Delay after stealth_get("https://google.com") on a fresh profile
+    "fresh_google_min":     CFG.get("behavior.fresh_google_min",     3.0),
+    "fresh_google_max":     CFG.get("behavior.fresh_google_max",     5.0),
+
+    # Delay after accepting consent banner
+    "post_consent_min":     CFG.get("behavior.post_consent_min",     2.0),
+    "post_consent_max":     CFG.get("behavior.post_consent_max",     4.0),
+
+    # Gap between consecutive queries in a single run
+    "between_queries_min":  CFG.get("behavior.between_queries_min",  6.0),
+    "between_queries_max":  CFG.get("behavior.between_queries_max", 12.0),
+}
+
+
+def _sleep(kind: str):
+    """Look up a configured min..max range and sleep a random value in it."""
+    lo = BEHAVIOR.get(f"{kind}_min")
+    hi = BEHAVIOR.get(f"{kind}_max")
+    if lo is None or hi is None:
+        logging.warning(f"[behavior] unknown sleep kind: {kind}")
+        return
+    t = random.uniform(float(lo), float(hi))
+    time.sleep(t)
+
+POST_AD_ACTIONS          = CFG.get("actions.post_ad_actions",
+                                   CFG.get("actions.post_ad", []))
+ON_TARGET_DOMAIN_ACTIONS = CFG.get("actions.on_target_domain_actions",
+                                   CFG.get("actions.on_target_domain", []))
 
 # run_id passed via env from dashboard, or created standalone
 RUN_ID = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
@@ -391,97 +440,40 @@ def parse_ads(driver, query: str) -> list[dict]:
 
 
 # ──────────────────────────────────────────────────────────────
-# POST-AD ACTIONS — user-defined pipeline
+# POST-AD ACTIONS — handled by action_runner module
 # ──────────────────────────────────────────────────────────────
 
-def execute_action(browser, action: dict, ad: dict):
-    """
-    Execute one user-configured action after an ad was found.
-
-    Supported action types:
-      - visit:   navigate to ad's clean_url (with probability gate)
-      - dwell:   wait N seconds on current page
-      - scroll:  human-scroll the page
-      - back:    go back in history
-      - close_tab: close this tab (if opened in new tab)
-    """
-    driver = browser.driver
-    act_type = action.get("type")
-
-    try:
-        if act_type == "visit":
-            probability = float(action.get("probability", 1.0))
-            if random.random() > probability:
-                logging.info(f"    skip visit (probability {probability})")
-                return
-
-            # Prefer google_click_url — this is the tracked /aclk? link that
-            # signals a REAL ad click to Google. Fall back to clean_url if
-            # for some reason it wasn't captured.
-            url = ad.get("google_click_url") or ad.get("clean_url")
-            if not url:
-                return
-            logging.info(f"    → visit {url[:80]}")
-
-            # Open in new tab to keep SERP alive
-            original = driver.current_window_handle
-            driver.execute_script(f"window.open('{url}', '_blank');")
-            time.sleep(1.5)
-            new_handle = [h for h in driver.window_handles if h != original][-1]
-            driver.switch_to.window(new_handle)
-
-            dwell_min = float(action.get("dwell_min", 5))
-            dwell_max = float(action.get("dwell_max", 15))
-            time.sleep(random.uniform(dwell_min, dwell_max))
-
-            try:
-                browser.human_scroll(1, 2)
-            except Exception:
-                pass
-
-            driver.close()
-            driver.switch_to.window(original)
-
-        elif act_type == "dwell":
-            min_sec = float(action.get("min_sec", 2))
-            max_sec = float(action.get("max_sec", 6))
-            t = random.uniform(min_sec, max_sec)
-            logging.info(f"    → dwell {t:.1f}s")
-            time.sleep(t)
-
-        elif act_type == "scroll":
-            n_min = int(action.get("min_scrolls", 1))
-            n_max = int(action.get("max_scrolls", 3))
-            logging.info(f"    → scroll {n_min}..{n_max}")
-            try:
-                browser.human_scroll(n_min, n_max)
-            except Exception:
-                driver.execute_script(f"window.scrollBy(0, {random.randint(200, 500)});")
-
-        elif act_type == "back":
-            delay = float(action.get("delay_sec", 1))
-            logging.info(f"    → back (delay {delay}s)")
-            time.sleep(delay)
-            driver.back()
-
-        else:
-            logging.warning(f"    unknown action type: {act_type}")
-
-    except Exception as e:
-        logging.warning(f"    action {act_type} failed: {e}")
+# Legacy execute_action() removed — all logic moved to action_runner.py
+# which supports 17 action types with human-like mouse/scroll/typing.
 
 
 def run_post_ad_pipeline(browser, ad: dict):
-    """Run the configured action pipeline for one ad"""
-    # Choose which pipeline to use
-    pipeline = ON_TARGET_DOMAIN_ACTIONS if ad.get("is_target") else POST_AD_ACTIONS
+    """
+    Run the configured action pipeline for one ad. Delegates to
+    action_runner.run_pipeline which implements 17 human-like action
+    types (click_ad with real mouse movement, read, type, hover,
+    scroll, back, etc.).
+
+    Pipeline is configured per-profile in the dashboard (Behavior /
+    Actions pages). See action_runner.action_catalog() for the full
+    list of action types and their params.
+
+    The pipeline sees three common flags on every step:
+      - probability         — chance this step runs (0..1)
+      - skip_on_my_domain   — skip if ad.domain is in MY_DOMAINS
+      - skip_on_target      — skip if ad.is_target (target domain)
+    """
+    from action_runner import run_pipeline
+
+    pipeline = ON_TARGET_DOMAIN_ACTIONS if ad.get("is_target") \
+               else POST_AD_ACTIONS
     if not pipeline:
         return
 
-    for action in pipeline:
-        if not action.get("enabled", True):
-            continue
-        execute_action(browser, action, ad)
+    run_pipeline(browser, pipeline, context={
+        "ad":         ad,
+        "my_domains": MY_DOMAINS,
+    })
 
 
 # ──────────────────────────────────────────────────────────────
@@ -506,7 +498,7 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
         logging.error(f"  navigation failed: {e}")
         return []
 
-    time.sleep(random.uniform(2, 4))
+    _sleep("initial_load")
 
     for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
         if is_offline_page(driver):
@@ -537,7 +529,7 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             )
         except Exception:
             pass
-        time.sleep(random.uniform(1.5, 3))
+        _sleep("serp_settle")
 
         ads = parse_ads(driver, query)
         if ads:
@@ -560,7 +552,7 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                 return []
             continue
 
-        time.sleep(random.uniform(2, 4))
+        _sleep("post_refresh")
 
     return []
 
@@ -706,7 +698,7 @@ def run_monitor():
                     except Exception as e:
                         logging.warning(f"    rotate failed: {e}")
                         break
-                    time.sleep(random.uniform(2, 4))
+                    _sleep("post_rotate")
                     report2 = diag.full_check(
                         expected_timezone = EXPECTED_TIMEZONE,
                         expected_country  = EXPECTED_COUNTRY,
@@ -740,7 +732,7 @@ def run_monitor():
             logging.info("🌱 Fresh profile — seeding Google consent cookies...")
             try:
                 browser.stealth_get("https://www.google.com/")
-                time.sleep(random.uniform(3, 5))
+                _sleep("fresh_google")
 
                 if is_offline_page(driver):
                     logging.error("✗ Google offline — proxy broken")
@@ -755,7 +747,7 @@ def run_monitor():
                         ))
                     )
                     btn.click()
-                    time.sleep(random.uniform(2, 4))
+                    _sleep("post_consent")
                     logging.info("  🍪 consent accepted")
                 except Exception:
                     pass
@@ -908,7 +900,9 @@ def run_monitor():
 
                 # Gap between queries
                 if i < len(SEARCH_QUERIES):
-                    gap = random.uniform(6, 12)
+                    lo = float(BEHAVIOR["between_queries_min"])
+                    hi = float(BEHAVIOR["between_queries_max"])
+                    gap = random.uniform(lo, hi)
                     logging.info(f"… waiting {gap:.0f}s before next query")
                     time.sleep(gap)
 

@@ -2,19 +2,176 @@
   <div class="page-header">
     <div>
       <div class="page-title">Behavior</div>
-      <div class="page-subtitle">Real-user emulation options</div>
+      <div class="page-subtitle">Timing, delays, and realistic-user options</div>
+    </div>
+    <button class="btn btn-secondary" id="reset-timings-btn"
+            title="Restore all timing values to defaults">
+      ↺ Reset timings to defaults
+    </button>
+  </div>
+
+  <!-- ── Search loop timings ───────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🔎 Search loop timings</div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Delays inside a single query. All values are seconds. The monitor
+      picks a random value between <em>min</em> and <em>max</em> each time
+      — keeping behavior non-deterministic.
+    </div>
+
+    <div class="timing-grid">
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Initial load wait</strong>
+          <div class="muted">After first page load, before looking for ads</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.initial_load_min"
+                 placeholder="min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.initial_load_max"
+                 placeholder="max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>SERP settle</strong>
+          <div class="muted">After DOM becomes ready, before reading content</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.serp_settle_min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.serp_settle_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Post-refresh delay</strong>
+          <div class="muted">After <code>driver.refresh()</code> during retry</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_refresh_min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_refresh_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Gap between queries</strong>
+          <div class="muted">Pause between consecutive searches in one run</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.5" min="0"
+                 data-config="behavior.between_queries_min"> –
+          <input type="number" class="input" step="0.5" min="0"
+                 data-config="behavior.between_queries_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
     </div>
   </div>
 
+  <!-- ── Session / proxy timings ───────────────────────────────── -->
   <div class="card">
-    <div class="card-title">Naturalness</div>
+    <div class="card-title">🛰 Session & proxy timings</div>
+
+    <div class="timing-grid">
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Post-rotate delay</strong>
+          <div class="muted">After IP rotation, before re-checking geo</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_rotate_min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_rotate_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Fresh Google.com visit</strong>
+          <div class="muted">First visit on a fresh profile (before consent)</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.fresh_google_min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.fresh_google_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Post-consent delay</strong>
+          <div class="muted">After accepting cookies on google.com</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_consent_min"> –
+          <input type="number" class="input" step="0.1" min="0"
+                 data-config="behavior.post_consent_max">
+          <span class="unit">s</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Refresh retry config ──────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">↻ Refresh retry</div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      When a query returns no ads, we refresh the page. These control
+      how aggressive the retry is. <strong>Max attempts</strong> = how
+      many tries before we give up; <strong>wait between</strong> = how
+      long we pause between refreshes.
+    </div>
+    <div class="timing-grid">
+      <div class="timing-row">
+        <div class="timing-label"><strong>Max refresh attempts</strong></div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="1" min="1" max="10"
+                 data-config="search.refresh_max_attempts">
+        </div>
+      </div>
+      <div class="timing-row">
+        <div class="timing-label">
+          <strong>Wait between refreshes</strong>
+          <div class="muted">Pause added on each retry</div>
+        </div>
+        <div class="timing-inputs">
+          <input type="number" class="input" step="1" min="1"
+                 data-config="search.refresh_min_sec"> –
+          <input type="number" class="input" step="1" min="1"
+                 data-config="search.refresh_max_sec">
+          <span class="unit">s</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Naturalness options ───────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🎭 Naturalness</div>
     <div class="checkbox-row">
       <input type="checkbox" id="cfg-bg-tabs" data-config="behavior.open_background_tabs">
       <label for="cfg-bg-tabs">Open background tabs</label>
     </div>
     <div class="form-hint" style="margin-bottom: 14px;">
-      Disabled by default — the C++ stealth patches already handle most detection vectors.
-      Enable only if you see capture ban rates climbing.
+      Disabled by default — the C++ stealth patches already handle most
+      detection vectors. Enable only if you see captcha ban rates climbing.
     </div>
     <div class="checkbox-row">
       <input type="checkbox" id="cfg-idle" data-config="behavior.idle_pauses">
@@ -26,8 +183,9 @@
     </div>
   </div>
 
+  <!-- ── Captcha ───────────────────────────────────────────────── -->
   <div class="card">
-    <div class="card-title">Captcha</div>
+    <div class="card-title">🧩 Captcha</div>
     <div class="form-group">
       <label class="form-label">2Captcha API key</label>
       <input type="password" class="input" data-config="captcha.twocaptcha_key">

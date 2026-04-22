@@ -1135,6 +1135,67 @@ def api_proxy_full_diagnostics():
 
 
 # ──────────────────────────────────────────────────────────────
+# ACTION PIPELINES API
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/actions/catalog", methods=["GET"])
+def api_actions_catalog():
+    """List all supported action types with their params for UI builder."""
+    try:
+        from action_runner import action_catalog, action_common_params
+        return jsonify({
+            "types":         action_catalog(),
+            "common_params": action_common_params(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/actions/pipelines", methods=["GET"])
+def api_actions_pipelines_get():
+    """
+    Return both pipelines used by main.py:
+      - post_ad_actions          (competitor ads)
+      - on_target_domain_actions (your own brand's ads, if shown)
+    """
+    db = get_db()
+    return jsonify({
+        "post_ad_actions":
+            db.config_get("actions.post_ad_actions") or [],
+        "on_target_domain_actions":
+            db.config_get("actions.on_target_domain_actions") or [],
+    })
+
+
+@app.route("/api/actions/pipelines", methods=["POST"])
+def api_actions_pipelines_save():
+    """
+    Save one or both pipelines. Body:
+      { "post_ad_actions": [...], "on_target_domain_actions": [...] }
+    Either key is optional.
+    """
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    saved = {}
+
+    for key in ("post_ad_actions", "on_target_domain_actions"):
+        if key in data:
+            pipeline = data[key]
+            if not isinstance(pipeline, list):
+                return jsonify({"error": f"{key} must be a list"}), 400
+            # Light validation — every item must have `type`
+            for i, step in enumerate(pipeline):
+                if not isinstance(step, dict) or "type" not in step:
+                    return jsonify({
+                        "error": f"{key}[{i}] must be a dict with 'type'"
+                    }), 400
+            db.config_set(f"actions.{key}", pipeline)
+            saved[key] = len(pipeline)
+
+    return jsonify({"ok": True, "saved": saved})
+
+
+# ──────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────
 

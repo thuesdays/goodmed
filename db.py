@@ -212,6 +212,29 @@ DEFAULT_CONFIG = {
     "behavior.idle_pauses":       False,
     "behavior.pre_target_warmup": False,
 
+    # ── Behavior timing (seconds) — configured from dashboard ───
+    # Delay after initial page load before we start reading the SERP
+    "behavior.initial_load_min":     2.0,
+    "behavior.initial_load_max":     4.0,
+    # Delay after WebDriverWait confirms SERP DOM is ready
+    "behavior.serp_settle_min":      1.5,
+    "behavior.serp_settle_max":      3.0,
+    # Delay after driver.refresh() before rechecking page state
+    "behavior.post_refresh_min":     2.0,
+    "behavior.post_refresh_max":     4.0,
+    # Delay after force_rotate_ip() before re-running geo check
+    "behavior.post_rotate_min":      2.0,
+    "behavior.post_rotate_max":      4.0,
+    # Delay after first-ever visit to google.com on a fresh profile
+    "behavior.fresh_google_min":     3.0,
+    "behavior.fresh_google_max":     5.0,
+    # Delay after clicking "Accept all" cookies consent
+    "behavior.post_consent_min":     2.0,
+    "behavior.post_consent_max":     4.0,
+    # Gap between consecutive queries in a single run
+    "behavior.between_queries_min":  6.0,
+    "behavior.between_queries_max": 12.0,
+
     "scheduler.target_runs_per_day":     30,
     "scheduler.active_hours":            [7, 20],
     "scheduler.min_interval_sec":        180,
