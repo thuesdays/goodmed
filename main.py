@@ -818,9 +818,20 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             # scrape pattern (land → grab → leave in 1-2s) and downgrades
             # ad load on the next query. Configurable via Settings; all
             # parts are independently toggleable, exceptions swallowed.
+            #
+            # Pass MY_DOMAINS + TARGET_DOMAINS as exclude list so the
+            # organic-click step never visits our own site. That would
+            # be (a) a wasted self-click and (b) a detectable
+            # "same fingerprint keeps searching then clicks its own
+            # brand" pattern.
             try:
                 from serp_behavior import post_ads_behavior
-                post_ads_behavior(driver, DB, watchdog=watchdog)
+                own_domains = list(set((MY_DOMAINS or []) + (TARGET_DOMAINS or [])))
+                post_ads_behavior(
+                    driver, DB,
+                    exclude_domains=own_domains,
+                    watchdog=watchdog,
+                )
             except Exception as e:
                 logging.debug(f"  SERP behavior failed: {e}")
 

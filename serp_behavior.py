@@ -167,12 +167,20 @@ _ORGANIC_SELECTORS = [
 
 def click_organic_result(driver, dwell_min_sec: float = 8.0,
                          dwell_max_sec: float = 25.0,
+                         exclude_domains: list = None,
                          watchdog=None) -> bool:
     """Pick a non-ad result from the SERP, open it in a new tab, dwell
     briefly, then close the tab and return to SERP.
 
+    `exclude_domains` — list of substrings (e.g. ["goodmedika.com.ua"])
+    to NEVER click. Must include the user's OWN domains — otherwise we
+    end up visiting our own site as "organic research" which is both
+    (a) a waste of a click impression on ourselves and (b) a detectable
+    self-reinforcement pattern (Google notices the same fingerprint
+    repeatedly searches for a brand then clicks its own site).
+
     Returns True if a click actually happened, False otherwise (no
-    organic results on page / all attempts failed).
+    organic results / all top-5 were own domains / click failed).
 
     Why new tab: (a) doesn't navigate away from SERP so we keep context;
     (b) matches the most common real-user pattern — middle-click or
@@ -182,11 +190,10 @@ def click_organic_result(driver, dwell_min_sec: float = 8.0,
     longer is rare for a quick scan. The range encompasses the p10-p75
     of real click-through dwell times for commercial queries."""
 
-    # Find candidate links via CSS selector, pick one in the top
-    # 5 results (real users rarely click past rank 5).
-    link_el = _find_organic_link(driver)
+    link_el = _find_organic_link(driver, exclude_domains=exclude_domains or [])
     if link_el is None:
-        logging.debug("[serp_behavior] no organic result found to click")
+        logging.debug("[serp_behavior] no clickable organic result "
+                      "(all were own domains or no results)")
         return False
 
     try:
@@ -245,9 +252,19 @@ def click_organic_result(driver, dwell_min_sec: float = 8.0,
         return False
 
 
-def _find_organic_link(driver):
+def _find_organic_link(driver, exclude_domains: list = None):
     """Return the WebElement of a clickable organic result, or None.
-    Pick randomly among the top 5 — that's where real users cluster."""
+    Pick randomly among the top 5 — that's where real users cluster.
+
+    `exclude_domains` — substring matches that disqualify an href. Used
+    to keep us from clicking our own brand's site (Self-visit would
+    look to Google like "the same fingerprint keeps searching for this
+    brand and going to its site", a self-reinforcement pattern that's
+    both wasteful and detectable). Matching is plain substring on the
+    URL — pass clean host strings like "goodmedika.com.ua", NOT patterns.
+    """
+    exclude_domains = exclude_domains or []
+
     for sel in _ORGANIC_SELECTORS:
         try:
             elements = driver.find_elements("css selector", sel)
@@ -267,6 +284,12 @@ def _find_organic_link(driver):
                     continue
                 if not href.startswith("http"):
                     continue
+                # Skip own / excluded domains — substring check is fine
+                # because the caller passes clean hostnames. We compare
+                # lowercase since URL hosts are case-insensitive.
+                href_low = href.lower()
+                if any(d.lower() in href_low for d in exclude_domains if d):
+                    continue
                 visible.append(el)
             except Exception:
                 continue
@@ -283,11 +306,18 @@ def _find_organic_link(driver):
 # Top-level orchestrator — call from main.py search loop
 # ──────────────────────────────────────────────────────────────
 
-def post_ads_behavior(driver, db, watchdog=None) -> None:
+def post_ads_behavior(driver, db, exclude_domains: list = None,
+                      watchdog=None) -> None:
     """Run the configured SERP behavior pipeline. Called from main.py
     AFTER ads are collected but BEFORE the next query. All steps are
     independently gated by DB config so users can disable parts that
     don't fit their use case.
+
+    `exclude_domains` — never click an organic result pointing at any
+    of these (substring match). Always pass at minimum the caller's
+    own brand domains (MY_DOMAINS) — otherwise the organic-click step
+    can end up visiting the user's own site, which defeats the purpose
+    of "research the competition" and sends bad signals to Google.
 
     Order matters: scroll first (we're at top of page), then dwell
     (with mini-scrolls) simulates reading, finally an optional organic
@@ -316,4 +346,5 @@ def post_ads_behavior(driver, db, watchdog=None) -> None:
         click_organic_result(driver,
                              dwell_min_sec=dwell_min,
                              dwell_max_sec=dwell_max,
+                             exclude_domains=exclude_domains or [],
                              watchdog=watchdog)
