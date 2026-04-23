@@ -51,6 +51,28 @@ const Overview = {
                         today.captchas ?? 0, yday.captchas ?? 0,
                         true);   // inverted: less captchas = better
 
+      // Actions (24h): clicks / visits / reads ran
+      const a24 = stats.actions_24h || {};
+      const ranH = a24.actions_ran || 0;
+      const skH  = a24.actions_skipped || 0;
+      $("#hero-actions").textContent = ranH;
+      // Build breakdown by type: "5 click_ad · 3 visit_link …"
+      const byType = a24.by_type || {};
+      const breakdown = Object.entries(byType)
+        .slice(0, 3)
+        .map(([t, n]) => `${n} ${t.replace(/_/g, " ")}`)
+        .join(" · ");
+      const trendEl = $("#hero-actions-trend");
+      if (trendEl) {
+        if (breakdown) {
+          trendEl.textContent = breakdown + (skH ? ` · ${skH} skipped` : "");
+        } else if (skH) {
+          trendEl.textContent = `${skH} skipped (no clicks yet)`;
+        } else {
+          trendEl.textContent = "no actions yet";
+        }
+      }
+
       // Success rate (24h)
       const totalToday = (today.searches ?? 0) + (today.empty ?? 0)
                        + (today.captchas ?? 0);
@@ -72,6 +94,24 @@ const Overview = {
       $("#stat-ads").textContent         = stats.total_ads ?? stats.total_searches;
       $("#stat-competitors").textContent = stats.total_competitors;
       $("#stat-profiles").textContent    = stats.total_profiles;
+
+      // All-time actions performed
+      const at = stats.actions_total || {};
+      const ranAll = at.actions_ran || 0;
+      const skAll  = at.actions_skipped || 0;
+      const errAll = at.actions_errored || 0;
+      const statActions = $("#stat-actions");
+      if (statActions) statActions.textContent = ranAll;
+      const statActionsSub = $("#stat-actions-sub");
+      if (statActionsSub) {
+        const parts = [];
+        if (skAll)  parts.push(`${skAll} skipped`);
+        if (errAll) parts.push(`${errAll} errored`);
+        statActionsSub.textContent = parts.length
+          ? parts.join(" · ")
+          : "no skipped / errored";
+      }
+
       const badge = $("#badge-competitors");
       if (badge) badge.textContent = stats.total_competitors;
 

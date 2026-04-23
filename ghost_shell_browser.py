@@ -271,6 +271,20 @@ class GhostShellBrowser:
         # 3. Configure Chrome Options (plain selenium — we have C++ patches
         # for detection evasion, undetected_chromedriver is redundant here).
         options = ChromeOptions()
+
+        # Page load strategy — 'eager' returns from driver.get() once
+        # DOMContentLoaded fires, instead of waiting for every iframe,
+        # tracker pixel, gstatic chunk, and favicon to finish. The SERP
+        # (including ad cards) is fully parseable at DOMContentLoaded —
+        # Google renders results server-side. Cuts 5-10s off per query.
+        #
+        # Does NOT affect ad parsing (elements are in the initial HTML),
+        # does NOT affect captcha detection (captcha page returns fast
+        # anyway), does NOT change the detection surface (real browsers
+        # always fire DOMContentLoaded before full load — Google can't
+        # tell when we start reading the DOM).
+        options.page_load_strategy = "eager"
+
         options.add_argument(f"--user-data-dir={self.user_data_path}")
         options.add_argument("--disable-crash-reporter")
         options.add_argument("--disable-breakpad")
@@ -448,6 +462,23 @@ class GhostShellBrowser:
         self.driver = webdriver.Chrome(service=service, options=options)
         logging.info("[GhostShellBrowser] Chrome session established ✓")
 
+        # Increase urllib3 connection pool size for the driver's HTTP
+        # channel. Default is 1 — which means when main.py is mid-call
+        # (driver.get waiting 10s for DOMContentLoaded), the watchdog's
+        # driver.title ping competes for the same single connection and
+        # triggers "Connection pool is full, discarding connection"
+        # warnings + false-positive hang detection.
+        #
+        # Size 5 is enough for main-thread + watchdog ping + occasional
+        # CDP command without contention.
+        try:
+            pool = getattr(self.driver.command_executor, "_conn", None)
+            if pool is not None and hasattr(pool, "pool"):
+                # urllib3 >= 1.x connection manager
+                pool.pool._maxsize = 5
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] pool size bump skipped: {e}")
+
         # 4. CDP Emulations (Pre-navigation)
         self._apply_cdp_overrides(payload)
         self._set_network_conditions(payload)
@@ -522,6 +553,118 @@ class GhostShellBrowser:
             })
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] CDP network condition error: {e}")
+
+        # ── Resource blocklist (Settings → Performance) ─────────────
+        # These are heavyweight URL patterns the Settings page lets
+        # users toggle off to speed up SERP loads. We NEVER include
+        # google.com, gstatic.com *.js (core) — only media, tiles,
+        # analytics beacons that don't affect ad detection. Patterns
+        # use CDP wildcard syntax: `*` matches anything.
+        try:
+            patterns = self._build_blocked_url_patterns()
+            if patterns:
+                self.driver.execute_cdp_cmd(
+                    "Network.setBlockedURLs", {"urls": patterns}
+                )
+                logging.info(
+                    f"[GhostShellBrowser] Blocked {len(patterns)} URL patterns "
+                    f"(Settings → Performance)"
+                )
+        except Exception as e:
+            logging.warning(f"[GhostShellBrowser] setBlockedURLs failed: {e}")
+
+    # Map each toggle key → concrete CDP URL patterns.
+    # Patterns are conservative:
+    #   * NEVER include bare google.com/* — would break SERP itself
+    #   * NEVER include gstatic.com *.js, *.css — core SERP assets
+    #   * ONLY include heavy binary/media/analytics that the ad parser
+    #     doesn't need
+    # Users who need finer control can add their own patterns in the
+    # "Custom patterns" textarea.
+    _BLOCKLIST_BUCKETS = {
+        "browser.block_youtube_video": [
+            "*://*.ytimg.com/*",
+            "*://*.youtube.com/*.mp4*",
+            "*://*.youtube.com/*.webm*",
+            "*://*.googlevideo.com/*",
+        ],
+        "browser.block_google_images": [
+            "*://encrypted-tbn*.gstatic.com/*",
+            "*://*.ggpht.com/*",
+            # Block image result thumbnails that occasionally appear on SERP
+            # (they're big and we don't parse them).
+            "*://lh3.googleusercontent.com/*",
+        ],
+        "browser.block_google_maps_tiles": [
+            "*://mt0.google.com/vt/*",
+            "*://mt1.google.com/vt/*",
+            "*://mt2.google.com/vt/*",
+            "*://mt3.google.com/vt/*",
+            "*://maps.googleapis.com/maps/api/staticmap*",
+        ],
+        "browser.block_fonts": [
+            "*://fonts.gstatic.com/*",
+            "*.woff2",
+            "*.woff",
+        ],
+        "browser.block_analytics": [
+            "*://*.google-analytics.com/*",
+            "*://*.googletagmanager.com/*",
+            "*://*.doubleclick.net/pagead/*",
+            "*://stats.g.doubleclick.net/*",
+            "*://www.googleadservices.com/pagead/conversion/*",
+        ],
+        "browser.block_social_widgets": [
+            "*://*.facebook.net/*",
+            "*://*.facebook.com/plugins/*",
+            "*://platform.twitter.com/*",
+            "*://*.x.com/i/widgets/*",
+            "*://*.linkedin.com/embed/*",
+        ],
+        "browser.block_video_everywhere": [
+            "*.mp4",
+            "*.webm",
+            "*.m3u8",
+            "*.ts",
+            "*.ogv",
+        ],
+    }
+
+    def _build_blocked_url_patterns(self) -> list:
+        """
+        Compose the CDP block-list from the user's Settings toggles.
+        Reads keys in the browser.block_* namespace and aggregates the
+        associated URL patterns into a single list.
+        """
+        try:
+            from db import get_db
+            db = get_db()
+        except Exception:
+            return []
+
+        patterns = []
+        for key, urls in self._BLOCKLIST_BUCKETS.items():
+            try:
+                if db.config_get(key):
+                    patterns.extend(urls)
+            except Exception:
+                continue
+
+        # Custom patterns — free-form list supplied via Settings
+        try:
+            custom = db.config_get("browser.block_custom_patterns") or []
+            if isinstance(custom, list):
+                patterns.extend([p.strip() for p in custom if p and p.strip()])
+        except Exception:
+            pass
+
+        # De-dupe while preserving order for predictable logs
+        seen, out = set(), []
+        for p in patterns:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
 
     # ──────────────────────────────────────────────────────────
     # SESSION MANAGEMENT
@@ -1049,11 +1192,37 @@ class GhostShellBrowser:
                             "cannot force_rotate_ip")
             return None
         old_ip = tracker.get_current_ip(self.driver)
-        tracker.force_rotate()
+
+        # force_rotate() returns False when no rotation API is configured.
+        # Don't bother waiting 60s for an IP change that can't happen —
+        # log the issue clearly and return the old IP so the caller
+        # knows we're alive and working (just not rotated).
+        triggered = tracker.force_rotate()
+        if not triggered:
+            logging.warning(
+                f"[GhostShellBrowser] Rotation NOT triggered — keeping "
+                f"IP {old_ip}. Configure rotation API in Proxy page."
+            )
+            return old_ip
+
         time.sleep(random.uniform(3, 8))
         new_ip = tracker.wait_for_rotation(self.driver, old_ip, timeout=60)
         if new_ip:
-            tracker.enrich_ip_info(new_ip, self.driver)
+            tracker.enrich_ip(new_ip, self.driver)
+            try:
+                from db import get_db
+                get_db().ip_record_start(new_ip)
+            except Exception as e:
+                logging.debug(f"ip_record_start after rotation: {e}")
+        else:
+            # API accepted the rotation request but IP didn't change
+            # within the 60s window. Could be provider lag, or the new
+            # IP is already our old one (small pool). Log both possibilities.
+            logging.warning(
+                f"[GhostShellBrowser] Rotation triggered but exit IP didn't "
+                f"change in 60s (still {old_ip}). Provider may be slow, or "
+                f"the pool re-issued the same IP."
+            )
         return new_ip
 
     def check_and_rotate_if_burned(self) -> str | None:
@@ -1071,7 +1240,12 @@ class GhostShellBrowser:
             new_ip = tracker.wait_for_rotation(self.driver, current_ip, timeout=60)
             if new_ip: current_ip = new_ip
 
-        tracker.enrich_ip_info(current_ip, self.driver)
+        tracker.enrich_ip(current_ip, self.driver)
+        try:
+            from db import get_db
+            get_db().ip_record_start(current_ip)
+        except Exception as e:
+            logging.debug(f"ip_record_start after check: {e}")
         return current_ip
 
     def report_rotating(self, ip: str, success: bool = True, captcha: bool = False):

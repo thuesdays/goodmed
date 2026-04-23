@@ -102,3 +102,22 @@ function confirmDialog(opts) {
     setTimeout(() => backdrop.querySelector(".gs-modal-btn-confirm").focus(), 50);
   });
 }
+
+/**
+ * Format an ISO timestamp as a relative-to-now string.
+ *   "3s ago" · "2m ago" · "1h ago" · "yesterday" · "5d ago" · ISO for older.
+ * Returns "—" for falsy input.
+ */
+function timeAgo(iso) {
+  if (!iso) return "—";
+  const then = new Date(iso);
+  if (isNaN(then)) return iso;
+  const s = Math.max(0, (Date.now() - then.getTime()) / 1000);
+  if (s < 5)     return "just now";
+  if (s < 60)   return `${Math.floor(s)}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  if (s < 86400 * 2)  return "yesterday";
+  if (s < 86400 * 14) return `${Math.floor(s / 86400)}d ago`;
+  return then.toISOString().slice(0, 10);   // old enough, just show date
+}

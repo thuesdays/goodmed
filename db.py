@@ -93,6 +93,34 @@ CREATE INDEX IF NOT EXISTS idx_comp_domain ON competitors(domain);
 CREATE INDEX IF NOT EXISTS idx_comp_query ON competitors(query);
 CREATE INDEX IF NOT EXISTS idx_comp_ts ON competitors(timestamp DESC);
 
+-- Per-step execution log for the action pipeline.
+-- One row per (ad × pipeline-step × outcome). Powers Overview/Competitor
+-- stats that count "how many ads did we click / interact with".
+--   ad_class: "target", "my_domain", "competitor", "unknown"
+--   outcome:  "ran", "skipped", "error"
+--   skip_reason (only when outcome=skipped): "my_domain" | "target" |
+--                                            "not_target" | "not_my_domain" |
+--                                            "probability" | "disabled"
+CREATE TABLE IF NOT EXISTS action_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER,
+    profile_name  TEXT NOT NULL,
+    timestamp     TEXT NOT NULL,
+    query         TEXT,
+    ad_domain     TEXT,
+    ad_class      TEXT,
+    action_type   TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    skip_reason   TEXT,
+    duration_sec  REAL,
+    error         TEXT,
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aev_run       ON action_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_aev_domain_ts ON action_events(ad_domain, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_aev_profile_ts ON action_events(profile_name, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_aev_outcome   ON action_events(outcome, timestamp DESC);
+
 CREATE TABLE IF NOT EXISTS ip_history (
     ip                  TEXT PRIMARY KEY,
     first_seen          TEXT NOT NULL,
@@ -162,6 +190,7 @@ DEFAULT_CONFIG = {
     "search.queries":             ["гудмедика", "гудмедіка", "goodmedika"],
     "search.my_domains":          ["goodmedika.com.ua", "goodmedika.ua", "goodmedika.com"],
     "search.target_domains":      [],
+    "search.block_domains":       [],
     "search.refresh_min_sec":     10,
     "search.refresh_max_sec":     15,
     "search.refresh_max_attempts": 4,
@@ -170,6 +199,12 @@ DEFAULT_CONFIG = {
     "proxy.is_rotating":          True,
     "proxy.rotation_provider":    "none",    # none | asocks | brightdata | generic
     "proxy.rotation_api_url":     None,
+    # asocks uses a path + query-param URL shape. We store the two parts
+    # separately and assemble at save time so the user doesn't have to
+    # escape/concatenate by hand. For non-asocks providers these are
+    # ignored and rotation_api_url is used verbatim.
+    "proxy.asocks_port_id":       None,
+    "proxy.asocks_api_key":       None,
     "proxy.rotation_api_key":     None,
     "proxy.rotation_method":      "GET",
     "proxy.pool_urls":            [],
@@ -194,6 +229,28 @@ DEFAULT_CONFIG = {
     "browser.expected_country":   "Ukraine",
     "browser.expected_timezone":  "Europe/Kyiv",
     "browser.geo_mismatch_mode":  "rotate",   # abort | rotate | warn
+    # UA spoof range — bounds for Chrome major version in the fingerprint.
+    # Configurable on Settings page. Defaults match the current pool
+    # (Chrome 143–147 as of Apr 2026).
+    "browser.spoof_chrome_min":   143,
+    "browser.spoof_chrome_max":   147,
+
+    # Resource-blocking via CDP Network.setBlockedURLs. Every toggle
+    # here is OFF by default to stay conservative — a non-googler who
+    # changes the defaults will see the same result as the previous
+    # build. Flip these on in Settings page to trade realism for speed.
+    #
+    # Each bucket is an English category — dashboard_server maps it to
+    # URL patterns at runtime. Patterns stay in code, not config, so
+    # users can't accidentally break Google by blocking it.
+    "browser.block_youtube_video":      False,  # *.ytimg.com, *.youtube.com/*.mp4
+    "browser.block_google_images":      False,  # encrypted-tbn*.gstatic.com, *.ggpht.com
+    "browser.block_google_maps_tiles":  False,  # *mt*.google.com/vt/*
+    "browser.block_fonts":              False,  # fonts.gstatic.com, *.woff2
+    "browser.block_analytics":          False,  # google-analytics, doubleclick beacons
+    "browser.block_social_widgets":     False,  # facebook.net, twitter/x embeds
+    "browser.block_video_everywhere":   False,  # *.mp4, *.webm, *.m3u8 universally
+    "browser.block_custom_patterns":    [],     # user-supplied URL patterns (CDP wildcard syntax)
     # Auto-rotate exit IP at start of each run. Forces a fresh TCP connection
     # to the rotating proxy so we get a new random Ukrainian IP each time.
     # Without this, subsequent runs in the same session can reuse the same IP
@@ -204,8 +261,13 @@ DEFAULT_CONFIG = {
 
     # Post-ad actions — what to do after we detected an ad on the SERP
     # Each action is {type: visit|dwell|scroll|click_result, ...params}
+    # Legacy keys (kept for compat with older imports):
     "actions.post_ad":            [],
     "actions.on_target_domain":   [],
+    # Modern keys used by Scripts page + main.py:
+    "actions.main_script":              [],
+    "actions.post_ad_actions":          [],
+    "actions.on_target_domain_actions": [],
 
     "behavior.open_background_tabs": False,
     "behavior.bg_tabs_count":     [2, 4],
@@ -542,6 +604,120 @@ class DB:
         return row["n"], row["d"]
 
     # ──────────────────────────────────────────────────────────
+    # ACTION EVENTS — per-step pipeline execution log
+    # ──────────────────────────────────────────────────────────
+
+    def action_event_add(self, run_id: Optional[int], profile_name: str,
+                         query: str, ad_domain: str, ad_class: str,
+                         action_type: str, outcome: str,
+                         skip_reason: str = None, duration_sec: float = None,
+                         error: str = None):
+        """Record one step execution.
+
+        outcome: "ran" | "skipped" | "error"
+        ad_class: "target" | "my_domain" | "competitor" | "unknown"
+        """
+        self._get_conn().execute("""
+            INSERT INTO action_events
+                (run_id, profile_name, timestamp, query, ad_domain, ad_class,
+                 action_type, outcome, skip_reason, duration_sec, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            run_id, profile_name,
+            datetime.now().isoformat(timespec="seconds"),
+            query, ad_domain, ad_class,
+            action_type, outcome, skip_reason, duration_sec, error,
+        ))
+        self._get_conn().commit()
+
+    def action_events_summary(self, hours: int = 24) -> dict:
+        """Roll-up counters for the Overview page.
+
+        Returns:
+            {
+              "actions_ran":     int,   # outcomes = "ran"
+              "actions_skipped": int,   # outcomes = "skipped"
+              "actions_errored": int,   # outcomes = "error"
+              "by_type":         {"click_ad": 12, "visit_link": 3, ...},
+              "by_ad_class":     {"target": 8, "competitor": 40, ...},
+            }
+        """
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+        conn = self._get_conn()
+
+        totals = conn.execute("""
+            SELECT outcome, COUNT(*) as n
+            FROM action_events WHERE timestamp >= ?
+            GROUP BY outcome
+        """, (cutoff,)).fetchall()
+        out = {
+            "actions_ran":     0,
+            "actions_skipped": 0,
+            "actions_errored": 0,
+        }
+        for r in totals:
+            if r["outcome"] == "ran":     out["actions_ran"]     = r["n"]
+            elif r["outcome"] == "skipped": out["actions_skipped"] = r["n"]
+            elif r["outcome"] == "error":   out["actions_errored"] = r["n"]
+
+        by_type = conn.execute("""
+            SELECT action_type, COUNT(*) as n
+            FROM action_events
+            WHERE timestamp >= ? AND outcome = 'ran'
+            GROUP BY action_type
+            ORDER BY n DESC
+        """, (cutoff,)).fetchall()
+        out["by_type"] = {r["action_type"]: r["n"] for r in by_type}
+
+        by_class = conn.execute("""
+            SELECT ad_class, COUNT(*) as n
+            FROM action_events
+            WHERE timestamp >= ? AND outcome = 'ran'
+            GROUP BY ad_class
+        """, (cutoff,)).fetchall()
+        out["by_ad_class"] = {r["ad_class"]: r["n"] for r in by_class}
+
+        return out
+
+    def action_events_by_domain(self, hours: int = None) -> dict:
+        """Returns {domain: {"ran": N, "skipped": N, "last_action_at": iso}}
+
+        Used by Competitors page to show "Actions" column alongside mentions.
+        """
+        query = """
+            SELECT ad_domain,
+                   SUM(CASE WHEN outcome='ran'     THEN 1 ELSE 0 END) as ran,
+                   SUM(CASE WHEN outcome='skipped' THEN 1 ELSE 0 END) as skipped,
+                   SUM(CASE WHEN outcome='error'   THEN 1 ELSE 0 END) as errored,
+                   MAX(timestamp) as last_action_at
+            FROM action_events
+            WHERE ad_domain IS NOT NULL AND ad_domain != ''
+        """
+        params = ()
+        if hours:
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
+            query += " AND timestamp >= ?"
+            params = (cutoff,)
+        query += " GROUP BY ad_domain"
+
+        rows = self._get_conn().execute(query, params).fetchall()
+        return {
+            r["ad_domain"]: {
+                "ran":            r["ran"]     or 0,
+                "skipped":        r["skipped"] or 0,
+                "errored":        r["errored"] or 0,
+                "last_action_at": r["last_action_at"],
+            }
+            for r in rows
+        }
+
+    def action_events_recent(self, limit: int = 50) -> list[dict]:
+        rows = self._get_conn().execute("""
+            SELECT * FROM action_events ORDER BY timestamp DESC LIMIT ?
+        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ──────────────────────────────────────────────────────────
     # IP HISTORY
     # ──────────────────────────────────────────────────────────
 
@@ -618,6 +794,41 @@ class DB:
                 org = COALESCE(?, org), asn = COALESCE(?, asn)
             WHERE ip = ?
         """, (country, city, org, asn, ip))
+
+    def ip_record_start(self, ip: str, country: str = None, city: str = None,
+                        org: str = None, asn: str = None):
+        """
+        Register that `ip` is being used RIGHT NOW (bump total_uses and
+        last_seen). Called at session start for every IP — including
+        static-proxy setups where no subsequent `ip_report(captcha=...)`
+        ever fires. Without this, Proxy → IP statistics stays empty for
+        non-rotating setups.
+
+        For rotating proxies, this is called in addition to report() so
+        we capture the IP even if the first request is instant-cut and
+        never reaches report().
+        """
+        if not ip:
+            return
+        conn = self._get_conn()
+        now = datetime.now().isoformat(timespec="seconds")
+        row = conn.execute("SELECT total_uses FROM ip_history WHERE ip = ?",
+                           (ip,)).fetchone()
+        if row is None:
+            conn.execute("""
+                INSERT INTO ip_history
+                    (ip, first_seen, last_seen, total_uses, total_captchas,
+                     consecutive_capchas, country, city, org, asn)
+                VALUES (?, ?, ?, 1, 0, 0, ?, ?, ?, ?)
+            """, (ip, now, now, country, city, org, asn))
+        else:
+            conn.execute("""
+                UPDATE ip_history
+                SET last_seen = ?, total_uses = total_uses + 1,
+                    country = COALESCE(?, country), city = COALESCE(?, city),
+                    org = COALESCE(?, org), asn = COALESCE(?, asn)
+                WHERE ip = ?
+            """, (now, country, city, org, asn, ip))
 
     def ip_log_rotation(self, provider: str = "unknown"):
         """Record a rotation call (for stats + dashboard)."""
@@ -810,6 +1021,15 @@ class DB:
             fp = self.fingerprint_current(name)
             sc = self.selfcheck_latest(name)
 
+            # Last run timestamp — any run for this profile, completed or not
+            last_run = conn.execute("""
+                SELECT started_at, finished_at, exit_code
+                  FROM runs
+                 WHERE profile_name = ?
+              ORDER BY id DESC
+                 LIMIT 1
+            """, (name,)).fetchone()
+
             result.append({
                 "name":         name,
                 "status":       status,
@@ -825,6 +1045,18 @@ class DB:
                     "total":     sc["total"],
                     "timestamp": sc["timestamp"],
                 } if sc else None,
+                # Last run: use finished_at if the run ended, else started_at
+                # so "currently running" profiles show their start time.
+                "last_run_at": (
+                    (last_run["finished_at"] or last_run["started_at"])
+                    if last_run else None
+                ),
+                "last_run_status": (
+                    ("success" if last_run["exit_code"] == 0
+                     else "failed" if last_run["exit_code"] is not None
+                     else "running")
+                    if last_run else None
+                ),
             })
         return result
 

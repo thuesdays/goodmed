@@ -44,6 +44,7 @@ class RunnerState:
     def __init__(self):
         self.is_running       = False
         self.current_run_id   = None
+        self.profile_name     = None          # which profile is active
         self.thread           = None
         self.process          = None          # subprocess handle (for stop)
         self.started_at       = None
@@ -162,6 +163,29 @@ def api_stats():
     total_comp, unique_domains = db.competitors_count()
     profiles = db.profiles_list()
 
+    # Post-click action counters — rolled up from action_events
+    actions_24h = db.action_events_summary(hours=24)
+    actions_all = db.action_events_summary(hours=24 * 365)
+
+    # Build info — which Chromium / Chrome versions ship with this binary
+    try:
+        from device_templates import CHROMIUM_BUILD, CHROMIUM_BUILD_FULL, CHROME_VERSIONS
+        stable_chrome = CHROME_VERSIONS[0]["major"] if CHROME_VERSIONS else "?"
+        # User-configurable spoof range (major version bounds)
+        spoof_min = db.config_get("browser.spoof_chrome_min") or None
+        spoof_max = db.config_get("browser.spoof_chrome_max") or None
+        build_info = {
+            "chromium_build":      CHROMIUM_BUILD,
+            "chromium_build_full": CHROMIUM_BUILD_FULL,
+            "chrome_spoof":        stable_chrome,     # top of the pool
+            "chrome_pool":         [v["major"] for v in CHROME_VERSIONS],
+            "chrome_pool_full":    [v["full"]  for v in CHROME_VERSIONS],
+            "spoof_min":           spoof_min,
+            "spoof_max":           spoof_max,
+        }
+    except Exception:
+        build_info = {}
+
     return jsonify({
         "total_profiles":    len(profiles),
         "total_searches":    total_summary.get("search_ok", 0),
@@ -171,6 +195,10 @@ def api_stats():
         "unique_domains":    unique_domains,
         "daily":             db.daily_stats(days=14),
         "run_status":        get_run_status_dict(),
+        # Post-click action stats (24h and all-time)
+        "actions_24h":       actions_24h,
+        "actions_total":     actions_all,
+        "build_info":        build_info,
     })
 
 
@@ -242,10 +270,22 @@ def api_profile_clear_session_quality(name: str):
 def api_competitors():
     db = get_db()
     total, unique = db.competitors_count()
+    by_domain = db.competitors_by_domain()
+
+    # Merge in per-domain action counters (how many times did we click /
+    # interact with an ad on this domain — not just how often we saw it)
+    actions_by_domain = db.action_events_by_domain()
+    for row in by_domain:
+        stats = actions_by_domain.get(row["domain"], {})
+        row["actions_ran"]     = stats.get("ran", 0)
+        row["actions_skipped"] = stats.get("skipped", 0)
+        row["actions_errored"] = stats.get("errored", 0)
+        row["last_action_at"]  = stats.get("last_action_at")
+
     return jsonify({
         "total_records":  total,
         "unique_domains": unique,
-        "by_domain":      db.competitors_by_domain(),
+        "by_domain":      by_domain,
         "recent":         db.competitors_recent(limit=100),
     })
 
@@ -272,6 +312,7 @@ def get_run_status_dict():
     return {
         "is_running":     RUNNER.is_running,
         "current_run_id": RUNNER.current_run_id,
+        "profile_name":   RUNNER.profile_name,
         "started_at":     RUNNER.started_at,
         "finished_at":    RUNNER.finished_at,
         "last_exit_code": RUNNER.last_exit_code,
@@ -297,12 +338,13 @@ def api_run():
 
         RUNNER.is_running     = True
         RUNNER.current_run_id = run_id
+        RUNNER.profile_name   = profile_name
         RUNNER.started_at     = datetime.now().isoformat(timespec="seconds")
         RUNNER.finished_at    = None
         RUNNER.last_exit_code = None
         RUNNER.last_error     = None
 
-        RUNNER.log(f"Overпуск #{run_id} мониторинга...", "info")
+        RUNNER.log(f"Overпуск #{run_id} мониторинга (profile: {profile_name})...", "info")
 
         try:
             env = os.environ.copy()
@@ -699,15 +741,49 @@ def api_db_info():
 
 @app.route("/api/profile-templates", methods=["GET"])
 def api_profile_templates():
-    """List available device templates for the create-profile UI."""
+    """List available device templates for the create-profile UI.
+
+    Returns enriched metadata the dropdown can preview (CPU cores, RAM,
+    GPU model short-name, screen resolution, desktop vs laptop).
+    """
     try:
         from device_templates import DEVICE_TEMPLATES
+        import re
+
+        def _extract_gpu(renderer: str) -> str:
+            """Pull a short model from the ANGLE renderer string.
+            Example: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 ...)'
+                     → 'GeForce RTX 4060'"""
+            if not renderer:
+                return "Unknown GPU"
+            # Strip ANGLE wrapper
+            m = re.search(r"ANGLE \([^,]+,\s*([^,]+)", renderer)
+            inner = m.group(1).strip() if m else renderer
+            # Strip vendor prefix ("NVIDIA ", "Intel(R) ", "AMD ")
+            inner = re.sub(r"^(NVIDIA|Intel\(R\)|Intel|AMD)\s+", "", inner)
+            # Strip common suffixes ("Direct3D11 vs_5_0 ps_5_0", "Graphics" sometimes)
+            inner = re.sub(r"\s*Direct3D.*$", "", inner)
+            return inner.strip() or "Unknown GPU"
+
         out = []
         for t in DEVICE_TEMPLATES:
+            cpu    = t.get("cpu")    or {}
+            gpu    = t.get("gpu")    or {}
+            screen = t.get("screen") or {}
+            battery = t.get("battery")
             out.append({
                 "name":        t.get("name"),
                 "platform":    t.get("platform"),
                 "description": t.get("description") or "",
+                # Enriched fields for dropdown preview
+                "cpu_cores":   cpu.get("concurrency"),
+                "ram_gb":      cpu.get("memory"),
+                "gpu_model":   _extract_gpu(gpu.get("gl_renderer", "")),
+                "gpu_vendor":  gpu.get("webgpu_vendor"),
+                "screen_w":    screen.get("width"),
+                "screen_h":    screen.get("height"),
+                "is_laptop":   battery is not None,
+                "weight":      t.get("weight", 1),
             })
         return jsonify(out)
     except Exception as e:
@@ -1014,27 +1090,227 @@ def api_proxy_rotate():
     method   = db.config_get("proxy.rotation_method") or "GET"
 
     rotation_called = False
+    rotation_error  = None
+    rotation_http   = None
     if provider != "none" and api_url:
         import requests
         try:
-            headers = {}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            headers = _build_rotation_headers(provider, api_key)
             if method.upper() == "POST":
                 r = requests.post(api_url, headers=headers, timeout=10)
             else:
                 r = requests.get(api_url, headers=headers, timeout=10)
+            rotation_http   = r.status_code
             rotation_called = r.ok
+            if not r.ok:
+                rotation_error = f"HTTP {r.status_code}: {r.text[:200]}"
         except Exception as e:
             return jsonify({"ok": False,
                             "error": f"rotation API call failed: {e}"}), 500
         import time as _t
         _t.sleep(2)
+    else:
+        rotation_error = (
+            "Rotation API not configured — provider="
+            f"{provider}, url={'set' if api_url else 'missing'}"
+        )
 
     info = _fetch_exit_info(proxy_url)
     info["rotation_called"] = rotation_called
-    info["provider"] = provider
+    info["rotation_error"]  = rotation_error
+    info["rotation_http"]   = rotation_http
+    info["provider"]        = provider
     return jsonify(info)
+
+
+def _build_rotation_headers(provider: str, api_key: str) -> dict:
+    """
+    Provider-specific header assembly. Matches the logic in
+    rotating_proxy.py so the dashboard test and the runtime rotation
+    behave identically.
+    """
+    headers = {}
+    if not api_key:
+        return headers
+    if provider == "brightdata":
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif provider == "asocks":
+        # asocks auth is the ?apiKey=... query parameter embedded in
+        # the URL — no header required, and adding one here can confuse
+        # strict API validators.
+        pass
+    else:
+        headers["X-API-Key"] = api_key
+    return headers
+
+
+@app.route("/api/proxy/asocks-port-list", methods=["POST"])
+def api_asocks_port_list():
+    """
+    Fetches the user's port list from asocks using their apiKey. The
+    Dashboard calls this while the user is filling in the rotation form
+    so they can pick the right portId without having to dig through
+    the asocks UI.
+
+    Per https://docs.asocks.com/en/operations/941a4fb52e76050f13a0e886b08d3b6f.html
+    the endpoint is GET /v2/proxy/ports?apiKey=<key>&per_page=50.
+
+    IMPORTANT DISTINCTION for users:
+      * "Port ID" in the asocks API = internal DB id (6-8 digit integer)
+      * TCP port in host:port (e.g. 16720) is NOT the Port ID
+    Users confuse these all the time — this endpoint disambiguates.
+    """
+    payload = request.get_json(silent=True) or {}
+    api_key = (payload.get("api_key") or "").strip()
+    if not api_key:
+        return jsonify({"ok": False, "error": "API key is empty"}), 400
+
+    import requests
+    try:
+        r = requests.get(
+            "https://api.asocks.com/v2/proxy/ports",
+            params={"apiKey": api_key, "per_page": 50},
+            timeout=10,
+        )
+        if not r.ok:
+            return jsonify({
+                "ok":    False,
+                "http":  r.status_code,
+                "error": f"asocks returned HTTP {r.status_code}",
+                "body":  r.text[:500],
+            }), 200
+        data = r.json()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Network error: {e}"}), 200
+
+    # asocks returns {success: true, message: {...}}. Inside message, the
+    # port list may live under different keys depending on the endpoint
+    # version — real shape (as of 2026) is:
+    #   message.proxies: [{id, name, proxy: "host:port", login, password,
+    #                      countryCode, cityName, refresh_link, ...}, ...]
+    # Older versions used message.data (Laravel paginator) and even older
+    # ones returned message as a flat array. Handle all three.
+    items = None
+    if isinstance(data, dict):
+        envelope = data.get("message", data)
+        if isinstance(envelope, list):
+            items = envelope
+        elif isinstance(envelope, dict):
+            # Current shape: message.proxies
+            # Laravel-paginator shape: message.data
+            items = (
+                envelope.get("proxies")
+                or envelope.get("data")
+                or envelope.get("items")
+                or envelope.get("ports")
+                or envelope.get("results")
+            )
+    else:
+        items = data
+
+    if not isinstance(items, list):
+        return jsonify({
+            "ok":    False,
+            "error": "Unexpected response shape from asocks — no port list found",
+            "body":  json.dumps(data)[:800] if isinstance(data, (dict, list)) else str(data)[:800],
+        }), 200
+
+    # Normalize each port. asocks gives us `proxy: "host:port"` as one string
+    # — split it for the UI. Also pass through `refresh_link` so we can skip
+    # URL assembly entirely (asocks literally hands us the full rotation URL).
+    ports = []
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+
+        # Split "109.236.84.23:16720" into host + port
+        host = p.get("host") or p.get("server") or p.get("ip")
+        port = p.get("port") or p.get("external_port")
+        proxy_str = p.get("proxy")
+        if proxy_str and (not host or not port):
+            try:
+                h, prt = proxy_str.rsplit(":", 1)
+                host = host or h
+                port = port or int(prt)
+            except Exception:
+                pass
+
+        # Country: prefer full name, fall back to code
+        country = None
+        c = p.get("country")
+        if isinstance(c, dict):
+            country = c.get("name") or c.get("code")
+        elif isinstance(c, str):
+            country = c
+        if not country:
+            country = p.get("countryCode") or p.get("country_code")
+
+        ports.append({
+            "id":           p.get("id") or p.get("port_id") or p.get("portId"),
+            "name":         p.get("name") or p.get("title"),
+            "host":         host,
+            "port":         port,
+            "login":        p.get("login") or p.get("username") or p.get("user"),
+            "country":      country,
+            "city":         p.get("cityName") or p.get("city"),
+            # asocks hands us a pre-signed rotation URL — pass it through
+            # so the UI can use it verbatim instead of rebuilding from scratch.
+            "refresh_link": p.get("refresh_link"),
+            "active":       p.get("status", 1) == 1 if "status" in p else p.get("active", True),
+        })
+    return jsonify({"ok": True, "ports": ports, "count": len(ports)})
+
+
+@app.route("/api/proxy/test-rotation-api", methods=["POST"])
+def api_proxy_test_rotation_api():
+    """
+    Ping the configured rotation API URL without actually caring about
+    the exit IP. Returns the HTTP status + response snippet so the user
+    can verify their asocks/brightdata URL is live.
+    """
+    db = get_db()
+    provider = db.config_get("proxy.rotation_provider") or "none"
+    api_url  = db.config_get("proxy.rotation_api_url")
+    api_key  = db.config_get("proxy.rotation_api_key")
+    method   = (db.config_get("proxy.rotation_method") or "GET").upper()
+
+    if provider == "none" or not api_url:
+        return jsonify({
+            "ok": False,
+            "status": "unconfigured",
+            "message": (
+                f"Provider is {provider!r} and URL is "
+                f"{'set' if api_url else 'empty'}. "
+                "Pick a provider and paste the rotation URL first."
+            ),
+        })
+
+    import requests
+    try:
+        headers = _build_rotation_headers(provider, api_key)
+        kwargs = {"headers": headers, "timeout": 10}
+        r = requests.post(api_url, **kwargs) if method == "POST" \
+            else requests.get(api_url, **kwargs)
+        return jsonify({
+            "ok":       r.ok,
+            "status":   "ok" if r.ok else "error",
+            "http":     r.status_code,
+            "provider": provider,
+            "method":   method,
+            "body":     r.text[:500],
+            "message": (
+                f"✓ HTTP {r.status_code} — rotation API is working"
+                if r.ok else
+                f"✗ HTTP {r.status_code} — check URL and credentials"
+            ),
+        })
+    except Exception as e:
+        return jsonify({
+            "ok":       False,
+            "status":   "network-error",
+            "provider": provider,
+            "message":  f"✗ Network error: {e}",
+        })
 
 
 @app.route("/api/proxy/test-rotation", methods=["POST"])
@@ -1157,28 +1433,84 @@ def api_actions_pipelines_get():
     Return both pipelines used by main.py:
       - post_ad_actions          (competitor ads)
       - on_target_domain_actions (your own brand's ads, if shown)
+
+    Defensive read: if the value came back as a JSON string (can happen
+    after certain legacy import paths), parse it. If parsing fails or
+    the value isn't a list, return [] instead of choking the UI with
+    `No parameters` ghost-steps.
     """
     db = get_db()
+
+    def _as_list(key):
+        raw = db.config_get(key)
+        if raw is None:
+            return []
+        # Sometimes imports stash strings — unwrap one level
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                logging.warning(
+                    f"[pipelines] {key} is an unparseable string, resetting"
+                )
+                return []
+        if not isinstance(raw, list):
+            logging.warning(
+                f"[pipelines] {key} is not a list (type={type(raw).__name__}), resetting"
+            )
+            return []
+        # Filter out malformed steps: missing `type` or not a dict
+        clean = []
+        for i, step in enumerate(raw):
+            if not isinstance(step, dict):
+                logging.warning(f"[pipelines] {key}[{i}] skipped (not a dict)")
+                continue
+            if not step.get("type"):
+                logging.warning(f"[pipelines] {key}[{i}] skipped (no type field)")
+                continue
+
+            # Auto-migrate legacy `search_all_queries` → `loop` with
+            # items_from="queries". Keeps existing configs working after
+            # the Scripts refactor (Apr 2026).
+            if step.get("type") == "search_all_queries":
+                step = {
+                    "type":       "loop",
+                    "enabled":    step.get("enabled", True),
+                    "items_from": "queries",
+                    "item_var":   "query",
+                    "shuffle":    step.get("shuffle", True),
+                    "steps": [
+                        {"type": "search_query", "query": "{query}"},
+                    ],
+                }
+                logging.info(
+                    f"[pipelines] {key}[{i}] migrated search_all_queries → loop"
+                )
+
+            clean.append(step)
+        return clean
+
     return jsonify({
-        "post_ad_actions":
-            db.config_get("actions.post_ad_actions") or [],
-        "on_target_domain_actions":
-            db.config_get("actions.on_target_domain_actions") or [],
+        "main_script":              _as_list("actions.main_script"),
+        "post_ad_actions":          _as_list("actions.post_ad_actions"),
+        "on_target_domain_actions": _as_list("actions.on_target_domain_actions"),
     })
 
 
 @app.route("/api/actions/pipelines", methods=["POST"])
 def api_actions_pipelines_save():
     """
-    Save one or both pipelines. Body:
-      { "post_ad_actions": [...], "on_target_domain_actions": [...] }
-    Either key is optional.
+    Save one, two, or all three pipelines. Body:
+      { "main_script":              [...],
+        "post_ad_actions":          [...],
+        "on_target_domain_actions": [...] }
+    Any key is optional; omitted keys are left untouched.
     """
     data = request.get_json(silent=True) or {}
     db = get_db()
     saved = {}
 
-    for key in ("post_ad_actions", "on_target_domain_actions"):
+    for key in ("main_script", "post_ad_actions", "on_target_domain_actions"):
         if key in data:
             pipeline = data[key]
             if not isinstance(pipeline, list):
@@ -1196,14 +1528,281 @@ def api_actions_pipelines_save():
 
 
 # ──────────────────────────────────────────────────────────────
+# API: CONFIGURATION EXPORT / IMPORT
+# ──────────────────────────────────────────────────────────────
+#
+# The export bundles every *configuration* table — stuff the user has
+# tweaked via the dashboard — into one JSON file. The bundle EXCLUDES
+# history tables (runs, events, logs, competitors, ip_history,
+# action_events, selfchecks, fingerprints) since those are per-deployment
+# and usually noise when copying a setup between machines.
+#
+# Format:
+#   {
+#     "format_version": 1,
+#     "exported_at":    "2026-04-22T22:15:00",
+#     "app_version":    "ghost-shell-1.0",
+#     "config":         { "key": value, ... },            # config_kv
+#     "profiles":       [ {...}, ... ],                   # profiles metadata
+#     "action_pipelines": {
+#         "post_ad_actions":         [ ... ],
+#         "on_target_domain_actions": [ ... ],
+#     }
+#   }
+
+EXPORT_FORMAT_VERSION = 1
+# Keys stored in config_kv that are machine-specific and should NOT be
+# moved between installations. Proxy credentials, for instance, are
+# typically different on each host.
+_EXPORT_SKIP_KEYS = {
+    "proxy.total_rotations",
+    "proxy.last_rotation_at",
+    "system.first_run_at",
+}
+
+
+@app.route("/api/export-config", methods=["GET"])
+def api_export_config():
+    """Download the full dashboard configuration as JSON."""
+    db = get_db()
+    try:
+        from datetime import datetime
+
+        # ── CRITICAL: read FLAT keys directly from SQLite, NOT the
+        # nested dict from config_get_all(). The nested form
+        # ({"proxy": {"url": ...}, ...}) round-trips incorrectly on
+        # import: iterating over the top-level `proxy` key and calling
+        # config_set("proxy", {...}) would write the whole object under
+        # a flat "proxy" key in config_kv, breaking lookups like
+        # config_get("proxy.url").
+        rows = db._get_conn().execute(
+            "SELECT key, value FROM config_kv"
+        ).fetchall()
+        flat_config = {}
+        for row in rows:
+            key = row["key"]
+            if key in _EXPORT_SKIP_KEYS:
+                continue
+            try:
+                flat_config[key] = json.loads(row["value"])
+            except Exception:
+                flat_config[key] = row["value"]
+
+        # Pull out the three action pipelines separately for clarity
+        # (they stay duplicated in `config` too — exactly what config_kv has).
+        action_pipelines = {
+            "main_script":              flat_config.get("actions.main_script", []),
+            "post_ad_actions":          flat_config.get("actions.post_ad_actions", []),
+            "on_target_domain_actions": flat_config.get("actions.on_target_domain_actions", []),
+        }
+
+        # Profiles — just the on-disk config, no per-run data
+        profiles = db.profiles_list()
+        # profiles_list returns dicts with heavy fields — keep only the
+        # deterministic ones. Anything with "last_", "total_", "session_"
+        # prefix is runtime state.
+        slim_profiles = []
+        for p in profiles:
+            slim_profiles.append({
+                k: v for k, v in p.items()
+                if not (k.startswith("last_") or k.startswith("total_")
+                        or k.startswith("session_") or k.startswith("recent_"))
+            })
+
+        bundle = {
+            "format_version":   EXPORT_FORMAT_VERSION,
+            "exported_at":      datetime.now().isoformat(timespec="seconds"),
+            "app_version":      "ghost-shell-1.0",
+            # config is a FLAT dict of dotted keys — one-to-one with
+            # SQLite's config_kv rows. Imports read this back as-is.
+            "config":           flat_config,
+            "profiles":         slim_profiles,
+            "action_pipelines": action_pipelines,
+        }
+
+        # Content-Disposition makes the browser download it as a file
+        from flask import Response
+        filename = f"ghost-shell-config-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+        return Response(
+            json.dumps(bundle, indent=2, ensure_ascii=False),
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except Exception as e:
+        logging.error(f"export-config failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/import-config", methods=["POST"])
+def api_import_config():
+    """Replace current config with an uploaded bundle.
+
+    Accepts JSON body `{ "bundle": {...}, "mode": "merge"|"replace" }`.
+      - merge   (default): union config dicts, existing keys overwritten
+                           by bundle values; profiles/pipelines upserted
+      - replace: dangerous — wipes existing config_kv before importing
+
+    Handles two `config` formats:
+      (a) flat: {"proxy.url": "...", "search.queries": [...]} — new format
+      (b) nested: {"proxy": {"url": "..."}, ...} — produced by the buggy
+          v1 exporter that round-tripped through config_get_all(). We
+          flatten it on the fly so old bundles still import correctly.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        bundle = data.get("bundle") or {}
+        mode = data.get("mode", "merge")
+
+        if not isinstance(bundle, dict):
+            return jsonify({"error": "bundle must be an object"}), 400
+        if bundle.get("format_version") != EXPORT_FORMAT_VERSION:
+            return jsonify({
+                "error": f"format_version mismatch: expected {EXPORT_FORMAT_VERSION}, "
+                         f"got {bundle.get('format_version')!r}. "
+                         f"This bundle was made by a different Ghost Shell version."
+            }), 400
+
+        db   = get_db()
+        conn = db._get_conn()
+        stats = {"config_keys": 0, "profiles": 0, "pipelines": 0}
+
+        # Remove legacy "mush" keys before any writes — these are the
+        # broken top-level dicts that the old buggy exporter produced
+        # (e.g. key="proxy", value='{"url": "..."}'). They shadow the
+        # correct dotted keys like "proxy.url" at read time.
+        conn.execute("""
+            DELETE FROM config_kv
+            WHERE key NOT LIKE '%.%'
+              AND key NOT IN ('_schema_version', '_last_migration')
+        """)
+
+        if mode == "replace":
+            # Keep skip-keys (machine-local) but wipe everything else
+            conn.execute("""
+                DELETE FROM config_kv
+                WHERE key NOT IN (%s)
+            """ % ",".join("?" * len(_EXPORT_SKIP_KEYS)),
+                tuple(_EXPORT_SKIP_KEYS))
+
+        # ── Config keys ──
+        cfg_in = bundle.get("config") or {}
+
+        # Detect legacy nested format and flatten it. Heuristic: if any
+        # top-level key has NO dot AND its value is a dict, it's nested.
+        is_nested = any(
+            "." not in k and isinstance(v, dict)
+            for k, v in cfg_in.items()
+        )
+        if is_nested:
+            def _flatten(d: dict, prefix: str = "") -> dict:
+                flat = {}
+                for k, v in d.items():
+                    key = f"{prefix}.{k}" if prefix else k
+                    if isinstance(v, dict):
+                        flat.update(_flatten(v, key))
+                    else:
+                        flat[key] = v
+                return flat
+            cfg_in = _flatten(cfg_in)
+            logging.info(
+                f"[import-config] detected legacy nested bundle — "
+                f"flattened to {len(cfg_in)} dotted keys"
+            )
+
+        for key, value in cfg_in.items():
+            if key in _EXPORT_SKIP_KEYS:
+                continue   # never import machine-specific keys
+            # Sanity — only accept dotted keys, refuse top-level junk
+            # that would re-introduce the mush bug.
+            if "." not in key:
+                logging.warning(
+                    f"[import-config] skipping non-dotted key {key!r}"
+                )
+                continue
+            db.config_set(key, value)
+            stats["config_keys"] += 1
+
+        # ── Profiles ── (upsert)
+        for p in (bundle.get("profiles") or []):
+            if not isinstance(p, dict) or not p.get("name"):
+                continue
+            try:
+                name = p["name"]
+                meta = {k: v for k, v in p.items() if k != "name"}
+                db.profile_save(name, meta)
+                stats["profiles"] += 1
+            except Exception as e:
+                logging.debug(f"profile_save {p.get('name')}: {e}")
+
+        # ── Action pipelines ──
+        ap = bundle.get("action_pipelines") or {}
+        for key in ("main_script", "post_ad_actions", "on_target_domain_actions"):
+            if key in ap and isinstance(ap[key], list):
+                db.config_set(f"actions.{key}", ap[key])
+                stats["pipelines"] += 1
+
+        conn.commit()
+        return jsonify({"ok": True, "mode": mode, "imported": stats})
+
+    except Exception as e:
+        logging.error(f"import-config failed: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────
+
+def cleanup_orphan_config_keys():
+    """
+    One-shot cleanup for a bug in early export/import (format_version=1):
+    the buggy exporter round-tripped config through the nested dict,
+    and on import it wrote values like {"proxy.url": "..."} as a single
+    row with key="proxy" and value='{"url":"..."}'.
+
+    These "mush" keys shadow the correct dotted keys (`proxy.url`,
+    `search.queries`, etc.) in config_get_all()'s nested output because
+    the nested builder processes them in row-order and the last write
+    wins.
+
+    This function removes any top-level (non-dotted) key in config_kv
+    that's NOT an internal schema marker. Safe to run on every startup
+    — a correctly-seeded DB has zero non-dotted keys.
+    """
+    try:
+        db = get_db()
+        conn = db._get_conn()
+        rows = conn.execute("""
+            SELECT key FROM config_kv
+            WHERE key NOT LIKE '%.%'
+              AND key NOT IN ('_schema_version', '_last_migration')
+        """).fetchall()
+        if rows:
+            deleted = [r["key"] for r in rows]
+            conn.execute("""
+                DELETE FROM config_kv
+                WHERE key NOT LIKE '%.%'
+                  AND key NOT IN ('_schema_version', '_last_migration')
+            """)
+            conn.commit()
+            logging.warning(
+                f"[dashboard] cleaned up {len(deleted)} orphan config_kv keys "
+                f"(probably from a broken v1 import): {deleted!r}. "
+                f"If anything looks unconfigured, re-enter values in the UI."
+            )
+    except Exception as e:
+        logging.debug(f"cleanup_orphan_config_keys failed: {e}")
+
 
 if __name__ == "__main__":
     # Auto-migration from legacy files
     get_db().migrate_from_files(verbose=True)
     # Clean up stale runs left from previous crashes
     cleanup_stale_runs()
+    # One-shot fix for broken v1 import/export (see function docstring)
+    cleanup_orphan_config_keys()
 
     port = int(os.environ.get("PORT", 5000))
     url  = f"http://127.0.0.1:{port}"

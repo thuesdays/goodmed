@@ -34,20 +34,27 @@ logger.setLevel(logging.DEBUG)
 
 
 # =============================================================================
-# CONSTANT POOLS — актуальные значения на Q1 2026
+# CONSTANT POOLS — актуальные значения на Q2 2026
 # =============================================================================
 
-# Chrome version pool — current as of April 22, 2026.
-# Stable channel distribution (approx):
+# The Chromium source we're building from. This is the actual engine —
+# JS APIs available, WebGL/WebGPU feature set, etc. Shown in the
+# dashboard header badge so the user knows which Chromium they compiled.
+CHROMIUM_BUILD         = "149"
+CHROMIUM_BUILD_FULL    = "149.0.7805.0"
+
+# Chrome version pool we SPOOF to the outside world. These don't match
+# CHROMIUM_BUILD — real Chrome stable lags ~2 major versions behind the
+# bleeding-edge Chromium source. A bot detector comparing UA (147) vs
+# engine features (149-specific) won't care because the delta is small
+# and well within the normal propagation window for stable rollouts.
+#
+# Distribution as of April 22, 2026:
 #   ~55% on current stable    (147)
 #   ~25% on previous stable   (146)
 #   ~12% on older stable      (145)
 #   ~5%  on older             (144)
 #   ~3%  on extended stable   (143)
-#
-# The `weight` field biases random selection: higher weight → more common.
-# Real-world CTO distribution (from browser telemetry reports) skews
-# toward the current stable, with a long tail of enterprise stragglers.
 CHROME_VERSIONS = [
     {"major": "147", "full": "147.0.7780.88",  "weight": 55},  # current stable (Apr 7, 2026)
     {"major": "146", "full": "146.0.7715.130", "weight": 25},  # prev stable (Mar 2026)
@@ -57,16 +64,38 @@ CHROME_VERSIONS = [
 ]
 
 
-def pick_chrome_version(rnd):
-    """Weighted random pick from CHROME_VERSIONS — newer = more common."""
-    total = sum(v["weight"] for v in CHROME_VERSIONS)
+def pick_chrome_version(rnd, bounds: tuple = None):
+    """Weighted random pick from CHROME_VERSIONS — newer = more common.
+
+    Args:
+        rnd:    random.Random instance (seeded for deterministic fingerprints).
+        bounds: optional (min_major, max_major) tuple. Versions outside
+                this range are excluded from the pool. Both ends are
+                inclusive; None means no bound on that side.
+
+    Falls back to the full pool if bounds would filter everything out.
+    """
+    pool = CHROME_VERSIONS
+    if bounds:
+        lo, hi = bounds
+        def _in_range(v):
+            major = int(v["major"])
+            if lo is not None and major < int(lo): return False
+            if hi is not None and major > int(hi): return False
+            return True
+        filtered = [v for v in CHROME_VERSIONS if _in_range(v)]
+        if filtered:
+            pool = filtered
+        # else: bounds exclude everything → silently fall back to full pool
+
+    total = sum(v["weight"] for v in pool)
     pick = rnd.randint(1, total)
     running = 0
-    for v in CHROME_VERSIONS:
+    for v in pool:
         running += v["weight"]
         if pick <= running:
             return v
-    return CHROME_VERSIONS[0]
+    return pool[0]
 
 PLATFORMS = [
     {
@@ -287,7 +316,22 @@ class DeviceTemplateBuilder:
             self.template = _weighted_choice(self.rnd, DEVICE_TEMPLATES)
 
         self.platform = self.rnd.choice(PLATFORMS)
-        self.chrome_v = pick_chrome_version(self.rnd)
+
+        # Chrome version: respect user-configured min/max bounds from
+        # Settings → UA spoof range. Falls through gracefully if DB is
+        # not reachable (e.g. unit-testing the builder standalone).
+        chrome_bounds = None
+        try:
+            from db import get_db
+            _db = get_db()
+            lo = _db.config_get("browser.spoof_chrome_min")
+            hi = _db.config_get("browser.spoof_chrome_max")
+            if lo or hi:
+                chrome_bounds = (lo, hi)
+        except Exception:
+            pass
+        self.chrome_v = pick_chrome_version(self.rnd, bounds=chrome_bounds)
+
         self.timezone = self.rnd.choice(TIMEZONE_PROFILES)
 
         if preferred_language:

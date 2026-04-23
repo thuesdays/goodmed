@@ -192,8 +192,10 @@ class BrowserWatchdog:
             if self._is_paused():
                 continue
 
-            # 1) Heartbeat age check
             stalled = time.time() - self._last_beat
+
+            # Hard limit — main thread hasn't pinged us in max_stall_sec,
+            # something is definitely wrong (probably a hung driver.get).
             if stalled >= self.max_stall_sec:
                 self._handle_hang(
                     reason=f"main-thread heartbeat older than {stalled:.0f}s "
@@ -201,17 +203,39 @@ class BrowserWatchdog:
                 )
                 return
 
-            # 2) Active driver ping
-            alive = self._ping_driver()
-            if not alive:
-                # Give it one more chance (sometimes CDP is briefly busy)
-                logging.warning("[Watchdog] driver unresponsive — retrying ping")
-                time.sleep(5)
-                if not self._ping_driver():
-                    self._handle_hang(
-                        reason=f"driver unresponsive for {self.ping_timeout_sec*2:.0f}s"
-                    )
-                    return
+            # Active driver ping is DISABLED by default because it
+            # races with main-thread selenium calls through the same
+            # HTTP connection pool. Even a cheap `driver.title` was
+            # competing with `driver.get()` and producing
+            # "Connection pool is full" warnings + false positives
+            # ("driver unresponsive — retrying ping" during a totally
+            # normal page load).
+            #
+            # Heartbeat-based stall detection is sufficient: main.py
+            # calls dog.heartbeat() between steps, and a real hang
+            # (dead browser, network black hole) will definitely fail
+            # to advance heartbeats within max_stall_sec.
+            #
+            # To re-enable active ping (if you ever need it), set
+            # self.enable_active_ping = True in __init__.
+            if getattr(self, "enable_active_ping", False):
+                # Only ping when heartbeat is getting old — within 30s
+                # of the hard limit. No point pinging during active work.
+                if stalled > max(30, self.max_stall_sec * 0.5):
+                    alive = self._ping_driver()
+                    if not alive:
+                        logging.warning(
+                            "[Watchdog] driver unresponsive AND main thread "
+                            "stalled — retrying ping"
+                        )
+                        time.sleep(5)
+                        if not self._ping_driver():
+                            self._handle_hang(
+                                reason=f"driver unresponsive for "
+                                       f"{self.ping_timeout_sec*2:.0f}s "
+                                       f"and heartbeat {stalled:.0f}s old"
+                            )
+                            return
 
     def _ping_driver(self) -> bool:
         """

@@ -3,6 +3,16 @@
 <head>
 <meta charset="UTF-8">
 <title>Ghost Shell Dashboard</title>
+
+<!-- Favicon: modern browsers pick the SVG (scales crisp at any DPR),
+     Safari/older fall back to the PNG, legacy IE/Edge reads the .ico. -->
+<link rel="icon"                 type="image/svg+xml" href="/favicon.svg">
+<link rel="icon"                 type="image/png"     href="/favicon-32.png"  sizes="32x32">
+<link rel="icon"                 type="image/png"     href="/favicon-16.png"  sizes="16x16">
+<link rel="apple-touch-icon"                          href="/apple-touch-icon.png">
+<link rel="shortcut icon"                             href="/favicon.ico">
+<meta name="theme-color" content="#6366f1">
+
 <link rel="stylesheet" href="/css/main.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
@@ -11,9 +21,16 @@
 <div class="app">
 
   <aside class="sidebar">
-    <div class="sidebar-brand">
+    <div class="sidebar-brand" data-page="overview"
+         title="Go to Overview" role="button" tabindex="0">
       <div class="sidebar-brand-icon">G</div>
-      <div>
+      <div class="sidebar-brand-text">
+        <div class="sidebar-brand-build" id="sidebar-build-badge"
+             title="Chromium source version this binary was built from"
+             style="display: none;">
+          <span class="build-dot"></span>
+          <span id="sidebar-build-text">…</span>
+        </div>
         <div class="sidebar-brand-name">Ghost Shell</div>
         <div class="sidebar-brand-sub">Control center</div>
       </div>
@@ -26,8 +43,8 @@
       <div class="sidebar-item" data-page="profiles">
         <span class="sidebar-item-icon">👤</span> Profiles
       </div>
-      <div class="sidebar-item" data-page="search">
-        <span class="sidebar-item-icon">🔍</span> Search
+      <div class="sidebar-item" data-page="domains">
+        <span class="sidebar-item-icon">🌍</span> Domains
       </div>
       <div class="sidebar-item" data-page="proxy">
         <span class="sidebar-item-icon">🌐</span> Proxy
@@ -39,8 +56,8 @@
       <div class="sidebar-item" data-page="behavior">
         <span class="sidebar-item-icon">⚙️</span> Behavior
       </div>
-      <div class="sidebar-item" data-page="actions">
-        <span class="sidebar-item-icon">🎯</span> Actions
+      <div class="sidebar-item" data-page="scripts">
+        <span class="sidebar-item-icon">🎬</span> Scripts
       </div>
       <div class="sidebar-item" data-page="runs">
         <span class="sidebar-item-icon">🕐</span> Runs
@@ -51,17 +68,24 @@
       <div class="sidebar-item" data-page="logs">
         <span class="sidebar-item-icon">📜</span> Logs
       </div>
+      <div class="sidebar-item" data-page="settings">
+        <span class="sidebar-item-icon">💾</span> Settings
+      </div>
     </nav>
 
     <div class="sidebar-footer">
-      <button id="run-btn" class="run-btn">
+      <button id="run-btn" class="run-btn"
+              title="Run the default profile (configured in Behavior page). Individual profiles have their own Start button on the Profiles page.">
         <span id="run-btn-icon">▶</span>
-        <span id="run-btn-text">Start</span>
+        <span id="run-btn-text">Run default profile</span>
       </button>
-      <button id="stop-btn" class="run-btn stop-btn" style="display:none">
-        <span>■</span> <span>Stop</span>
+      <button id="stop-btn" class="run-btn stop-btn" style="display:none"
+              title="Forcefully terminate the current run and its browser processes">
+        <span>■</span> <span>Stop monitor</span>
       </button>
       <div class="run-status" id="run-status">Ready</div>
+      <div class="run-status-sub" id="run-status-sub"
+           title="Default profile from Behavior → Profile section">—</div>
     </div>
   </aside>
 
@@ -82,15 +106,16 @@
 <!-- Page modules -->
 <script src="/js/pages/overview.js"></script>
 <script src="/js/pages/profiles.js"></script>
-<script src="/js/pages/search.js"></script>
 <script src="/js/pages/proxy.js"></script>
 <script src="/js/pages/profile-detail.js"></script>
 <script src="/js/pages/competitors.js"></script>
 <script src="/js/pages/behavior.js"></script>
-<script src="/js/pages/actions.js"></script>
+<script src="/js/pages/scripts.js"></script>
+<script src="/js/pages/domains.js"></script>
 <script src="/js/pages/runs.js"></script>
 <script src="/js/pages/scheduler.js"></script>
 <script src="/js/pages/logs.js"></script>
+<script src="/js/pages/settings.js"></script>
 
 <!-- Router (must be last) -->
 <script src="/js/app.js"></script>

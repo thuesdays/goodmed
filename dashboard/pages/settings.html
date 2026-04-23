@@ -1,0 +1,280 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Settings</div>
+      <div class="page-subtitle">Build info, UA spoof range, backup & restore</div>
+    </div>
+  </div>
+
+  <!-- ─── Build info ──────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🧬 Build info</div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Versions baked into the custom Chromium binary. The <strong>engine</strong>
+      is whatever Chromium source you compiled — that's what the browser
+      actually runs. The <strong>UA spoof</strong> is what Ghost Shell
+      claims it is to the outside world (user-agent string, Sec-CH-UA
+      headers, <code>navigator.userAgentData</code>).
+    </div>
+
+    <div class="build-info-line">
+      <span class="build-info-chip build-info-chip-engine">
+        <span class="build-info-chip-label">Chromium engine</span>
+        <span class="build-info-chip-value" id="bi-engine">—</span>
+      </span>
+      <span class="build-info-sep">·</span>
+      <span class="build-info-chip build-info-chip-spoof">
+        <span class="build-info-chip-label">Spoofed as Chrome</span>
+        <span class="build-info-chip-value" id="bi-spoof">—</span>
+      </span>
+      <span class="build-info-note" id="bi-spoof-note">weighted random from range</span>
+    </div>
+  </div>
+
+  <!-- ─── UA spoof range ─────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🎭 UA spoof range</div>
+    <div class="form-hint" style="margin-bottom: 16px;">
+      When Ghost Shell generates a fingerprint, it picks a Chrome version
+      from this major-version range. Newer real-stable versions are
+      picked more often — it mimics the actual distribution on the web.
+      Keep this <strong>close to the current Chrome stable</strong>
+      (too old = suspicious, too new = you're ahead of actual rollout).
+    </div>
+
+    <div class="input-row-3">
+      <div class="form-group">
+        <label class="form-label">Minimum major version</label>
+        <input type="number" class="input"
+               data-config="browser.spoof_chrome_min"
+               min="100" max="200" step="1" placeholder="143">
+        <div class="form-hint">
+          Bottom of the range. Rarely picked — models enterprise stragglers.
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Maximum major version</label>
+        <input type="number" class="input"
+               data-config="browser.spoof_chrome_max"
+               min="100" max="200" step="1" placeholder="147">
+        <div class="form-hint">
+          Top of the range. Most picks land here — should match the
+          current Chrome stable channel.
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Current pool (preview)</label>
+        <div class="input-readonly" id="spoof-pool-preview">—</div>
+        <div class="form-hint">
+          Versions that will actually be used, filtered by the bounds.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Performance / resource blocking ─────────────────────── -->
+  <div class="card">
+    <div class="card-title">⚡ Performance — resource blocking</div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Ghost Shell uses Chrome DevTools Protocol to block heavyweight
+      URL patterns at the network layer. Ad detection works from the
+      initial HTML, so images, fonts, video, and third-party trackers
+      can be safely dropped — this cuts page-load time significantly
+      on slow proxies.
+      <br><br>
+      <strong>Safety:</strong> none of these patterns touch
+      <code>google.com</code> SERP HTML, core JS, or anything the ad
+      parser needs. If you ever suspect blocking broke something,
+      uncheck everything and reload.
+    </div>
+
+    <div class="block-list">
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_youtube_video">
+        <div class="block-item-body">
+          <div class="block-item-title">🎬 YouTube video &amp; thumbnails</div>
+          <div class="block-item-desc">
+            Drops <code>*.ytimg.com</code>, <code>*.googlevideo.com</code>,
+            and MP4/WebM from youtube.com. Video cards on the SERP will
+            show a placeholder — text/title still parses normally.
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_google_images">
+        <div class="block-item-body">
+          <div class="block-item-title">🖼️ Google image thumbnails</div>
+          <div class="block-item-desc">
+            <code>encrypted-tbn*.gstatic.com</code>,
+            <code>lh3.googleusercontent.com</code>. The image-results
+            row in SERP appears broken — ads/text unaffected.
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_google_maps_tiles">
+        <div class="block-item-body">
+          <div class="block-item-title">🗺️ Google Maps tiles</div>
+          <div class="block-item-desc">
+            <code>mt0-3.google.com/vt/*</code>, staticmap API. Local-pack
+            results won't show the map thumbnail — business listings &amp;
+            ads still parse.
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_fonts">
+        <div class="block-item-body">
+          <div class="block-item-title">🔤 Web fonts</div>
+          <div class="block-item-desc">
+            <code>fonts.gstatic.com</code> and all <code>.woff / .woff2</code>
+            files. Page renders in the system font — saves ~200 KB per load.
+            <strong>Caveat:</strong> fingerprint-detection sites check for
+            font loading; may be a minor signal on heavily-profiled visits.
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_analytics">
+        <div class="block-item-body">
+          <div class="block-item-title">📊 Analytics &amp; tracking beacons</div>
+          <div class="block-item-desc">
+            Google Analytics, GTM, DoubleClick beacons, conversion pixels.
+            These are fire-and-forget — missing them is normal (ad-blockers
+            do this too). <strong>Recommended.</strong>
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_social_widgets">
+        <div class="block-item-body">
+          <div class="block-item-title">💬 Social widgets</div>
+          <div class="block-item-desc">
+            Facebook SDK, Twitter/X embeds, LinkedIn widgets. Only
+            relevant on advertiser landing pages when we click through.
+          </div>
+        </div>
+      </label>
+
+      <label class="block-item">
+        <input type="checkbox" data-config="browser.block_video_everywhere">
+        <div class="block-item-body">
+          <div class="block-item-title">⏹ All video files (any site)</div>
+          <div class="block-item-desc">
+            Universal <code>*.mp4</code>, <code>*.webm</code>,
+            <code>*.m3u8</code>, <code>*.ts</code> blocking. Only enable
+            if the click-through landing pages are heavy with video.
+          </div>
+        </div>
+      </label>
+    </div>
+
+    <div class="form-group" style="margin-top: 20px;">
+      <label class="form-label">Custom patterns (advanced)</label>
+      <textarea class="textarea" rows="4"
+                data-config="browser.block_custom_patterns"
+                data-config-list="true"
+                placeholder="*://annoying-tracker.example.com/*&#10;*://slow-widget.example.org/script.js&#10;*.ico"></textarea>
+      <div class="form-hint">
+        One pattern per line. Uses CDP wildcard syntax: <code>*</code>
+        matches any characters, prefix with scheme for host match
+        (e.g. <code>*://*.example.com/*</code>). Invalid patterns are
+        silently ignored by Chrome.
+      </div>
+    </div>
+
+    <div class="block-footer">
+      <span id="block-status" class="block-status">—</span>
+      <button id="btn-save-blocking" class="btn btn-primary">
+        💾 Save &amp; apply
+      </button>
+    </div>
+    <div class="form-hint" style="margin-top: 8px;">
+      Changes apply to the <strong>next browser launch</strong> — the
+      already-running session keeps its current rules. Stop the
+      monitor and start it again for the new block-list to take effect.
+    </div>
+  </div>
+
+  <!-- ─── Export ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">📦 Export configuration</div>
+    <div class="form-hint" style="margin-bottom: 16px;">
+      Download a single JSON file with every dashboard setting, all
+      profile definitions, and both action pipelines.
+      <strong>History is NOT included</strong> — runs, events, logs,
+      captured competitor ads, IP history, and self-check results all
+      stay behind. The result is a portable "setup snapshot" you can
+      copy to another machine or check into git.
+    </div>
+
+    <div class="settings-export-box">
+      <div>
+        <div class="settings-export-title">What's inside the bundle</div>
+        <ul class="settings-export-list">
+          <li>✓ Dashboard config — queries, domains, behavior timings, proxy URL</li>
+          <li>✓ Profile metadata (names, templates, languages)</li>
+          <li>✓ Post-click action pipelines (both target &amp; generic)</li>
+          <li class="muted">✗ Run history · events · logs · IP history · selfchecks</li>
+          <li class="muted">✗ Rotation counters · last-rotation timestamp</li>
+        </ul>
+      </div>
+      <button id="btn-export-config" class="btn btn-primary">
+        ⬇ Download bundle
+      </button>
+    </div>
+  </div>
+
+  <!-- ─── Import ──────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">📥 Import configuration</div>
+    <div class="form-hint" style="margin-bottom: 16px;">
+      Load a previously exported Ghost Shell bundle. Choose <strong>Merge</strong>
+      (default, safe) to overlay the bundle on top of your current settings — only
+      keys present in the bundle are overwritten. Choose <strong>Replace</strong>
+      to nuke all current config before loading — use only when you want a
+      completely clean import.
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Bundle file</label>
+      <input type="file" id="import-file-input" accept=".json,application/json"
+             class="settings-file-input">
+      <div class="form-hint" id="import-file-info">
+        No file selected
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Mode</label>
+      <div class="settings-mode-picker">
+        <label class="settings-mode-option">
+          <input type="radio" name="import-mode" value="merge" checked>
+          <div>
+            <strong>Merge</strong>
+            <div class="muted">Overlay bundle values on current config. Safe default.</div>
+          </div>
+        </label>
+        <label class="settings-mode-option settings-mode-danger">
+          <input type="radio" name="import-mode" value="replace">
+          <div>
+            <strong>Replace</strong>
+            <div class="muted">Wipe current config first. All existing settings will be lost.</div>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <button id="btn-import-config" class="btn btn-primary" disabled>
+      ⬆ Import bundle
+    </button>
+
+    <!-- Result display -->
+    <div id="import-result" class="settings-import-result" style="display:none;"></div>
+  </div>
+</section>

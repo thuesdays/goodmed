@@ -81,6 +81,8 @@ async function updateRunStatus() {
       runBtn().style.display = "none";
       stopBtn().style.display = "flex";
       runStatus().textContent = `Running (#${s.current_run_id || "?"})`;
+      const sub = document.getElementById("run-status-sub");
+      if (sub) sub.textContent = s.profile_name ? `profile: ${s.profile_name}` : "";
     } else {
       runBtn().style.display = "flex";
       stopBtn().style.display = "none";
@@ -89,6 +91,17 @@ async function updateRunStatus() {
         runStatus().textContent = `Finished (${code})`;
       } else {
         runStatus().textContent = "Ready";
+      }
+      // Show which profile the sidebar button would launch
+      const sub = document.getElementById("run-status-sub");
+      if (sub) {
+        const defaultProfile =
+          (typeof configCache?.browser?.profile_name === "string")
+            ? configCache.browser.profile_name
+            : null;
+        sub.textContent = defaultProfile
+          ? `default: ${defaultProfile}`
+          : "no default profile set";
       }
     }
   } catch {}

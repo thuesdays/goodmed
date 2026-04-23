@@ -246,9 +246,13 @@ class RotatingProxyTracker:
         wait_for_rotation() or reconnect the proxy.
         """
         if self.rotation_provider == "none" or not self.rotation_api_url:
-            logging.info(
-                "[RotatingProxy] No rotation API configured — "
-                "will wait for provider auto-rotation"
+            logging.warning(
+                "[RotatingProxy] ⚠ Rotation API is NOT configured "
+                f"(provider={self.rotation_provider!r}, url={self.rotation_api_url!r}). "
+                "Cannot force-rotate — IP will only change when the proxy "
+                "provider rotates it on its own schedule. "
+                "Fix: Proxy page → Rotation section → paste your provider's "
+                "rotation URL and set provider to 'asocks'/'brightdata'/'generic'."
             )
             return False
 
@@ -256,6 +260,9 @@ class RotatingProxyTracker:
         if self.rotation_api_key:
             if self.rotation_provider == "brightdata":
                 headers["Authorization"] = f"Bearer {self.rotation_api_key}"
+            elif self.rotation_provider == "asocks":
+                # asocks uses ?apiKey=... in the URL — no header needed.
+                pass
             else:
                 headers["X-API-Key"] = self.rotation_api_key
 

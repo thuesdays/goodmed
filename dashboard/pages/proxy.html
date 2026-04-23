@@ -10,6 +10,13 @@
   <div class="card">
     <div class="card-title">🛰  Live proxy diagnostics</div>
 
+    <div id="rotation-missing-banner" class="banner banner-warn" style="display: none; margin-bottom: 14px;">
+      ⚠ <strong>Rotation API is not configured.</strong>
+      The ⚡ Rotate IP button below, Auto-rotate on start, and
+      <code>rotate_ip</code> script steps will have no effect until you
+      set up rotation in the <a href="#" data-scroll-target="rotation-status-chip" class="banner-link">Rotation API card below</a>.
+    </div>
+
     <div class="proxy-live" id="proxy-live-panel">
       <div class="proxy-live-header">
         <div>
@@ -158,32 +165,134 @@
 
   <!-- ─── ROTATION API ─────────────────────────────────────────── -->
   <div class="card">
-    <div class="card-title">Rotation API (for forced IP change on captcha)</div>
+    <div class="card-title">
+      Rotation API
+      <span id="rotation-status-chip" class="rotation-status-chip off">
+        not configured
+      </span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      This is what actually changes your exit IP. Without it, clicking
+      <strong>⚡ Rotate IP</strong> above, ticking <strong>Auto-rotate on start</strong>,
+      or running <code>rotate_ip</code> steps in a script all do nothing —
+      the proxy keeps whatever exit it grabbed at connect time.
+    </div>
+
     <div class="form-group">
       <label class="form-label">Provider</label>
-      <select class="select" data-config="proxy.rotation_provider" style="max-width: 240px;">
+      <select class="select" id="rotation-provider-select"
+              data-config="proxy.rotation_provider" style="max-width: 240px;">
         <option value="none">None — wait for auto-rotation</option>
-        <option value="asocks">asocks (URL-based auth)</option>
+        <option value="asocks">asocks</option>
         <option value="brightdata">Bright Data (Bearer token)</option>
-        <option value="generic">Generic (X-API-Key header)</option>
+        <option value="generic">Generic (URL only)</option>
       </select>
     </div>
-    <div class="form-group">
-      <label class="form-label">Rotation API URL</label>
-      <input type="text" class="input" data-config="proxy.rotation_api_url"
-             placeholder="https://api.asocks.com/v2/proxy/refresh/12345">
-    </div>
-    <div class="input-row">
-      <div class="form-group">
-        <label class="form-label">API key (optional)</label>
-        <input type="password" class="input" data-config="proxy.rotation_api_key">
+
+    <!-- ── asocks-specific simple builder ── -->
+    <div id="rotation-asocks-builder" class="rotation-provider-box">
+      <div class="rotation-provider-title">
+        🔧 asocks configuration
       </div>
+      <div class="form-hint" style="margin-bottom: 12px;">
+        Per the <a href="https://api.asocks.com/api/docs/" target="_blank" class="link-inline">asocks API docs</a>,
+        the refresh endpoint is
+        <code>GET https://api.asocks.com/v2/proxy/refresh/{portId}?apiKey={apiKey}</code>.
+        Fill in the two pieces below and we'll assemble the URL for you.
+      </div>
+      <div class="input-row">
+        <div class="form-group">
+          <label class="form-label">Port ID <span class="label-required">*</span></label>
+          <input type="number" class="input" id="asocks-port-id"
+                 placeholder="e.g. 123456" min="1">
+          <div class="form-hint">
+            <strong>Important:</strong> this is NOT the TCP port from
+            your proxy's <code>host:port</code> (e.g. 16720). It's the
+            <strong>internal record ID</strong> in asocks — usually a 6–8
+            digit number. Use the button below to auto-fetch it.
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">API key <span class="label-required">*</span></label>
+          <input type="password" class="input" id="asocks-api-key"
+                 placeholder="paste your asocks API key">
+          <div class="form-hint">
+            From <em>My Account → API Keys</em> in the asocks dashboard.
+            This is <strong>not</strong> the proxy password — it's a
+            separate long token used only for API calls.
+          </div>
+        </div>
+      </div>
+
+      <div class="asocks-port-picker">
+        <button class="btn btn-secondary" id="btn-asocks-list-ports">
+          🔍 Fetch port list from asocks
+        </button>
+        <div class="form-hint">
+          Calls <code>GET /v2/proxy/port-list</code> with the API key
+          above and shows every proxy port on your account so you can
+          pick the right one.
+        </div>
+        <div id="asocks-port-list" class="asocks-port-list" style="display: none;"></div>
+      </div>
+
       <div class="form-group">
-        <label class="form-label">HTTP method</label>
-        <select class="select" data-config="proxy.rotation_method">
-          <option value="GET">GET</option>
-          <option value="POST">POST</option>
-        </select>
+        <label class="form-label">Assembled URL (read-only)</label>
+        <div class="input-readonly" id="asocks-assembled-url">—</div>
+        <div class="form-hint">
+          This is what Ghost Shell will GET to rotate. If it looks right,
+          click <strong>🧪 Test rotation API</strong> below.
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Advanced / generic raw-URL editor ── -->
+    <div id="rotation-advanced-builder" class="rotation-provider-box">
+      <div class="form-group">
+        <label class="form-label">Rotation API URL</label>
+        <input type="text" class="input" id="rotation-raw-url"
+               data-config="proxy.rotation_api_url"
+               placeholder="https://example-provider.com/rotate?token=...">
+        <div class="form-hint">
+          Full URL your provider exposes for rotation. Include query
+          params + tokens as needed.
+        </div>
+      </div>
+      <div class="input-row">
+        <div class="form-group">
+          <label class="form-label">API key (optional, sent as header)</label>
+          <input type="password" class="input" data-config="proxy.rotation_api_key">
+          <div class="form-hint">
+            <strong>Bright Data:</strong> sent as <code>Authorization: Bearer</code><br>
+            <strong>Generic:</strong> sent as <code>X-API-Key</code>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">HTTP method</label>
+          <select class="select" data-config="proxy.rotation_method">
+            <option value="GET">GET</option>
+            <option value="POST">POST</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="rotation-test-footer">
+      <button id="btn-test-rotation-api" class="btn btn-secondary">
+        🧪 Test rotation API
+      </button>
+      <div id="rotation-api-test-result" class="form-hint">
+        Calls the URL above once and reports the HTTP status.
+      </div>
+    </div>
+  </div>
+
+    <div class="rotation-test-footer">
+      <button id="btn-test-rotation-api" class="btn btn-secondary">
+        🧪 Test rotation API
+      </button>
+      <div id="rotation-api-test-result" class="form-hint">
+        Calls the URL above once and reports the HTTP status.
       </div>
     </div>
   </div>

@@ -447,7 +447,7 @@ def parse_ads(driver, query: str) -> list[dict]:
 # which supports 17 action types with human-like mouse/scroll/typing.
 
 
-def run_post_ad_pipeline(browser, ad: dict):
+def run_post_ad_pipeline(browser, ad: dict, query: str = None):
     """
     Run the configured action pipeline for one ad. Delegates to
     action_runner.run_pipeline which implements 17 human-like action
@@ -458,21 +458,40 @@ def run_post_ad_pipeline(browser, ad: dict):
     Actions pages). See action_runner.action_catalog() for the full
     list of action types and their params.
 
-    The pipeline sees three common flags on every step:
+    The pipeline sees four common flags on every step:
       - probability         — chance this step runs (0..1)
       - skip_on_my_domain   — skip if ad.domain is in MY_DOMAINS
       - skip_on_target      — skip if ad.is_target (target domain)
+      - only_on_target      — inverse: run ONLY for target-domain ads
+      - only_on_my_domain   — inverse: run ONLY for my-domain ads
+
+    Every step execution (ran / skipped / error) is logged to
+    action_events — see db.action_event_add().
+
+    Both competitor and target-domain ads flow through POST_AD_ACTIONS
+    now. Differentiation is per-step via only_on_*/skip_on_* flags.
+    (Legacy ON_TARGET_DOMAIN_ACTIONS is kept as a fallback for users
+    who haven't opened the Scripts page to trigger auto-migration yet.)
     """
     from action_runner import run_pipeline
 
-    pipeline = ON_TARGET_DOMAIN_ACTIONS if ad.get("is_target") \
-               else POST_AD_ACTIONS
+    pipeline = POST_AD_ACTIONS
+    # Backwards-compat: if the user still has a populated legacy
+    # on_target_domain_actions list AND the current ad is on a target
+    # domain, run the legacy pipeline for it. This goes away once the
+    # user visits Scripts (the dashboard auto-migrates on load).
+    if ad.get("is_target") and ON_TARGET_DOMAIN_ACTIONS:
+        pipeline = ON_TARGET_DOMAIN_ACTIONS
+
     if not pipeline:
         return
 
     run_pipeline(browser, pipeline, context={
-        "ad":         ad,
-        "my_domains": MY_DOMAINS,
+        "ad":           ad,
+        "my_domains":   MY_DOMAINS,
+        "run_id":       RUN_ID,
+        "profile_name": PROFILE_NAME,
+        "query":        query,
     })
 
 
@@ -481,24 +500,57 @@ def run_post_ad_pipeline(browser, ad: dict):
 # ──────────────────────────────────────────────────────────────
 
 def search_query(browser, query: str, sqm: SessionQualityMonitor,
-                 current_ip: str = None) -> list[dict]:
+                 current_ip: str = None, watchdog=None) -> list[dict]:
     """
     Single query execution:
-    - Open direct search URL
+    - Open direct search URL (eager page load — returns at DOMContentLoaded)
+    - Try to parse ads immediately; poll briefly if SERP still rendering
     - Refresh-loop until ads appear (or max attempts)
     - Parse & return ads
+
+    Why this is fast now:
+      • page_load_strategy='eager' cuts 5-10s by not waiting for tracker
+        pixels, gstatic chunks, iframe ads-preview, favicon, etc.
+      • We poll for ads every 300ms up to 3s instead of WebDriverWait(10)
+        + _sleep("serp_settle") which added 3-4s even on a fast SERP.
+      • As soon as ads are found, we call window.stop() to kill any
+        still-pending subresources — the next query's driver.get() won't
+        be blocked by those.
+
+    The `watchdog` arg, if provided, gets a heartbeat() call inside the
+    polling loop + after each refresh so a slow-but-alive fetch doesn't
+    trip the stall detector.
     """
     driver = browser.driver
     url = build_search_url(query)
     logging.info(f"🔎 {query}  →  {url}")
 
+    def _beat():
+        if watchdog is not None:
+            try: watchdog.heartbeat()
+            except Exception: pass
+
+    # Hard cap navigation: if Google's slow, we'd rather abort + retry
+    # than hang for a minute. 15s is generous — a working SERP returns
+    # HTML in under 2s through a Ukrainian residential proxy.
+    try:
+        driver.set_page_load_timeout(15)
+    except Exception:
+        pass
+
     try:
         browser.stealth_get(url, referer="https://www.google.com/")
     except Exception as e:
-        logging.error(f"  navigation failed: {e}")
-        return []
+        # Timeout / network error — caller's refresh loop handles retry
+        err = type(e).__name__
+        logging.warning(f"  navigation {err}: {str(e)[:80]}")
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+        # Still continue — DOM might be usable even after a timeout
 
-    _sleep("initial_load")
+    _beat()
 
     for attempt in range(1, REFRESH_MAX_ATTEMPTS + 1):
         if is_offline_page(driver):
@@ -519,20 +571,40 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             logging.warning("  ✗ Ads Preview page (unexpected) — skipping")
             return []
 
-        # Wait for SERP containers
-        try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((
-                    By.CSS_SELECTOR,
-                    "#search, #rso, [data-text-ad], #center_col"
-                ))
-            )
-        except Exception:
-            pass
-        _sleep("serp_settle")
+        # Fast polling loop: on a healthy SERP, ads are parseable within
+        # ~500ms of DOMContentLoaded. Poll every 300ms up to 3s, bail
+        # immediately when we find any.
+        ads = []
+        poll_deadline = time.time() + 3.0
+        poll_interval = 0.3
+        beat_every    = 3     # every Nth iteration = ~900ms apart
+        i = 0
+        while time.time() < poll_deadline:
+            try:
+                ads = parse_ads(driver, query)
+            except Exception:
+                ads = []
+            if ads:
+                break
+            # Also check for a captcha flash that appeared async
+            if is_captcha_page(driver):
+                logging.error("  ✗ CAPTCHA appeared during poll")
+                sqm.record("captcha", query=query, url=driver.current_url)
+                if current_ip:
+                    browser.report_rotating(current_ip, success=False, captcha=True)
+                return []
+            if i % beat_every == 0:
+                _beat()
+            i += 1
+            time.sleep(poll_interval)
 
-        ads = parse_ads(driver, query)
         if ads:
+            # Stop any still-running subresources — gstatic, trackers,
+            # iframes — so the next query doesn't have to queue behind them.
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
             logging.info(f"  ✓ {len(ads)} ads on attempt {attempt}")
             return ads
 
@@ -542,17 +614,34 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
 
         wait_sec = random.uniform(REFRESH_MIN_SEC, REFRESH_MAX_SEC)
         logging.info(f"  ↻ attempt {attempt}/{REFRESH_MAX_ATTEMPTS} — refresh in {wait_sec:.0f}s")
-        time.sleep(wait_sec)
+        # During this pre-refresh wait, heartbeat every ~5s so the
+        # watchdog doesn't flag us for stalling.
+        slept = 0
+        while slept < wait_sec:
+            chunk = min(5, wait_sec - slept)
+            time.sleep(chunk)
+            slept += chunk
+            _beat()
+
+        # Before we attempt refresh — is the browser still alive?
+        if not browser.is_alive():
+            logging.warning("  browser died during wait — aborting query")
+            return []
 
         try:
             driver.refresh()
         except Exception as e:
-            logging.warning(f"  refresh error: {e}")
+            err = type(e).__name__
+            logging.warning(f"  refresh {err}: {str(e)[:80]}")
             if not browser.is_alive():
                 return []
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
             continue
 
-        _sleep("post_refresh")
+        _beat()
 
     return []
 
@@ -663,6 +752,29 @@ def run_monitor():
             expected_country  = EXPECTED_COUNTRY,
         )
         diag.print_report(report)
+
+        # Record the current exit IP in ip_history — this is the only
+        # place that catches static (non-rotating) proxy IPs. For rotating
+        # proxies report() also fires later, but record_start ensures we
+        # never miss an IP just because its first request didn't captcha.
+        try:
+            ip_info = report.get("ip_info") or {}
+            exit_ip = ip_info.get("ip")
+            if exit_ip:
+                DB.ip_record_start(
+                    ip      = exit_ip,
+                    country = ip_info.get("country"),
+                    city    = ip_info.get("city"),
+                    org     = ip_info.get("org") or ip_info.get("isp"),
+                    asn     = ip_info.get("asn"),
+                )
+                # Remember current_ip even for static proxies (used below for
+                # later reporting on captchas). Don't overwrite a rotation-set
+                # value that might already be there.
+                if current_ip is None:
+                    current_ip = exit_ip
+        except Exception as e:
+            logging.debug(f"ip_record_start failed: {e}")
 
         if report.get("webrtc_leak"):
             logging.error("✗ WebRTC leak detected — aborting")
@@ -828,7 +940,73 @@ def run_monitor():
             check_interval = check_every,
         ) as dog:
 
-            for i, query in enumerate(SEARCH_QUERIES, 1):
+            # ── NEW: if a "main_script" is configured in Scripts page,
+            # run THAT instead of the hardcoded query-iteration loop.
+            # Steps inside main_script call back into search_query() /
+            # run_post_ad_pipeline() via loop_ctx callbacks.
+            main_script = CFG.get("actions.main_script", []) or []
+            if main_script:
+                from action_runner import run_main_script
+                logging.info(
+                    f"[main] Running main_script with {len(main_script)} steps "
+                    f"(legacy query loop bypassed)"
+                )
+
+                def _cb_search(q: str):
+                    """Callback for search_query step — returns the ads list."""
+                    try:
+                        ads = search_query(
+                            browser, q, sqm,
+                            current_ip=current_ip,
+                            watchdog=dog,
+                        )
+                        if ads:
+                            save_ads(ads)
+                        return ads or []
+                    except Exception as e:
+                        logging.warning(f"main_script._cb_search({q!r}): {e}")
+                        return []
+
+                def _cb_rotate():
+                    try:
+                        return browser.force_rotate_ip()
+                    except Exception as e:
+                        logging.warning(f"main_script._cb_rotate: {e}")
+                        return None
+
+                def _cb_per_ad(ad, query):
+                    """Dispatch one ad through the per-ad pipeline."""
+                    try:
+                        run_post_ad_pipeline(browser, ad, query=query)
+                    except Exception as e:
+                        logging.warning(
+                            f"main_script per-ad failed for "
+                            f"{ad.get('domain', '?')!r}: {e}"
+                        )
+
+                run_main_script(browser, main_script, loop_ctx={
+                    "all_queries":   SEARCH_QUERIES,
+                    "search_query":  _cb_search,
+                    "rotate_ip":     _cb_rotate,
+                    "per_ad_runner": _cb_per_ad,
+                    "watchdog":      dog,
+                })
+                # Skip the legacy loop. Using a local flag instead of
+                # `SEARCH_QUERIES = []` — assigning to the module-level
+                # name inside this function would make Python treat it
+                # as a local for the WHOLE enclosing block, tripping
+                # `for i, query in enumerate(SEARCH_QUERIES, 1)` below
+                # with UnboundLocalError before the assignment runs.
+                skip_legacy_loop = True
+            else:
+                skip_legacy_loop = False
+
+            if skip_legacy_loop:
+                queries_to_run = []
+            else:
+                queries_to_run = SEARCH_QUERIES
+
+            for i, query in enumerate(queries_to_run, 1):
                 dog.heartbeat()
 
                 if not browser.is_alive():
@@ -838,7 +1016,8 @@ def run_monitor():
                 t0 = time.time()
                 try:
                     ads = search_query(browser, query, sqm,
-                                       current_ip=current_ip)
+                                       current_ip=current_ip,
+                                       watchdog=dog)
                 except Exception as e:
                     # Catch "chrome not reachable" / "session deleted" / etc
                     # — these mean the browser died mid-query (user closed it,
@@ -894,7 +1073,7 @@ def run_monitor():
                 if ads:
                     with dog.pause(f"action pipeline for {len(ads)} ads"):
                         for ad in ads:
-                            run_post_ad_pipeline(browser, ad)
+                            run_post_ad_pipeline(browser, ad, query=query)
 
                 all_ads.extend(ads)
 

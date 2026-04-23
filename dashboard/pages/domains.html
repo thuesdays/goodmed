@@ -1,0 +1,66 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Domains</div>
+      <div class="page-subtitle">
+        Your own properties, target domains, and domains to ignore
+      </div>
+    </div>
+  </div>
+
+  <div class="card callout-note" style="margin-bottom: 18px;">
+    <div style="display: flex; align-items: flex-start; gap: 10px;">
+      <div style="font-size: 18px; line-height: 1;">💡</div>
+      <div>
+        <strong>Queries moved to Scripts.</strong>
+        Search terms are now configured directly inside a
+        <code>loop</code> step on the <a href="#" data-nav="scripts">Scripts</a>
+        page — one query list per loop, fully customizable. That lets
+        you run different queries in different rotations, with different
+        per-ad pipelines, in one script.
+      </div>
+    </div>
+  </div>
+
+  <!-- ── My domains ─────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🏠 My domains</div>
+    <div class="form-hint" style="margin-bottom: 10px;">
+      Domains you own and don't want to count as competitors. Ads
+      matching any of these entries are excluded from the Competitors
+      table. Step-level <code>skip_on_my_domain</code> checks use this
+      list too — handy for not clicking your own ads and burning your
+      ad budget.
+    </div>
+    <textarea class="textarea" rows="4"
+              data-config="search.my_domains" data-config-list="true"
+              placeholder="example.com&#10;example.org&#10;www.example.com"></textarea>
+  </div>
+
+  <!-- ── Target domains ─────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🎯 Target domains</div>
+    <div class="form-hint" style="margin-bottom: 10px;">
+      Ads that match any domain here trigger the <strong>on-target</strong>
+      script instead of the default post-click pipeline. Use for
+      competitors you want to treat specially — e.g. longer dwell time
+      or different interaction patterns.
+    </div>
+    <textarea class="textarea" rows="4"
+              data-config="search.target_domains" data-config-list="true"
+              placeholder="competitor-example-1.com&#10;competitor-example-2.net"></textarea>
+  </div>
+
+  <!-- ── Block list (future) ────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">🚫 Block list (optional)</div>
+    <div class="form-hint" style="margin-bottom: 10px;">
+      Domains to skip entirely — the monitor sees them in the SERP but
+      doesn't record, click, or otherwise interact. Useful for massive
+      aggregators (marketplaces, news sites) that dilute your stats.
+    </div>
+    <textarea class="textarea" rows="3"
+              data-config="search.block_domains" data-config-list="true"
+              placeholder="aggregator.example.com&#10;large-marketplace.example.com"></textarea>
+  </div>
+</section>

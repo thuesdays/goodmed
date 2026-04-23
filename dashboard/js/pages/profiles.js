@@ -17,7 +17,7 @@ const Profiles = {
     { key: "selfcheck",   label: "Self-check", default: true },
     { key: "fingerprint", label: "Fingerprint", default: false },
     { key: "languages",   label: "Languages",  default: false },
-    { key: "lastRun",     label: "Last run",   default: false },
+    { key: "lastRun",     label: "Last run",   default: true },
     { key: "actions",     label: "Actions",    default: true },
   ],
 
@@ -54,6 +54,20 @@ const Profiles = {
 
     this.renderColumnPicker();
     await this.reload();
+
+    // Start polling run status — flips Start ↔ Stop on the row where
+    // the running profile lives. Cheap GET every 2s.
+    if (this._statusTimer) clearInterval(this._statusTimer);
+    await this.refreshRunStatus();   // first update immediately
+    this._statusTimer = setInterval(() => this.refreshRunStatus(), 2000);
+  },
+
+  /** Called by the router when the user leaves this page. */
+  teardown() {
+    if (this._statusTimer) {
+      clearInterval(this._statusTimer);
+      this._statusTimer = null;
+    }
   },
 
   async reload() {
@@ -142,17 +156,66 @@ const Profiles = {
           Array.isArray(p.fingerprint?.languages)
             ? p.fingerprint.languages.slice(0, 2).join(", ")
             : "—"}</span>`;
-      case "lastRun":
-        return `<span class="muted">—</span>`;
-      case "actions":
+      case "lastRun": {
+        if (!p.last_run_at) return `<span class="muted">never</span>`;
+        // If this profile is the one currently running, show live marker
+        const running = this._runStatus?.is_running
+                        && this._runStatus?.profile_name === p.name;
+        if (running) {
+          return `<span class="run-status-live">
+            <span class="run-dot"></span> running now
+          </span>`;
+        }
+        const cls = p.last_run_status === "failed" ? "status-failed"
+                  : p.last_run_status === "running" ? "status-running"
+                  : "";
+        return `<span class="last-run ${cls}" title="${escapeHtml(p.last_run_at)}">
+          ${escapeHtml(timeAgo(p.last_run_at))}
+        </span>`;
+      }
+      case "actions": {
+        // If a run is in progress AND it's for THIS profile, show Stop
+        // instead of Start. The runStatus cache is refreshed by
+        // runner.js every 3s — we just read it here.
+        const running = !!(this._runStatus && this._runStatus.is_running);
+        const runningThis = running && this._runStatus.profile_name === p.name;
+        const isDefault = this._defaultProfileName === p.name;
+
+        // Show a subtle marker if this is the default profile
+        const defaultMark = isDefault
+          ? `<span class="profile-default-star"
+                   title="Default profile — the sidebar Start button launches this">★</span>`
+          : "";
+
+        let mainBtn;
+        if (runningThis) {
+          mainBtn = `<button class="profile-row-btn stop"
+                             onclick="Profiles.stopThis('${escapeHtml(p.name)}')">
+                       ■ Stop
+                     </button>`;
+        } else if (running) {
+          // Another profile is running. Disable start on this row —
+          // the runner is single-slot.
+          mainBtn = `<button class="profile-row-btn start" disabled
+                             title="Another profile (${escapeHtml(this._runStatus.profile_name || '?')}) is running. Stop it first.">
+                       ▶ Start
+                     </button>`;
+        } else {
+          mainBtn = `<button class="profile-row-btn start"
+                             onclick="Profiles.startProfile('${escapeHtml(p.name)}')">
+                       ▶ Start
+                     </button>`;
+        }
+
         return `
           <div class="profile-row-actions">
-            <button class="profile-row-btn start"
-                    onclick="Profiles.startProfile('${escapeHtml(p.name)}')">▶ Start</button>
+            ${defaultMark}
+            ${mainBtn}
             <button class="profile-menu-btn"
                     onclick="Profiles.showMenu(event, '${escapeHtml(p.name)}')">⋮</button>
           </div>
         `;
+      }
       default:
         return "—";
     }
@@ -168,8 +231,40 @@ const Profiles = {
         body: JSON.stringify(configCache),
       });
       await startRun();
+      // Immediately bump status — don't wait for the 3s poll tick so
+      // the user sees the Start button flip to Stop right away.
+      setTimeout(() => this.refreshRunStatus(), 500);
     } catch (e) {
       toast("Failed to start: " + e.message, true);
+    }
+  },
+
+  async stopThis(name) {
+    // Use the shared stopRun() — it has the confirm dialog + kill logic.
+    await stopRun();
+    setTimeout(() => this.refreshRunStatus(), 500);
+  },
+
+  /** Pull the latest run status + default profile name, then re-render
+   *  the Actions column so Start ↔ Stop reflects reality. Called on a
+   *  timer while the user is looking at the Profiles page. */
+  async refreshRunStatus() {
+    try {
+      const status = await api("/api/run/status");
+      this._runStatus = status;
+      // Default profile is read from the already-cached config — no need
+      // to hit the backend every 2s. setActive() below mutates the cache
+      // in place, so this stays in sync with UI actions.
+      this._defaultProfileName = configCache?.browser?.profile_name || null;
+      // Light refresh — only rebuild if there's a meaningful change,
+      // to avoid flashing the table every 3s.
+      const snapshot = `${status.is_running}|${status.profile_name}|${this._defaultProfileName}`;
+      if (snapshot !== this._lastStatusSnapshot) {
+        this._lastStatusSnapshot = snapshot;
+        this.renderTable();
+      }
+    } catch {
+      // Endpoint might be briefly unavailable — ignore
     }
   },
 
@@ -180,12 +275,10 @@ const Profiles = {
 
     const menu = document.createElement("div");
     menu.className = "context-menu";
+    // Start/Stop live on the row itself now — cleaner menu.
     menu.innerHTML = `
-      <div class="context-menu-item" data-action="start">▶ Start monitoring</div>
-      <div class="context-menu-item" data-action="stop">■ Stop if running</div>
-      <div class="context-menu-divider"></div>
-      <div class="context-menu-item" data-action="setactive">★ Set as active profile</div>
-      <div class="context-menu-item" data-action="view">🪪 View details</div>
+      <div class="context-menu-item" data-action="setactive">★ Set as default</div>
+      <div class="context-menu-item" data-action="view">🪪 Edit profile</div>
       <div class="context-menu-divider"></div>
       <div class="context-menu-item danger" data-action="delete">🗑 Delete profile</div>
     `;
@@ -201,8 +294,6 @@ const Profiles = {
       item.addEventListener("click", async () => {
         const action = item.dataset.action;
         menu.remove();
-        if (action === "start")     await this.startProfile(name);
-        if (action === "stop")      await stopRun();
         if (action === "setactive") await this.setActive(name);
         if (action === "view")      this.viewDetail(name);
         if (action === "delete")    await this.deleteProfile(name);
@@ -223,7 +314,12 @@ const Profiles = {
         method: "POST",
         body: JSON.stringify(configCache),
       });
-      toast(`✓ "${name}" is now active`);
+      // Keep local state in sync and re-render so the ★ moves
+      // to the new default row without waiting for the 2s poll.
+      this._defaultProfileName = name;
+      this._lastStatusSnapshot = null;    // force next poll to rerender too
+      this.renderTable();
+      toast(`✓ "${name}" is now the default profile`);
     } catch (e) {
       toast("Error: " + e.message, true);
     }
@@ -293,14 +389,42 @@ const CreateProfileModal = {
         });
       });
 
-      // Populate template dropdown
+      // Populate template dropdown with rich specs (CPU / RAM / GPU)
       try {
         const templates = await api("/api/profile-templates");
         const sel = $("#np-template");
         for (const t of templates) {
           const opt = document.createElement("option");
           opt.value = t.name;
-          opt.textContent = `${t.name} — ${t.platform || "?"}`;
+
+          // Compose label: "gaming_nvidia_mid — 12c · 16GB · RTX 4060"
+          const parts = [];
+          if (t.cpu_cores) parts.push(`${t.cpu_cores}c`);
+          if (t.ram_gb)    parts.push(`${Math.round(t.ram_gb)} GB`);
+          if (t.gpu_model) parts.push(t.gpu_model);
+          if (t.screen_w && t.screen_h) {
+            // Only show resolution if it's unusual (not the common 1920×1080)
+            if (!(t.screen_w === 1920 && t.screen_h === 1080)) {
+              parts.push(`${t.screen_w}×${t.screen_h}`);
+            }
+          }
+          if (t.is_laptop) parts.push("laptop");
+
+          opt.textContent = parts.length
+            ? `${t.name} — ${parts.join(" · ")}`
+            : t.name;
+
+          // Full tooltip on hover (native <option> supports title)
+          opt.title = [
+            `Template: ${t.name}`,
+            t.cpu_cores ? `CPU: ${t.cpu_cores} threads` : "",
+            t.ram_gb    ? `RAM: ${t.ram_gb} GB`         : "",
+            t.gpu_model ? `GPU: ${t.gpu_model}`         : "",
+            (t.screen_w && t.screen_h) ? `Display: ${t.screen_w}×${t.screen_h}` : "",
+            t.is_laptop ? "Form factor: laptop (battery emulation on)"
+                        : "Form factor: desktop (plugged in)",
+          ].filter(Boolean).join("\n");
+
           sel.appendChild(opt);
         }
       } catch (e) {

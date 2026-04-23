@@ -78,6 +78,7 @@ Each action is a dict like:
 
 import logging
 import random
+import re
 import time
 from typing import Any, Callable
 
@@ -553,16 +554,343 @@ ACTION_HANDLERS: dict[str, Callable] = {
 }
 
 
+# ──────────────────────────────────────────────────────────────
+# LOOP-LEVEL HANDLERS
+#
+# These run from run_main_script(). Instead of driver+action+ctx,
+# they receive (browser, step, loop_ctx) where loop_ctx is a
+# contract with callbacks main.py provides:
+#   loop_ctx = {
+#       "all_queries":    [...],          # list of strings from DB
+#       "search_query":   callable,       # run_one_query(query) -> list[ad]
+#       "rotate_ip":      callable,       # force_rotate() -> new_ip|None
+#       "per_ad_runner":  callable,       # run_post_ad_pipeline(ad, query)
+#       "watchdog":       watchdog obj    # .heartbeat() / .pause()
+#   }
+# ──────────────────────────────────────────────────────────────
+
+def _loop_search_query(browser, step, loop_ctx):
+    """Run one specific query string; dispatch per-ad pipeline for each ad."""
+    q = (step.get("query") or "").strip()
+    if not q:
+        log.warning("  search_query step has empty 'query' field, skipping")
+        return
+    fail_on_empty = bool(step.get("fail_on_empty", False))
+
+    search_fn = loop_ctx.get("search_query")
+    if search_fn is None:
+        log.warning("  search_query: no runner in loop_ctx")
+        return
+
+    log.info(f"  → search_query: {q!r}")
+    ads = search_fn(q) or []
+    if not ads and fail_on_empty:
+        raise RuntimeError(f"search_query: no ads for {q!r} (fail_on_empty=true)")
+
+    per_ad = loop_ctx.get("per_ad_runner")
+    if per_ad and ads:
+        for ad in ads:
+            per_ad(ad, q)
+
+
+def _loop_search_all_queries(browser, step, loop_ctx):
+    """Convenience wrapper: iterate every query from DB.search.queries."""
+    queries = list(loop_ctx.get("all_queries") or [])
+    if step.get("shuffle", True):
+        random.shuffle(queries)
+    if not queries:
+        log.warning("  search_all_queries: no queries configured")
+        return
+
+    search_fn = loop_ctx.get("search_query")
+    per_ad    = loop_ctx.get("per_ad_runner")
+    if search_fn is None:
+        log.warning("  search_all_queries: no runner in loop_ctx")
+        return
+
+    log.info(f"  → search_all_queries: {len(queries)} queries")
+    for q in queries:
+        ads = search_fn(q) or []
+        if per_ad and ads:
+            for ad in ads:
+                per_ad(ad, q)
+
+
+def _loop_rotate_ip(browser, step, loop_ctx):
+    """Force a proxy rotation. No-op on static proxies."""
+    wait_after = float(step.get("wait_after_sec", 4))
+    rotate_fn = loop_ctx.get("rotate_ip")
+    if rotate_fn is None:
+        log.info("  rotate_ip: no rotation callback (static proxy?) — skip")
+        return
+    new_ip = rotate_fn()
+    if new_ip:
+        log.info(f"  → rotate_ip: now on {new_ip}")
+    if wait_after > 0:
+        time.sleep(wait_after + random.uniform(0, 1.5))
+
+
+def _loop_pause(browser, step, loop_ctx):
+    """Sleep for a random duration between min_sec and max_sec."""
+    lo = float(step.get("min_sec", 3))
+    hi = float(step.get("max_sec", 8))
+    if hi < lo: hi = lo
+    sleep_for = random.uniform(lo, hi)
+    log.info(f"  → pause: {sleep_for:.1f}s")
+    time.sleep(sleep_for)
+
+
+def _loop_visit_url(browser, step, loop_ctx):
+    """Navigate to an arbitrary URL, dwell, then continue."""
+    url = (step.get("url") or "").strip()
+    if not url:
+        log.warning("  visit_url: empty URL, skipping")
+        return
+    lo = float(step.get("dwell_min", 4))
+    hi = float(step.get("dwell_max", 12))
+    log.info(f"  → visit_url: {url}")
+    try:
+        browser.driver.get(url)
+    except Exception as e:
+        log.warning(f"    visit_url failed: {e}")
+        return
+    time.sleep(random.uniform(lo, hi))
+
+
+def _loop_refresh(browser, step, loop_ctx):
+    """
+    Refresh the current page (typically a SERP after a search_query
+    step returned no ads). Supports a retry loop with delays between
+    refreshes.
+
+    Params:
+      max_attempts   int    how many times to refresh (default 3)
+      delay_min_sec  float  min wait between refreshes (default 3)
+      delay_max_sec  float  max wait between refreshes (default 8)
+      stop_when_ads  bool   after each refresh, re-parse ads and stop
+                            the retry loop early if any are found
+                            (default true). Requires the nested context
+                            to have a search_query callback able to
+                            re-dispatch the last query — for now we just
+                            drop the check and always do N refreshes.
+
+    Typical usage: inside a loop over queries, after search_query:
+      loop { items: [...], item_var: query
+             steps: [
+               { search_query: "{query}" }
+               { refresh: max_attempts: 3, delay_min_sec: 5 }
+             ] }
+    """
+    max_attempts = int(step.get("max_attempts", 3))
+    lo = float(step.get("delay_min_sec", 3))
+    hi = float(step.get("delay_max_sec", 8))
+    if hi < lo: hi = lo
+
+    driver = browser.driver
+    # Cap this refresh's load time — combined with eager strategy, it
+    # returns almost immediately after DOMContentLoaded. No reason to
+    # wait for third-party subresources on a page we're about to re-parse.
+    try:
+        driver.set_page_load_timeout(15)
+    except Exception:
+        pass
+
+    for attempt in range(1, max_attempts + 1):
+        wait = random.uniform(lo, hi)
+        log.info(f"  → refresh: attempt {attempt}/{max_attempts} "
+                 f"(wait {wait:.1f}s before)")
+        time.sleep(wait)
+        try:
+            driver.refresh()
+        except Exception as e:
+            log.warning(f"    refresh failed: {e}")
+            try: driver.execute_script("window.stop();")
+            except Exception: pass
+            return
+
+
+def _substitute_vars(value, vars_dict):
+    """Replace {var} placeholders in a string (or recursively in dict/list).
+
+    Used inside `_loop_foreach` so that when a user writes a nested step
+    like `search_query: { query: "{item}" }` inside a foreach over items
+    ["apple", "banana"], each iteration actually searches "apple" then
+    "banana".
+
+    Only plain-identifier braces are substituted — `{item}` yes,
+    `{"type":"x"}` no (the latter isn't an identifier).
+    """
+    if isinstance(value, str):
+        def _sub(match):
+            key = match.group(1).strip()
+            return str(vars_dict.get(key, match.group(0)))
+        return re.sub(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", _sub, value)
+    if isinstance(value, dict):
+        return {k: _substitute_vars(v, vars_dict) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_substitute_vars(v, vars_dict) for v in value]
+    return value
+
+
+def _loop_foreach(browser, step, loop_ctx):
+    """
+    Generic iteration step. User supplies the list explicitly; inside
+    steps can reference the current item via `{item}` (or a custom
+    `item_var`).
+
+    Params:
+      items       list[str]  explicit list of values to iterate over.
+      items_from  optional "queries" — fetch from search.queries for
+                  backwards compat with older configs.
+      item_var    str        placeholder name, default "item".
+      shuffle     bool       randomize order (default true).
+      steps       list[dict] nested action steps to run per item.
+
+    Example (Main script → Loop):
+      type: loop
+      items: ["best laptops", "gaming chairs", "smart home hub"]
+      item_var: query
+      steps:
+        - type: pause     (min_sec: 2, max_sec: 5)
+        - type: search_query   (query: "{query}")
+        - type: rotate_ip
+    """
+    items     = list(step.get("items") or [])
+    items_src = step.get("items_from")
+    item_var  = step.get("item_var") or "item"
+    shuffle   = bool(step.get("shuffle", True))
+    steps     = step.get("steps") or []
+
+    # Backwards-compat: pull items from the Domains page if requested
+    if not items and items_src == "queries":
+        items = list(loop_ctx.get("all_queries") or [])
+
+    if not items:
+        log.warning("  loop: empty items list — nothing to iterate")
+        return
+    if not steps:
+        log.warning("  loop: no nested steps defined")
+        return
+
+    if shuffle:
+        items = list(items)
+        random.shuffle(items)
+
+    log.info(f"  → loop: {len(items)} items × {len(steps)} steps "
+             f"(var={item_var!r}, shuffle={shuffle})")
+
+    dog = loop_ctx.get("watchdog")
+
+    for idx, item in enumerate(items, 1):
+        if dog:
+            try: dog.heartbeat()
+            except Exception: pass
+
+        log.info(f"  [loop {idx}/{len(items)}] {item_var}={item!r}")
+        vars_dict = {item_var: item, "index": idx, "total": len(items)}
+
+        for i, nested_step in enumerate(steps, 1):
+            if not nested_step.get("enabled", True):
+                continue
+
+            # Substitute {item_var} in every param value
+            resolved = _substitute_vars(dict(nested_step), vars_dict)
+            act_type = resolved.get("type")
+            handler  = LOOP_ACTION_HANDLERS.get(act_type)
+
+            if handler is None:
+                log.warning(f"    loop step {i}: unknown action {act_type!r}")
+                continue
+
+            prob = float(resolved.get("probability", 1.0))
+            if random.random() > prob:
+                log.info(f"    loop step {i}: skip {act_type} (p={prob:.2f})")
+                continue
+
+            try:
+                handler(browser, resolved, loop_ctx)
+            except Exception as e:
+                log.warning(f"    loop step {i}: {act_type} errored: "
+                            f"{type(e).__name__}: {e}")
+                if resolved.get("abort_on_error"):
+                    raise
+
+
+LOOP_ACTION_HANDLERS: dict[str, Callable] = {
+    "search_query":        _loop_search_query,
+    "search_all_queries":  _loop_search_all_queries,
+    "rotate_ip":           _loop_rotate_ip,
+    "pause":               _loop_pause,
+    "visit_url":           _loop_visit_url,
+    "refresh":             _loop_refresh,
+    "loop":                _loop_foreach,
+}
+
+
+def run_main_script(browser, main_script: list, loop_ctx: dict):
+    """
+    Execute a top-level (loop-scope) script. Each step is one of the
+    LOOP_ACTION_HANDLERS entries. Skipped when `main_script` is empty —
+    caller should fall back to the legacy hardcoded query loop.
+
+    loop_ctx contract:
+      all_queries     list[str]           — queries from db.search.queries
+      search_query    callable(q) → list  — main.search_query wrapper
+      rotate_ip       callable()   → str  — main.rotate wrapper
+      per_ad_runner   callable(ad, query) — main.run_post_ad_pipeline
+      watchdog        watchdog ctx        — optional, for heartbeat
+    """
+    if not main_script:
+        return False   # caller uses legacy behavior
+
+    dog = loop_ctx.get("watchdog")
+    for i, step in enumerate(main_script, 1):
+        if not step.get("enabled", True):
+            continue
+        act_type = step.get("type")
+        handler = LOOP_ACTION_HANDLERS.get(act_type)
+        if handler is None:
+            log.warning(f"[main_script step {i}] unknown loop action: {act_type}")
+            continue
+
+        prob = float(step.get("probability", 1.0))
+        if random.random() > prob:
+            log.info(f"[main_script step {i}] skip {act_type} (p={prob:.2f})")
+            continue
+
+        if dog:
+            try: dog.heartbeat()
+            except Exception: pass
+
+        log.info(f"[main_script step {i}/{len(main_script)}] {act_type}")
+        try:
+            handler(browser, step, loop_ctx)
+        except Exception as e:
+            log.warning(f"[main_script step {i}] {act_type} errored: "
+                        f"{type(e).__name__}: {e}")
+            # Propagate only if the step flagged itself mandatory
+            if step.get("abort_on_error"):
+                raise
+
+    return True   # main script ran
+
+
 def run_pipeline(browser, pipeline: list, context: dict = None):
     """
     Execute a full pipeline of actions. Each action dict has at minimum
     `type`. Common params:
-      - enabled            (bool, default true)
-      - probability        (0.0..1.0, default 1.0)
-      - skip_on_my_domain  (bool) — skip this step if ad's domain is
-                            one of the user's own domains (search.my_domains)
-      - skip_on_target     (bool) — skip this step if ad's domain is a
-                            target domain (from context)
+      - enabled             (bool, default true)
+      - probability         (0.0..1.0, default 1.0)
+      - skip_on_my_domain   (bool) — skip this step if ad's domain is
+                             one of the user's own domains (search.my_domains)
+      - skip_on_target      (bool) — skip this step if ad's domain is a
+                             target domain (from context)
+      - only_on_target      (bool) — inverse: run ONLY for target-domain ads
+      - only_on_my_domain   (bool) — inverse: run ONLY for my-domain ads
+
+    Each step's execution is recorded in the `action_events` table so the
+    Overview / Competitors pages can display real "actions performed"
+    counters (instead of just "ads found").
     """
     if not pipeline:
         return
@@ -578,33 +906,88 @@ def run_pipeline(browser, pipeline: list, context: dict = None):
     ))
     is_target   = bool(ad.get("is_target"))
 
+    # Classify ad for stats tables
+    if is_target:       ad_class = "target"
+    elif is_mine:       ad_class = "my_domain"
+    elif ad_domain:     ad_class = "competitor"
+    else:               ad_class = "unknown"
+
+    # DB handle for event logging; fail open if DB not available
+    try:
+        from db import get_db
+        _db = get_db()
+    except Exception:
+        _db = None
+
+    run_id       = ctx.get("run_id")
+    profile_name = ctx.get("profile_name") or "unknown"
+    query_str    = ctx.get("query") or ""
+
+    def _log_event(action_type, outcome, skip_reason=None,
+                   duration_sec=None, error=None):
+        if _db is None:
+            return
+        try:
+            _db.action_event_add(
+                run_id=run_id, profile_name=profile_name,
+                query=query_str, ad_domain=ad_domain, ad_class=ad_class,
+                action_type=action_type, outcome=outcome,
+                skip_reason=skip_reason, duration_sec=duration_sec,
+                error=error,
+            )
+        except Exception as e:
+            log.debug(f"action_event_add failed: {e}")
+
     for i, action in enumerate(pipeline, 1):
+        act_type = action.get("type") or "unknown"
+
         if not action.get("enabled", True):
+            _log_event(act_type, "skipped", skip_reason="disabled")
             continue
-        act_type = action.get("type")
+
         handler = ACTION_HANDLERS.get(act_type)
         if handler is None:
             log.warning(f"  unknown action type: {act_type}")
+            _log_event(act_type, "error", error="unknown_action_type")
             continue
 
         # Per-step domain filters — "do nothing if ad is my own domain"
         if is_mine and action.get("skip_on_my_domain"):
             log.info(f"  [{i}] skip {act_type} (ad is on my_domain: {ad_domain})")
+            _log_event(act_type, "skipped", skip_reason="my_domain")
             continue
         if is_target and action.get("skip_on_target"):
             log.info(f"  [{i}] skip {act_type} (ad is on target domain)")
+            _log_event(act_type, "skipped", skip_reason="target")
+            continue
+        # Inverse filters — step runs ONLY for specified ad class
+        if action.get("only_on_target") and not is_target:
+            log.info(f"  [{i}] skip {act_type} (only_on_target, ad is not target)")
+            _log_event(act_type, "skipped", skip_reason="not_target")
+            continue
+        if action.get("only_on_my_domain") and not is_mine:
+            log.info(f"  [{i}] skip {act_type} (only_on_my_domain, ad is not mine)")
+            _log_event(act_type, "skipped", skip_reason="not_my_domain")
             continue
 
         probability = float(action.get("probability", 1.0))
         if random.random() > probability:
             log.info(f"  [{i}] skip {act_type} (probability {probability:.2f})")
+            _log_event(act_type, "skipped", skip_reason="probability")
             continue
 
+        t0 = time.time()
         try:
             log.info(f"  [{i}] running {act_type}")
             handler(driver, action, ctx)
+            _log_event(act_type, "ran", duration_sec=round(time.time() - t0, 2))
         except Exception as e:
             log.warning(f"  [{i}] {act_type} errored: {type(e).__name__}: {e}")
+            _log_event(
+                act_type, "error",
+                duration_sec=round(time.time() - t0, 2),
+                error=f"{type(e).__name__}: {str(e)[:120]}",
+            )
             # Continue with remaining steps — don't abort the whole pipeline
             # for one bad selector
 
@@ -642,12 +1025,29 @@ def action_common_params() -> list[dict]:
             "default": False,
             "label": "Skip if ad is on target domain",
             "hint": "Skips this step for ads matching Search → Target "
-                    "Domains. Inverse of the on-target-domain pipeline.",
+                    "Domains. Use this on pipelines meant for generic/"
+                    "competitor ads only.",
+        },
+        {
+            "name": "only_on_target",
+            "type": "bool",
+            "default": False,
+            "label": "Run ONLY for target-domain ads",
+            "hint": "Step runs only when the ad's domain is in Search → "
+                    "Target Domains. Mutually exclusive with skip_on_target.",
+        },
+        {
+            "name": "only_on_my_domain",
+            "type": "bool",
+            "default": False,
+            "label": "Run ONLY for my-domain ads",
+            "hint": "Step runs only when the ad's domain is in Search → "
+                    "My Domains. Rare, but useful for a self-audit pipeline.",
         },
     ]
 
 
-def action_catalog() -> list[dict]:
+def _action_catalog_raw() -> list[dict]:
     """Return metadata for every action type — used by dashboard builder."""
     return [
         {
@@ -806,9 +1206,136 @@ def action_catalog() -> list[dict]:
             "type": "wait_for",
             "label": "Wait for element to appear",
             "description": "Block until selector appears or timeout.",
+            "scope": "per_ad",
             "params": [
                 {"name": "selector",    "type": "text", "required": True},
                 {"name": "timeout_sec", "type": "number", "default": 10},
             ],
         },
+
+        # ═════════════════════════════════════════════════════════
+        # LOOP-LEVEL actions — run OUTSIDE the per-ad pipeline.
+        # These compose the "main script" that orchestrates a run:
+        # search a query, iterate its ads, rotate IP between queries,
+        # take a break, etc. Scope metadata lets the UI group them
+        # separately in the builder.
+        # ═════════════════════════════════════════════════════════
+        {
+            "type": "search_query",
+            "label": "Run one search query",
+            "scope": "loop",
+            "description": "Navigate to google.com/search?q=… for the given "
+                          "query, wait for the SERP, parse ads, and (if ads "
+                          "are found) run the per-ad pipeline for each one.",
+            "params": [
+                {"name": "query", "type": "text", "required": True,
+                 "label": "Query text",
+                 "hint": "The exact string to type into Google. May contain spaces."},
+                {"name": "fail_on_empty", "type": "bool", "default": False,
+                 "label": "Fail if no ads",
+                 "hint": "Normally no ads = just move on. Enable this if an "
+                         "empty SERP should abort the whole script."},
+            ],
+        },
+        {
+            "type": "loop",
+            "label": "Loop over a custom list",
+            "scope": "loop",
+            "description": "Iterate a list of values, running nested steps "
+                          "for each. Inside the steps, use {item} (or your "
+                          "custom variable name) anywhere a param value is a "
+                          "string — e.g. search_query with query='{item}'. "
+                          "This replaces the old hardcoded query loop.",
+            "params": [
+                {"name": "items", "type": "textlist", "required": True,
+                 "label": "Items (one per line)",
+                 "hint": "One value per line. These are substituted into "
+                         "nested steps' string params."},
+                {"name": "item_var", "type": "text", "default": "item",
+                 "label": "Placeholder name",
+                 "hint": "Use this name in braces inside nested steps. "
+                         "E.g. if var is 'query', write '{query}' in "
+                         "a search_query step."},
+                {"name": "shuffle", "type": "bool", "default": True,
+                 "label": "Randomize order"},
+                {"name": "steps", "type": "steps", "default": [],
+                 "label": "Nested steps",
+                 "hint": "Runs once per item. Only loop-level actions "
+                         "(search_query, pause, rotate_ip, visit_url) are "
+                         "valid here — per-ad actions (click_ad, read, "
+                         "hover) run inside search_query automatically."},
+            ],
+        },
+        {
+            "type": "rotate_ip",
+            "label": "Rotate proxy IP",
+            "scope": "loop",
+            "description": "Force a proxy rotation mid-script. No-op on "
+                          "static (non-rotating) proxies.",
+            "params": [
+                {"name": "wait_after_sec", "type": "number", "default": 4,
+                 "label": "Pause after (s)"},
+            ],
+        },
+        {
+            "type": "pause",
+            "label": "Wait / idle pause",
+            "scope": "loop",
+            "description": "Sleep for a random duration. Simulates a human "
+                          "getting distracted between tasks.",
+            "params": [
+                {"name": "min_sec", "type": "number", "default": 3, "label": "Min (s)"},
+                {"name": "max_sec", "type": "number", "default": 8, "label": "Max (s)"},
+            ],
+        },
+        {
+            "type": "visit_url",
+            "label": "Visit a URL",
+            "scope": "loop",
+            "description": "Navigate to an arbitrary URL. Useful for warm-up "
+                          "(news site, weather) to break the fingerprint of "
+                          "\"only ever goes to Google\".",
+            "params": [
+                {"name": "url", "type": "text", "required": True,
+                 "label": "URL", "placeholder": "https://example.com"},
+                {"name": "dwell_min", "type": "number", "default": 4,
+                 "label": "Min dwell (s)"},
+                {"name": "dwell_max", "type": "number", "default": 12,
+                 "label": "Max dwell (s)"},
+            ],
+        },
+        {
+            "type": "refresh",
+            "label": "Refresh current page",
+            "scope": "loop",
+            "description": "Reload the current page N times with a random "
+                          "delay between attempts. Use this right after a "
+                          "search_query step — if Google returned no ads, "
+                          "a refresh often brings them back (ad auction "
+                          "runs per impression, timing-sensitive).",
+            "params": [
+                {"name": "max_attempts", "type": "number", "default": 3,
+                 "label": "Max attempts",
+                 "hint": "How many times to refresh the page."},
+                {"name": "delay_min_sec", "type": "number", "default": 3,
+                 "label": "Min delay (s)",
+                 "hint": "Minimum wait before each refresh. Humans don't "
+                         "hammer F5 — a 3-8s range looks organic."},
+                {"name": "delay_max_sec", "type": "number", "default": 8,
+                 "label": "Max delay (s)"},
+            ],
+        },
     ]
+
+
+def action_catalog() -> list[dict]:
+    """Top-level catalog — wraps _action_catalog_raw() and ensures every
+    entry has a `scope` ('per_ad' | 'loop') set, so the dashboard's
+    script builder can group them properly. Called by the dashboard
+    GET /api/actions/catalog endpoint.
+    """
+    catalog = _action_catalog_raw()
+    for entry in catalog:
+        if "scope" not in entry:
+            entry["scope"] = "per_ad"
+    return catalog

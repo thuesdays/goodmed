@@ -1,0 +1,115 @@
+<section>
+  <div class="page-header">
+    <div>
+      <div class="page-title">Scripts</div>
+      <div class="page-subtitle">
+        Build runs as a sequence of actions — search queries, pauses,
+        rotations, clicks, visits. Three scripts, each with its own role.
+      </div>
+    </div>
+    <div style="display: flex; gap: 8px;">
+      <button class="btn btn-secondary" id="actions-reload-btn">↻ Reload</button>
+      <button class="btn btn-primary" id="actions-save-btn">💾 Save changes</button>
+    </div>
+  </div>
+
+  <!-- ── MAIN script (loop-level) ───────────────────────────── -->
+  <div class="card">
+    <div class="card-title">
+      🎬 Main script
+      <span class="badge" id="main-script-count">0</span>
+      <div style="margin-left: auto;">
+        <button class="btn btn-secondary btn-small"
+                data-pipeline="main_script" data-action="add">
+          + Add step
+        </button>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      The <strong>entry point</strong> of a run. Sequenced loop-level
+      actions: search a query, rotate proxy, pause, visit a warm-up URL,
+      etc. When a <code>search_query</code> step runs and finds ads on
+      the SERP, the <strong>Per-ad actions</strong> below execute once
+      for each ad (before moving on to the next step).
+      <br><br>
+      Leave this script empty to use the legacy behavior: iterate every
+      query in <em>Domains → Search queries</em>, apply per-ad actions
+      to each ad, pause between queries.
+    </div>
+    <div id="main-script-list" class="pipeline-list"
+         data-pipeline="main_script"></div>
+  </div>
+
+  <!-- ── Per-ad pipeline (merged — competitor + target-domain) ─ -->
+  <div class="card">
+    <div class="card-title">
+      🎯 Per-ad actions
+      <span class="badge" id="post-ad-count">0</span>
+      <div style="margin-left: auto;">
+        <button class="btn btn-secondary btn-small"
+                data-pipeline="post_ad_actions" data-action="add">
+          + Add step
+        </button>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Runs <strong>once per ad</strong> found by a <code>search_query</code>
+      step in the Main script above. Steps execute in order for each ad
+      — click, read, hover, go back, etc.
+      <br><br>
+      To treat your own or target domains differently, use the per-step
+      flags on each action:
+      <span class="inline-flag-demo skip">skip my</span> /
+      <span class="inline-flag-demo skip">skip target</span> to exclude
+      a step for those ads, or
+      <span class="inline-flag-demo only">only my</span> /
+      <span class="inline-flag-demo only">only target</span> to run it
+      <strong>exclusively</strong> for those ads. Example: record every
+      ad with a <code>dwell</code> step, but click only competitors — on
+      your <code>click_ad</code> step check "skip if ad is on my
+      domain" and "skip if ad is on target domain".
+    </div>
+    <div id="post-ad-list" class="pipeline-list"
+         data-pipeline="post_ad_actions"></div>
+  </div>
+
+  <!-- ── Catalog reference ──────────────────────────────────── -->
+  <div class="card">
+    <div class="card-title">
+      📖 Available action types
+      <span class="badge" id="catalog-count">—</span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 10px;">
+      Click any action to add it to the Main script. Color indicates
+      scope: <span class="scope-badge scope-loop">loop</span> = script-level
+      (search, rotate, pause) · <span class="scope-badge scope-per-ad">per ad</span>
+      = runs once per ad (click, read, hover).
+    </div>
+    <div id="actions-catalog" class="actions-catalog">
+      <div class="empty-state">Loading…</div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── ADD-STEP MODAL ────────────────────────────────────────── -->
+<div class="profile-modal" id="add-step-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="add-step-modal"></div>
+  <div class="profile-modal-content" style="width: 480px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">➕ Add action step</div>
+      <button class="profile-modal-close" data-close="add-step-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Action type</label>
+        <select id="add-step-type" class="select" style="width: 100%;"></select>
+        <div class="form-hint" id="add-step-description"></div>
+      </div>
+      <div id="add-step-params"></div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="add-step-modal">Cancel</button>
+      <button class="btn btn-primary" id="add-step-confirm-btn">Add step</button>
+    </div>
+  </div>
+</div>
