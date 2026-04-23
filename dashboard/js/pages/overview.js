@@ -13,7 +13,52 @@ const Overview = {
       this.loadRecentActivity(),
       this.loadTopCompetitors(),
       this.loadProfileHealth(),
+      this.loadTrafficCard(),
     ]);
+
+    // Clicking the traffic card navigates to the full page. We attach
+    // here rather than in HTML because navigate() is a JS function —
+    // cleaner than an onclick handler that calls it.
+    const card = document.getElementById("stat-traffic-card");
+    if (card) {
+      const go = () => navigate("traffic");
+      card.addEventListener("click", go);
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); }
+      });
+    }
+  },
+
+  // ── Traffic card (24h rollup, clicks through to full page) ──────
+  //
+  // Queries the same /api/traffic/summary endpoint the Traffic page uses.
+  // We show bytes + request count, and flag "heavy" traffic so users
+  // with paid proxies notice before their next bill. Heavy threshold
+  // is 1 GB/day per profile pool — tuned against asocks pricing (~$3/GB
+  // for residential). Users with different price tiers can adjust the
+  // threshold in Settings (not yet wired — see traffic.heavy_threshold_gb).
+
+  async loadTrafficCard() {
+    const bytesEl = document.getElementById("stat-traffic-bytes");
+    const subEl   = document.getElementById("stat-traffic-sub");
+    const chipEl  = document.getElementById("stat-traffic-chip");
+    if (!bytesEl) return;
+    try {
+      const s = await api("/api/traffic/summary?hours=24");
+      const b = s.total_bytes || 0;
+      // formatBytes is the canonical helper from utils.js — loaded
+      // before page scripts, always available on window.
+      bytesEl.textContent = formatBytes(b);
+      subEl.textContent   = `${(s.total_requests || 0).toLocaleString()} requests`;
+      // Heavy = >1 GB in 24h. Chip is hint, not a blocker.
+      if (chipEl) {
+        chipEl.style.display = b > 1024 * 1024 * 1024 ? "" : "none";
+      }
+    } catch (e) {
+      bytesEl.textContent = "—";
+      subEl.textContent   = "no data";
+      console.warn("Traffic card load:", e);
+    }
   },
 
   // ── Headline stats (hero + big cards + chart) ────────────────

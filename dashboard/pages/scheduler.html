@@ -8,6 +8,10 @@
     </div>
     <div class="btn-group">
       <button class="btn btn-secondary" id="sched-refresh-btn">↻ Refresh</button>
+      <button class="btn btn-secondary" id="sched-reap-btn"
+              title="Force-kill stale runs and clear stuck scheduler state. Safe to click anytime.">
+        🧹 Clean zombies
+      </button>
       <button class="btn" id="sched-start-btn" style="background: var(--healthy);">
         <span>▶</span> <span>Start scheduler</span>
       </button>
@@ -20,7 +24,10 @@
   <!-- Status card -->
   <div class="stats-grid">
     <div class="stat">
-      <div class="stat-label">Status</div>
+      <div class="stat-label">
+        Status
+        <span class="health-pill" id="sched-health-pill" style="display:none;"></span>
+      </div>
       <div class="stat-value" id="sched-status-value">—</div>
       <div class="stat-delta" id="sched-status-sub">idle</div>
     </div>

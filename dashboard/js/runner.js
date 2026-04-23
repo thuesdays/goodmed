@@ -207,19 +207,39 @@ function _renderActiveRunsPanel(activeRuns) {
 
   list.innerHTML = activeRuns
     .sort((a, b) => a.run_id - b.run_id)
-    .map(r => `
-      <div class="active-run-row" data-run-id="${r.run_id}">
-        <div class="active-run-info">
-          <div class="active-run-name">${escapeHtml(r.profile_name || "?")}</div>
-          <div class="active-run-meta">
-            #${r.run_id} · ${escapeHtml(_elapsedShort(r.started_at))}
+    .map(r => {
+      // Heartbeat visualisation. The backend returns heartbeat_age
+      // (seconds since last DB ping from main.py). We classify:
+      //   < 45s   → healthy (no badge, keep UI clean)
+      //   45-90s  → amber "slow" pill (might be in long operation)
+      //   > 90s   → red "WEDGED" pill (watchdog will kill soon, or
+      //             it's between main.py's start and first heartbeat)
+      let hbBadge = "";
+      const hb = r.heartbeat_age;
+      if (hb != null && hb >= 45) {
+        const cls = hb >= 90 ? "active-run-badge wedged" : "active-run-badge slow";
+        const label = hb >= 90
+          ? `⚠ no ping ${Math.floor(hb)}s`
+          : `slow ${Math.floor(hb)}s`;
+        hbBadge = `<span class="${cls}" title="Seconds since last main.py heartbeat. Watchdog kills after 180s.">${label}</span>`;
+      }
+      return `
+        <div class="active-run-row" data-run-id="${r.run_id}">
+          <div class="active-run-info">
+            <div class="active-run-name">
+              ${escapeHtml(r.profile_name || "?")}
+              ${hbBadge}
+            </div>
+            <div class="active-run-meta">
+              #${r.run_id} · ${escapeHtml(_elapsedShort(r.started_at))}
+            </div>
           </div>
+          <button class="active-run-stop"
+                  onclick="stopSpecificRun(${r.run_id}, '${escapeHtml(r.profile_name || "")}')"
+                  title="Stop this run">■</button>
         </div>
-        <button class="active-run-stop"
-                onclick="stopSpecificRun(${r.run_id}, '${escapeHtml(r.profile_name || "")}')"
-                title="Stop this run">■</button>
-      </div>
-    `).join("");
+      `;
+    }).join("");
 }
 
 // Init

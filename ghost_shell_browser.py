@@ -14,6 +14,7 @@ import logging
 import time
 import math
 import re
+import threading
 from datetime import datetime
 
 from selenium import webdriver
@@ -205,6 +206,53 @@ class GhostShellBrowser:
                     logging.debug(f"[GhostShellBrowser] Removed stale {lock_name}")
                 except Exception as e:
                     logging.debug(f"[GhostShellBrowser] Could not remove {lock_name}: {e}")
+
+        # ── Ghost Shell-specific lock file ─────────────────────────
+        # Belt-and-suspenders on top of the DB-level guard in
+        # process_reaper.ensure_no_live_run_for_profile(). If the DB
+        # is unavailable (e.g. user blew away ghost_shell.db to reset),
+        # this file still blocks a second Chrome from spawning against
+        # the same user-data-dir (which would silently corrupt session
+        # state on both).
+        gs_lock = os.path.join(self.user_data_path, ".ghost_shell.lock")
+        if os.path.exists(gs_lock):
+            stale = True
+            try:
+                with open(gs_lock, "r") as f:
+                    old_pid = int(f.read().strip() or "0")
+                if old_pid > 0:
+                    try:
+                        import psutil
+                        if psutil.pid_exists(old_pid):
+                            # Is it actually a Ghost Shell process?
+                            from process_reaper import pid_looks_like_ghost_shell
+                            if pid_looks_like_ghost_shell(old_pid):
+                                raise RuntimeError(
+                                    f"Profile '{self.profile_name}' is locked by "
+                                    f"live PID {old_pid}. Stop that run first "
+                                    f"(Dashboard → Scheduler → 🧹 Clean zombies, "
+                                    f"or kill PID manually)."
+                                )
+                    except ImportError:
+                        pass  # no psutil — fall through, treat as stale
+            except RuntimeError:
+                raise
+            except Exception:
+                pass  # corrupt lock file → treat as stale
+            if stale:
+                try:
+                    os.remove(gs_lock)
+                except OSError:
+                    pass
+
+        # Write our own PID into the lock. Cleared in close().
+        try:
+            with open(gs_lock, "w") as f:
+                f.write(str(os.getpid()))
+            self._gs_lock_path = gs_lock
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] lock write skipped: {e}")
+            self._gs_lock_path = None
 
         # 3. Configure Local Preferences (WebRTC & permissions ONLY).
         # Language settings are NOT written here — that would overwrite our
@@ -557,6 +605,46 @@ class GhostShellBrowser:
         w = win_w - 80 + random.randint(-15, 15)
         h = win_h - 120 + random.randint(-15, 15)
         self.driver.set_window_size(w, h)
+
+        # ── Traffic collector — optional, config-gated ──────────────
+        # Tracks bytes per domain for the dashboard's bandwidth charts.
+        # Lightweight (PerformanceObserver + polling every 5s), gated on
+        # traffic.enabled so users with tight disk / slow boxes can skip.
+        self._traffic_collector = None
+        try:
+            from db import get_db as _get_db
+            db = _get_db()
+            if db.config_get("traffic.enabled") is not False:  # default True
+                from traffic_collector import TrafficCollector
+                self._traffic_collector = TrafficCollector(
+                    driver             = self.driver,
+                    profile_name       = self.profile_name or "default",
+                    run_id             = self.run_id,
+                    db                 = db,
+                    flush_interval_sec = int(
+                        db.config_get("traffic.flush_interval_sec") or 30
+                    ),
+                )
+                self._traffic_collector.start()
+        except Exception as e:
+            logging.warning(f"[GhostShellBrowser] Traffic collector init failed: {e}")
+
+        # ── Hang watchdog ──────────────────────────────────────────
+        # Pokes driver.title every WATCHDOG_PROBE_SEC seconds. If N
+        # probes in a row time out or raise, assumes Chrome is wedged
+        # and kills the whole tree. Without this, selenium commands
+        # block indefinitely (default timeout is None for .get()
+        # followed by silent CDP hangs on page_load_strategy=eager).
+        self._watchdog_thread = None
+        self._watchdog_stop = threading.Event()
+        self._watchdog_fail_count = 0
+        try:
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop, daemon=True, name="GSB-watchdog"
+            )
+            self._watchdog_thread.start()
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] watchdog spawn skipped: {e}")
 
         # 5. Initialization Navigation (CRITICAL)
         # Bypasses the first-load visibility detection before actual targets are visited
@@ -1208,6 +1296,119 @@ class GhostShellBrowser:
             return True
         except Exception:
             return False
+
+    # ──────────────────────────────────────────────────────────
+    # HANG WATCHDOG
+    # ──────────────────────────────────────────────────────────
+    #
+    # The watchdog is a daemon thread spawned in start(). It pokes
+    # the driver every WATCHDOG_PROBE_SEC; a successful probe resets
+    # the failure counter, a failed probe increments it. Once the
+    # counter hits WATCHDOG_KILL_AFTER consecutive failures we kill
+    # the whole Chrome process tree — which lets the main thread's
+    # next selenium command fail fast (WebDriverException) instead
+    # of blocking forever.
+    #
+    # Why not rely on command timeouts alone?
+    #   Selenium's .get() has a timeout via set_page_load_timeout(),
+    #   but many commands (CDP exec, driver.title after a nav) have
+    #   NO timeout by default. And if the underlying http channel
+    #   stalls, even timeouts don't fire. This thread is the safety
+    #   net for those cases.
+    #
+    # Why not restart instead of kill?
+    #   We're in a daemon context; restarting the browser mid-run
+    #   would corrupt the run's state. Killing is cleaner — main.py's
+    #   run loop will see a WebDriverException and exit, heartbeat
+    #   stops, and the scheduler starts the next iteration clean.
+
+    WATCHDOG_PROBE_SEC   = 30    # how often to poke the driver
+    WATCHDOG_PROBE_TIMEOUT = 20  # per-probe ceiling (seconds)
+    WATCHDOG_KILL_AFTER  = 3     # consecutive failures before murder
+
+    def _watchdog_loop(self):
+        """Background thread — detects frozen Chrome and force-kills it."""
+        while not self._watchdog_stop.is_set():
+            self._watchdog_stop.wait(self.WATCHDOG_PROBE_SEC)
+            if self._watchdog_stop.is_set():
+                return
+            if self.driver is None:
+                return
+
+            probe_ok = self._watchdog_probe()
+            if probe_ok:
+                if self._watchdog_fail_count > 0:
+                    logging.info(
+                        f"[GhostShellBrowser] watchdog: driver recovered "
+                        f"after {self._watchdog_fail_count} failed probe(s)"
+                    )
+                self._watchdog_fail_count = 0
+                continue
+
+            self._watchdog_fail_count += 1
+            logging.warning(
+                f"[GhostShellBrowser] watchdog: probe failed "
+                f"({self._watchdog_fail_count}/{self.WATCHDOG_KILL_AFTER})"
+            )
+            if self._watchdog_fail_count >= self.WATCHDOG_KILL_AFTER:
+                self._watchdog_kill_chrome()
+                return   # don't probe a corpse
+
+    def _watchdog_probe(self) -> bool:
+        """One probe attempt. We use a deadline-based thread because
+        selenium's own timeout handling is unreliable on stalled sockets.
+        Probe tries `driver.title` — lightweight CDP command.
+        """
+        result = {"ok": False}
+
+        def _try_ping():
+            try:
+                _ = self.driver.title   # cheap, goes through CDP
+                result["ok"] = True
+            except Exception as e:
+                logging.debug(f"[watchdog] probe exception: {e}")
+
+        t = threading.Thread(target=_try_ping, daemon=True)
+        t.start()
+        t.join(timeout=self.WATCHDOG_PROBE_TIMEOUT)
+        if t.is_alive():
+            # The thread is stuck in the selenium call — probe timed out.
+            # Thread will eventually unstick or get GC'd when we kill Chrome.
+            return False
+        return result["ok"]
+
+    def _watchdog_kill_chrome(self):
+        """Chrome is wedged — kill the whole tree so selenium commands
+        on the main thread fail fast instead of blocking forever."""
+        logging.error(
+            "[GhostShellBrowser] watchdog: Chrome appears WEDGED. "
+            "Force-killing process tree so main.py can exit cleanly."
+        )
+        try:
+            service_proc = getattr(self.driver, "service", None)
+            chromedriver_pid = None
+            if service_proc and getattr(service_proc, "process", None):
+                chromedriver_pid = service_proc.process.pid
+        except Exception:
+            chromedriver_pid = None
+
+        if chromedriver_pid:
+            try:
+                from process_reaper import kill_process_tree
+                kill_process_tree(chromedriver_pid, reason="watchdog: Chrome hang")
+            except Exception as e:
+                logging.warning(f"[watchdog] kill_process_tree error: {e}")
+
+        # Also nuke the proxy forwarder — it's useless without Chrome
+        try:
+            if self._proxy_forwarder:
+                self._proxy_forwarder.stop()
+        except Exception:
+            pass
+
+        # Null out the driver so .is_alive() returns False and any
+        # selenium commands raise AttributeError instead of hanging.
+        self.driver = None
 
     def restart(self):
         """Gracefully restarts the browser instance."""
@@ -1950,6 +2151,32 @@ class GhostShellBrowser:
 
     def close(self):
         """Gracefully terminates the driver and background processes."""
+        # Release our profile lock ASAP — even if the rest of shutdown
+        # fails, a follow-up run against the same profile should be able
+        # to start (other protections will still catch true double-spawn).
+        gs_lock = getattr(self, "_gs_lock_path", None)
+        if gs_lock and os.path.exists(gs_lock):
+            try:
+                os.remove(gs_lock)
+            except OSError:
+                pass
+
+        # Stop watchdog FIRST — we don't want it killing Chrome mid-shutdown
+        # if our save operations take >30s.
+        try:
+            self._watchdog_stop.set()
+        except Exception:
+            pass
+
+        # Stop traffic collector SECOND — it does one final poll via
+        # execute_script(). That requires the driver to still be alive.
+        if getattr(self, "_traffic_collector", None):
+            try:
+                self._traffic_collector.stop()
+            except Exception as e:
+                logging.debug(f"[GhostShellBrowser] traffic collector stop: {e}")
+            self._traffic_collector = None
+
         if self.driver and self.auto_session and self.is_alive():
             try:
                 self._auto_save_session()

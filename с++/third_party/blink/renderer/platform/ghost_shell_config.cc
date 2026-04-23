@@ -2,6 +2,8 @@
 
 #include "third_party/blink/renderer/platform/ghost_shell_config.h"
 
+#include <optional>
+
 #include "base/base64.h"
 #include "base/command_line.h"
 #include "base/json/json_reader.h"
@@ -38,6 +40,16 @@ String SerializeListAsJson(const ListT& list) {
   std::string tmp;
   base::Value wrapper(list.Clone());   // named lvalue — safe to pass
   if (!base::JSONWriter::Write(wrapper, &tmp)) return String("[]");
+  return ToBlinkString(tmp);
+}
+
+// Same trick for dicts — needed for the codec capabilities map, which
+// is a dict-of-dicts (codec_key → {supported, smooth, power_efficient}).
+template <typename DictT>
+String SerializeDictAsJson(const DictT& d) {
+  std::string tmp;
+  base::Value wrapper(d.Clone());
+  if (!base::JSONWriter::Write(wrapper, &tmp)) return String("{}");
   return ToBlinkString(tmp);
 }
 
@@ -189,12 +201,23 @@ void GhostShellConfig::Initialize() {
   }
 
   // ─── Noise seeds ───────────────────────────────────────
+  // Every field falls back to the struct's zero-initialised default
+  // when absent — so if a user upgrades Ghost Shell and the profile
+  // config was written before we added (e.g.) webgl_noise, the field
+  // simply stays at 0 and that subsystem gets no jitter. Existing
+  // profiles keep working until regenerated.
   if (const auto* noise = dict.FindDict("noise")) {
-    random_seed_       = noise->FindInt("seed").value_or(random_seed_);
-    canvas_shift_      = noise->FindInt("canvas_shift").value_or(canvas_shift_);
-    audio_offset_      = noise->FindDouble("audio_offset").value_or(audio_offset_);
-    rect_offset_       = noise->FindDouble("rect_offset").value_or(rect_offset_);
-    font_width_offset_ = noise->FindDouble("font_width_offset").value_or(font_width_offset_);
+    random_seed_            = noise->FindInt("seed").value_or(random_seed_);
+    canvas_shift_           = noise->FindInt("canvas_shift").value_or(canvas_shift_);
+    canvas_noise_           = noise->FindDouble("canvas_noise").value_or(canvas_noise_);
+    webgl_noise_            = noise->FindDouble("webgl_noise").value_or(webgl_noise_);
+    webgl_params_mask_      = noise->FindInt("webgl_params_mask").value_or(webgl_params_mask_);
+    audio_offset_           = noise->FindDouble("audio_offset").value_or(audio_offset_);
+    audio_rate_jitter_      = noise->FindInt("audio_rate_jitter").value_or(audio_rate_jitter_);
+    rect_offset_            = noise->FindDouble("rect_offset").value_or(rect_offset_);
+    font_width_offset_      = noise->FindDouble("font_width_offset").value_or(font_width_offset_);
+    screen_avail_jitter_    = noise->FindInt("screen_avail_jitter").value_or(screen_avail_jitter_);
+    timezone_offset_jitter_ = noise->FindInt("timezone_offset_jitter").value_or(timezone_offset_jitter_);
   }
 
   // ─── WebRTC Media ──────────────────────────────────────
@@ -229,6 +252,27 @@ void GhostShellConfig::Initialize() {
   if (const auto* plugins = dict.FindList("plugins"))
     plugins_json_ = SerializeListAsJson(*plugins);
 
+  // ─── GPU (WebGL UNMASKED_* + WebGPU adapter info) ──────
+  // Shape: {"gpu": {"unmasked_vendor": "...", "unmasked_renderer": "..."}}
+  // Defaults (set in the header) cover the "Intel integrated" case —
+  // the most common real GPU, so an unconfigured profile blends in.
+  if (const auto* gpu = dict.FindDict("gpu")) {
+    if (const auto* v = gpu->FindString("unmasked_vendor"))
+      unmasked_vendor_ = ToBlinkString(*v);
+    if (const auto* r = gpu->FindString("unmasked_renderer"))
+      unmasked_renderer_ = ToBlinkString(*r);
+  }
+
+  // ─── Media codecs ──────────────────────────────────────
+  // Shape: {"codecs": {"av1": {"supported": true, "smooth": true,
+  //                             "power_efficient": false}, ...}}
+  // Stored as JSON and parsed on each codec lookup — called rarely
+  // enough that parse overhead doesn't matter, and keeping it string-
+  // shaped here saves us a map<String, struct> in the header.
+  if (const auto* codecs = dict.FindDict("codecs")) {
+    codecs_json_ = SerializeDictAsJson(*codecs);
+  }
+
   // ─── Permissions API ───────────────────────────────────
   // Payload shape: {"permissions": {"geolocation": "prompt",
   //                                 "notifications": "prompt",
@@ -256,4 +300,46 @@ String GhostShellConfig::GetPermissionState(const String& name) const {
   return it->value;
 }
 
+// ─── Codec lookup helpers ──────────────────────────────────
+//
+// codecs_json_ stores {codec_key: {supported, smooth, power_efficient}}.
+// We parse on each call — cheap because MediaCapabilities.decodingInfo()
+// is not in any hot loop, and keeping the parse here avoids caching
+// complications when a renderer reloads config.
+namespace {
+bool LookupCodecBool(const String& json, const String& key, const char* field,
+                     bool default_value) {
+  std::optional<base::Value> parsed =
+      base::JSONReader::Read(json.Utf8().c_str(), 0);
+  if (!parsed || !parsed->is_dict()) return default_value;
+  const base::DictValue* entry = parsed->GetDict().FindDict(key.Utf8().c_str());
+  if (!entry) return default_value;
+  return entry->FindBool(field).value_or(default_value);
+}
+}  // namespace
+
+bool GhostShellConfig::GetCodecSupported(const String& key) const {
+  // Default true — if a profile's config didn't ship a codec map, we
+  // shouldn't start breaking video playback. The point of the lookup
+  // is to DOWNGRADE select codecs, not deny everything.
+  return LookupCodecBool(codecs_json_, key, "supported", true);
+}
+
+bool GhostShellConfig::GetCodecSmooth(const String& key) const {
+  return LookupCodecBool(codecs_json_, key, "smooth", true);
+}
+
+bool GhostShellConfig::GetCodecPowerEfficient(const String& key) const {
+  return LookupCodecBool(codecs_json_, key, "power_efficient", true);
+}
+
 }  // namespace blink
+
+extern "C" {
+bool GhostShell_IsActive() {
+  return blink::GhostShellConfig::GetInstance().IsActive();
+}
+int GhostShell_GetRandomSeed() {
+  return blink::GhostShellConfig::GetInstance().GetRandomSeed();
+}
+}

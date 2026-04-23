@@ -219,6 +219,42 @@ CREATE TABLE IF NOT EXISTS profile_group_members (
 );
 CREATE INDEX IF NOT EXISTS idx_group_members_profile
     ON profile_group_members(profile_name);
+
+-- ───────────────────────────────────────────────────────────────
+-- Traffic stats — AGGREGATED per (profile, domain, hour_bucket).
+--
+-- We record TOTALS per bucket, not individual requests. A 4-hour run
+-- that hits google.com 10,000 times creates at most 4 rows, not 10,000.
+-- Hour granularity gives us useful time-series charts without blowing
+-- up DB size. Rough sizing:
+--
+--   ~30 active hours/day * 50 unique domains * 10 profiles = 15,000 rows/day
+--   90 days retention = ~1.4M rows ≈ 50 MB of SQLite.
+--
+-- Cleanup policy: rows older than traffic.retention_days (default 90)
+-- are deleted by traffic_cleanup() which dashboard_server runs at
+-- startup and once per day.
+--
+-- We intentionally DO NOT store full URLs or paths. Only (domain, bytes)
+-- — enough for cost attribution, granular enough for "who's eating my
+-- bandwidth" questions, narrow enough to never log sensitive query params.
+-- ───────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS traffic_stats (
+    profile_name  TEXT    NOT NULL,
+    domain        TEXT    NOT NULL,
+    hour_bucket   TEXT    NOT NULL,   -- 'YYYY-MM-DD HH' (local time, hour resolution)
+    bytes         INTEGER NOT NULL DEFAULT 0,   -- cumulative in this bucket
+    req_count     INTEGER NOT NULL DEFAULT 0,   -- cumulative request count
+    run_id        INTEGER,                       -- first run that contributed (nullable)
+    updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (profile_name, domain, hour_bucket)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_profile_time
+    ON traffic_stats(profile_name, hour_bucket DESC);
+CREATE INDEX IF NOT EXISTS idx_traffic_bucket
+    ON traffic_stats(hour_bucket);
+CREATE INDEX IF NOT EXISTS idx_traffic_domain
+    ON traffic_stats(domain);
 """
 
 
@@ -321,6 +357,20 @@ DEFAULT_CONFIG = {
     # to exceed this.
     "runner.max_parallel":              4,
     "runner.warn_at_parallel":          3,    # show amber UI warning at this count
+
+    # ── Traffic accounting ─────────────────────────────────────
+    # We aggregate bytes per (profile, domain, hour) via CDP events.
+    # Keeping enabled costs ~1% CPU per browser and 50 MB of DB over
+    # 90 days. Disable if running on a box where the disk is tight or
+    # you don't care about who's eating bandwidth.
+    "traffic.enabled":                  True,
+    # How long to keep traffic rows. Older rows are deleted at startup
+    # and once per day. Set 0 to disable cleanup (keep forever).
+    "traffic.retention_days":           90,
+    # How often (seconds) the in-browser aggregator flushes pending
+    # buckets to SQLite. Lower = fresher dashboard numbers but more
+    # write volume. 30s is a good tradeoff.
+    "traffic.flush_interval_sec":       30,
     # Auto-rotate exit IP at start of each run. Forces a fresh TCP connection
     # to the rotating proxy so we get a new random Ukrainian IP each time.
     # Without this, subsequent runs in the same session can reuse the same IP
@@ -422,6 +472,10 @@ class DB:
     def _init_schema(self):
         conn = self._get_conn()
         conn.executescript(SCHEMA_SQL)
+        # Ensure newer columns exist on old DBs — SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so we check PRAGMA first.
+        self._ensure_column(conn, "runs", "pid",          "INTEGER")
+        self._ensure_column(conn, "runs", "heartbeat_at", "TEXT")
         # Check how full config is. On first init (empty), bulk-insert all
         # defaults. On subsequent starts after an upgrade, only insert keys
         # that are missing — so user customisations stay and new features
@@ -454,6 +508,17 @@ class DB:
     # ──────────────────────────────────────────────────────────
     # CONFIG
     # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_column(conn, table: str, col: str, type_sql: str):
+        """Idempotent ALTER TABLE ADD COLUMN for schema migrations.
+        SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe via
+        PRAGMA first. Safe to call repeatedly at startup."""
+        existing = {r["name"] for r in
+                    conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_sql}")
+            logging.info(f"[DB] Migrated: added {table}.{col} ({type_sql})")
 
     def config_get(self, key: str, default: Any = None) -> Any:
         row = self._get_conn().execute(
@@ -521,10 +586,54 @@ class DB:
 
     def run_start(self, profile_name: str, proxy_url: str = None) -> int:
         cur = self._get_conn().execute("""
-            INSERT INTO runs (started_at, profile_name, proxy_url)
-            VALUES (?, ?, ?)
-        """, (datetime.now().isoformat(timespec="seconds"), profile_name, proxy_url))
+            INSERT INTO runs (started_at, profile_name, proxy_url, heartbeat_at)
+            VALUES (?, ?, ?, ?)
+        """, (datetime.now().isoformat(timespec="seconds"),
+              profile_name, proxy_url,
+              datetime.now().isoformat(timespec="seconds")))
         return cur.lastrowid
+
+    def run_set_pid(self, run_id: int, pid: int):
+        """Called by dashboard_server after spawning main.py so we can
+        kill stale subprocesses on next dashboard restart."""
+        self._get_conn().execute(
+            "UPDATE runs SET pid = ? WHERE id = ?", (pid, run_id)
+        )
+
+    def run_heartbeat(self, run_id: int):
+        """Pinged by main.py every ~15 seconds while a run is alive.
+        If no heartbeat for 3 min, stale-detector treats the run as
+        hung and triggers forced cleanup."""
+        self._get_conn().execute(
+            "UPDATE runs SET heartbeat_at = ? WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), run_id)
+        )
+
+    def runs_find_unfinished_with_pid(self) -> list:
+        """Returns runs that never wrote finished_at. Each has a PID we
+        can check against the OS — if the PID is dead, mark the run as
+        stale; if the PID is alive but heartbeat is old, kill it.
+        Called by dashboard_server.cleanup_stale_runs() at startup."""
+        rows = self._get_conn().execute("""
+            SELECT id, profile_name, pid, started_at, heartbeat_at
+            FROM runs
+            WHERE finished_at IS NULL
+            ORDER BY started_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def runs_live_for_profile(self, profile_name: str) -> list:
+        """All runs for this profile that are still marked as running
+        (finished_at IS NULL). Pre-spawn guards use this — if ANY match,
+        we refuse to start a new run unless we can prove the old one is
+        really dead. Returns newest first."""
+        rows = self._get_conn().execute("""
+            SELECT id, pid, started_at, heartbeat_at
+            FROM runs
+            WHERE profile_name = ? AND finished_at IS NULL
+            ORDER BY started_at DESC
+        """, (profile_name,)).fetchall()
+        return [dict(r) for r in rows]
 
     def run_finish(self, run_id: int, exit_code: int = 0, error: str = None,
                    total_queries: int = None, total_ads: int = None,
@@ -650,6 +759,187 @@ class DB:
             WHERE profile_name = ? ORDER BY timestamp DESC LIMIT ?
         """, (profile_name, limit)).fetchall()
         return [dict(r) for r in rows]
+
+    # ──────────────────────────────────────────────────────────
+    # TRAFFIC STATS (aggregated per profile × domain × hour)
+    # ──────────────────────────────────────────────────────────
+    #
+    # We never store individual HTTP requests — that would bloat the DB
+    # and record sensitive URL paths. Instead, the browser-side collector
+    # aggregates request sizes in memory and flushes buckets here every
+    # 30 seconds via traffic_record_batch().
+    #
+    # Each bucket key is (profile_name, domain, hour_bucket). Two flushes
+    # targeting the same bucket MERGE rather than conflict — we use
+    # INSERT ... ON CONFLICT DO UPDATE with accumulating arithmetic.
+
+    @staticmethod
+    def _hour_bucket(ts: datetime = None) -> str:
+        """Format a datetime as 'YYYY-MM-DD HH' for bucket keying.
+        Uses local time — matches what users see in their dashboard
+        timezone. Hour is enough resolution for traffic charts without
+        making the table 60× bigger than it needs to be."""
+        ts = ts or datetime.now()
+        return ts.strftime("%Y-%m-%d %H")
+
+    def traffic_record_batch(self, profile_name: str, run_id: Optional[int],
+                             by_domain: dict, when: datetime = None):
+        """Flush a batch of (domain -> {bytes, req_count}) into the DB.
+
+        Called by GhostShellBrowser's in-memory aggregator every ~30 seconds
+        while a run is live. `by_domain` is a dict like:
+            {"google.com": {"bytes": 1234567, "req_count": 42},
+             "dl.google.com": {"bytes": 2345678, "req_count": 8}}
+
+        All pairs are bucketed into the SAME hour — the caller doesn't
+        flush across hour boundaries.
+        """
+        if not by_domain or not profile_name:
+            return
+        bucket = self._hour_bucket(when)
+        conn = self._get_conn()
+        # Batch upsert — one statement per domain, but all under a single
+        # transaction so 50-domain flushes stay fast.
+        with conn:
+            for domain, stats in by_domain.items():
+                if not domain:
+                    continue
+                b = int(stats.get("bytes") or 0)
+                c = int(stats.get("req_count") or 0)
+                if b <= 0 and c <= 0:
+                    continue
+                # SQLite UPSERT syntax — atomic and locks-free at row level.
+                conn.execute("""
+                    INSERT INTO traffic_stats
+                        (profile_name, domain, hour_bucket, bytes, req_count, run_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(profile_name, domain, hour_bucket) DO UPDATE SET
+                        bytes      = bytes + excluded.bytes,
+                        req_count  = req_count + excluded.req_count,
+                        updated_at = datetime('now')
+                """, (profile_name, domain, bucket, b, c, run_id))
+
+    def traffic_summary(self, hours: int = 24) -> dict:
+        """Total bytes + requests across all profiles in the last N hours.
+        Returns {total_bytes, total_requests, profile_count, domain_count,
+                 by_hour: [{hour, bytes, requests}, ...]}"""
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H")
+        conn = self._get_conn()
+        totals = conn.execute("""
+            SELECT
+                COALESCE(SUM(bytes), 0)     AS total_bytes,
+                COALESCE(SUM(req_count), 0) AS total_requests,
+                COUNT(DISTINCT profile_name) AS profile_count,
+                COUNT(DISTINCT domain)       AS domain_count
+            FROM traffic_stats
+            WHERE hour_bucket >= ?
+        """, (cutoff,)).fetchone()
+
+        by_hour = conn.execute("""
+            SELECT
+                hour_bucket                    AS hour,
+                COALESCE(SUM(bytes), 0)        AS bytes,
+                COALESCE(SUM(req_count), 0)    AS requests
+            FROM traffic_stats
+            WHERE hour_bucket >= ?
+            GROUP BY hour_bucket
+            ORDER BY hour_bucket ASC
+        """, (cutoff,)).fetchall()
+
+        return {
+            "total_bytes":    totals["total_bytes"] or 0,
+            "total_requests": totals["total_requests"] or 0,
+            "profile_count":  totals["profile_count"] or 0,
+            "domain_count":   totals["domain_count"] or 0,
+            "by_hour":        [dict(r) for r in by_hour],
+        }
+
+    def traffic_by_profile(self, hours: int = 24) -> list:
+        """Per-profile traffic totals for the last N hours.
+        Returns [{profile_name, bytes, requests, domain_count}, ...]
+        sorted by bytes desc."""
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H")
+        rows = self._get_conn().execute("""
+            SELECT
+                profile_name,
+                COALESCE(SUM(bytes), 0)       AS bytes,
+                COALESCE(SUM(req_count), 0)   AS requests,
+                COUNT(DISTINCT domain)        AS domain_count
+            FROM traffic_stats
+            WHERE hour_bucket >= ?
+            GROUP BY profile_name
+            ORDER BY bytes DESC
+        """, (cutoff,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def traffic_by_domain(self, hours: int = 24, limit: int = 50,
+                          profile_name: Optional[str] = None) -> list:
+        """Top domains by bytes in the last N hours. Optionally filter
+        to a single profile — useful to answer 'what's eating my
+        profile_03's bandwidth'."""
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H")
+        conn = self._get_conn()
+        if profile_name:
+            rows = conn.execute("""
+                SELECT domain,
+                       SUM(bytes)     AS bytes,
+                       SUM(req_count) AS requests
+                FROM traffic_stats
+                WHERE hour_bucket >= ? AND profile_name = ?
+                GROUP BY domain
+                ORDER BY bytes DESC
+                LIMIT ?
+            """, (cutoff, profile_name, limit)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT domain,
+                       SUM(bytes)     AS bytes,
+                       SUM(req_count) AS requests,
+                       COUNT(DISTINCT profile_name) AS profiles
+                FROM traffic_stats
+                WHERE hour_bucket >= ?
+                GROUP BY domain
+                ORDER BY bytes DESC
+                LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def traffic_timeseries(self, profile_name: Optional[str] = None,
+                           hours: int = 24, bucket: str = "hour") -> list:
+        """Time series for the traffic chart.
+
+        bucket = 'hour' (default, finest — use for hours <= 48)
+        bucket = 'day'  (use for hours > 48, aggregates each day)
+
+        Returns [{time: 'YYYY-MM-DD HH' or 'YYYY-MM-DD', bytes, requests}].
+        """
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H")
+        # Day-bucketing: derive 'YYYY-MM-DD' from 'YYYY-MM-DD HH' via SUBSTR(,1,10)
+        time_expr = "hour_bucket" if bucket == "hour" else "SUBSTR(hour_bucket, 1, 10)"
+        where_clause = "hour_bucket >= ?"
+        params = [cutoff]
+        if profile_name:
+            where_clause += " AND profile_name = ?"
+            params.append(profile_name)
+        rows = self._get_conn().execute(f"""
+            SELECT {time_expr}                   AS time,
+                   COALESCE(SUM(bytes), 0)       AS bytes,
+                   COALESCE(SUM(req_count), 0)   AS requests
+            FROM traffic_stats
+            WHERE {where_clause}
+            GROUP BY time
+            ORDER BY time ASC
+        """, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def traffic_cleanup(self, retention_days: int = 90) -> int:
+        """Delete traffic rows older than `retention_days`. Returns row
+        count removed. Called by dashboard_server at startup + once/day."""
+        cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d %H")
+        cur = self._get_conn().execute(
+            "DELETE FROM traffic_stats WHERE hour_bucket < ?", (cutoff,)
+        )
+        return cur.rowcount or 0
 
     # ──────────────────────────────────────────────────────────
     # COMPETITORS

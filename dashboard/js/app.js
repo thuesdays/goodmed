@@ -15,6 +15,7 @@ const PAGES = {
   // "Scripts" page (was "Actions") — pipeline/script builder
   scripts:     { html: "/pages/scripts.html",     init: () => ScriptsPage.init() },
   runs:        { html: "/pages/runs.html",        init: () => Runs.init() },
+  traffic:     { html: "/pages/traffic.html",     init: () => Traffic.init(),     teardown: () => Traffic.teardown?.() },
   scheduler:   { html: "/pages/scheduler.html",   init: () => Scheduler.init() },
   logs:        { html: "/pages/logs.html",        init: () => Logs.init(),        teardown: () => Logs.teardown?.() },
   settings:    { html: "/pages/settings.html",    init: () => Settings.init() },

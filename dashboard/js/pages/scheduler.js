@@ -13,6 +13,8 @@ const Scheduler = {
     $("#sched-start-btn").addEventListener("click", () => this.start());
     $("#sched-stop-btn").addEventListener("click", () => this.stop());
     $("#sched-refresh-btn").addEventListener("click", () => this.refresh());
+    const reapBtn = $("#sched-reap-btn");
+    if (reapBtn) reapBtn.addEventListener("click", () => this.reapZombies());
 
     await Promise.all([
       this.loadProfiles(),
@@ -112,18 +114,55 @@ const Scheduler = {
 
   renderStatus(s) {
     const running = s.is_running;
+    const health  = s.health || (running ? "ok" : "stopped");
 
     $("#sched-start-btn").style.display = running ? "none" : "inline-flex";
     $("#sched-stop-btn").style.display  = running ? "inline-flex" : "none";
 
-    $("#sched-status-value").textContent = running ? "Running" : "Stopped";
-    $("#sched-status-value").style.color = running ? "var(--healthy)" : "var(--text-muted)";
+    // Status label reflects health, not just binary is_running. This
+    // catches the "process is alive but the main loop wedged" case,
+    // which previously showed "Running" misleadingly.
+    const labelByHealth = {
+      ok:      "Running",
+      stale:   "Wedged — no heartbeat",
+      crashed: "Crashed (stale state)",
+      stopped: "Stopped",
+    };
+    const colorByHealth = {
+      ok:      "var(--healthy)",
+      stale:   "var(--warning, #f59e0b)",
+      crashed: "var(--danger, #ef4444)",
+      stopped: "var(--text-muted)",
+    };
+    $("#sched-status-value").textContent = labelByHealth[health] || "—";
+    $("#sched-status-value").style.color = colorByHealth[health];
+
+    // Small pill next to the label — cheap visual indicator for users
+    // scanning the page fast.
+    const pill = $("#sched-health-pill");
+    if (pill) {
+      if (health === "ok") {
+        pill.style.display = "none";
+      } else {
+        pill.style.display       = "inline-block";
+        pill.textContent         = health;
+        pill.className           = `health-pill health-pill-${health}`;
+      }
+    }
 
     if (running) {
-      const startedAgo = s.started_at
-        ? this.relativeTime(s.started_at)
-        : "—";
-      $("#sched-status-sub").textContent = `since ${startedAgo}`;
+      const startedAgo = s.started_at ? this.relativeTime(s.started_at) : "—";
+      let sub = `since ${startedAgo}`;
+      if (s.heartbeat_age != null && s.heartbeat_age >= 0) {
+        const hbStr = s.heartbeat_age < 60
+          ? `ping ${s.heartbeat_age}s ago`
+          : `⚠ no ping ${Math.floor(s.heartbeat_age / 60)}m`;
+        sub += ` · ${hbStr}`;
+      }
+      $("#sched-status-sub").textContent = sub;
+    } else if (health === "crashed") {
+      $("#sched-status-sub").textContent =
+        "last heartbeat was too old — click 🧹 Clean zombies to reset";
     } else {
       $("#sched-status-sub").textContent = "idle";
     }
@@ -143,6 +182,36 @@ const Scheduler = {
     }
 
     $("#sched-last-profile").textContent = s.last_run_profile || "—";
+  },
+
+  /** Force-kill any wedged runs + clear stuck scheduler state.
+   *  Idempotent — clicking repeatedly is safe. */
+  async reapZombies() {
+    const btn = $("#sched-reap-btn");
+    const original = btn ? btn.textContent : "";
+    if (btn) {
+      btn.disabled    = true;
+      btn.textContent = "🧹 Cleaning…";
+    }
+    try {
+      const r = await fetch("/api/admin/reap-zombies", { method: "POST" });
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+      const bits = [];
+      if (body.runs_killed)      bits.push(`killed ${body.runs_killed} wedged`);
+      if (body.runs_marked_dead) bits.push(`marked ${body.runs_marked_dead} dead`);
+      if (body.runs_left_alive)  bits.push(`${body.runs_left_alive} still alive`);
+      const msg = bits.length ? `Cleaned: ${bits.join(", ")}` : "Nothing to clean — all good ✓";
+      toast(msg);
+      this.refresh();
+    } catch (e) {
+      toast(`Reap failed: ${e.message}`, true);
+    } finally {
+      if (btn) {
+        btn.disabled    = false;
+        btn.textContent = original;
+      }
+    }
   },
 
   relativeTime(iso) {

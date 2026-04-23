@@ -186,6 +186,21 @@ class RunnerPool:
 
     # ── Helpers ─────────────────────────────────────────────────
     def _slot_to_dict(self, slot: RunnerSlot) -> dict:
+        # Pull the heartbeat_at from the DB so the UI can show how
+        # fresh each run's liveness ping is. Useful for spotting
+        # wedged browsers in the Runs page before the watchdog
+        # kills them.
+        hb_age = None
+        try:
+            row = get_db()._get_conn().execute(
+                "SELECT heartbeat_at FROM runs WHERE id = ?",
+                (slot.run_id,)
+            ).fetchone()
+            if row and row["heartbeat_at"]:
+                hb = datetime.fromisoformat(row["heartbeat_at"])
+                hb_age = int((datetime.now() - hb).total_seconds())
+        except Exception:
+            pass
         return {
             "run_id":         slot.run_id,
             "profile_name":   slot.profile_name,
@@ -194,6 +209,7 @@ class RunnerPool:
             "last_exit_code": slot.last_exit_code,
             "last_error":     slot.last_error,
             "is_running":     slot.is_running,
+            "heartbeat_age":  hb_age,    # seconds since last heartbeat, or null
         }
 
 
@@ -264,30 +280,30 @@ RUNNER = _LegacyRunnerShim()
 
 def cleanup_stale_runs():
     """
-    Mark all runs stuck in 'running' state as failed on dashboard startup.
-    Happens when dashboard/main.py crashes without calling run_finish().
+    Resolve inconsistent DB/process state left by previous dashboard
+    instances. For each run stuck in 'running' state (finished_at IS NULL):
+
+      * dead process / stale heartbeat → force-kill any descendants and
+        mark the run as failed
+      * live process with fresh heartbeat → leave alone (dashboard was
+        restarted but scheduler or manual run is still healthily going)
+
+    Before this function existed, we only flipped the DB flag — Chrome
+    subprocesses from the old dashboard kept running and collided with
+    fresh spawns on user-data-dir locks. Now we genuinely clean up.
     """
     try:
+        from process_reaper import reap_stale_runs
         db = get_db()
-        conn = db._get_conn()
-        rows = conn.execute("""
-            SELECT id FROM runs
-            WHERE finished_at IS NULL AND exit_code IS NULL
-        """).fetchall()
-        for row in rows:
-            conn.execute("""
-                UPDATE runs
-                SET finished_at = ?, exit_code = -99, error = ?
-                WHERE id = ?
-            """, (
-                datetime.now().isoformat(timespec="seconds"),
-                "stale: process not found on dashboard restart",
-                row["id"],
-            ))
-        if rows:
-            logging.info(f"[startup] Cleaned up {len(rows)} stale run(s)")
+        stats = reap_stale_runs(db, reason_prefix="dashboard-restart")
+        if any(stats.values()):
+            logging.info(
+                f"[startup] Stale-run reap: "
+                f"killed={stats['killed']}, marked={stats['marked_finished']}, "
+                f"still alive={stats['alive_left_alone']}"
+            )
     except Exception as e:
-        logging.error(f"[startup] Stale cleanup failed: {e}")
+        logging.error(f"[startup] Stale cleanup failed: {e}", exc_info=True)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -384,6 +400,70 @@ def api_stats():
         "actions_24h":       actions_24h,
         "actions_total":     actions_all,
         "build_info":        build_info,
+    })
+
+
+# ──────────────────────────────────────────────────────────────
+# API: TRAFFIC STATS (aggregated by profile × domain × hour)
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/traffic/summary", methods=["GET"])
+def api_traffic_summary():
+    """Global traffic totals + hourly time series.
+    Query params:
+      ?hours=N         — default 24, max 2160 (90 days)
+      ?bucket=hour|day — chart granularity
+    """
+    hours  = min(int(request.args.get("hours", 24) or 24), 24 * 90)
+    bucket = request.args.get("bucket", "hour")
+    if bucket not in ("hour", "day"):
+        bucket = "hour"
+    db = get_db()
+    summary = db.traffic_summary(hours=hours)
+    summary["timeseries"] = db.traffic_timeseries(hours=hours, bucket=bucket)
+    return jsonify(summary)
+
+
+@app.route("/api/traffic/by-profile", methods=["GET"])
+def api_traffic_by_profile():
+    """Per-profile traffic totals sorted by bytes desc."""
+    hours = min(int(request.args.get("hours", 24) or 24), 24 * 90)
+    return jsonify({
+        "hours":    hours,
+        "profiles": get_db().traffic_by_profile(hours=hours),
+    })
+
+
+@app.route("/api/traffic/by-domain", methods=["GET"])
+def api_traffic_by_domain():
+    """Top domains by bytes. Optionally filter to one profile."""
+    hours        = min(int(request.args.get("hours", 24) or 24), 24 * 90)
+    limit        = min(int(request.args.get("limit", 50) or 50), 500)
+    profile_name = request.args.get("profile") or None
+    return jsonify({
+        "hours":   hours,
+        "profile": profile_name,
+        "domains": get_db().traffic_by_domain(
+            hours=hours, limit=limit, profile_name=profile_name
+        ),
+    })
+
+
+@app.route("/api/traffic/timeseries", methods=["GET"])
+def api_traffic_timeseries():
+    """Time-series data for the main traffic chart."""
+    hours  = min(int(request.args.get("hours", 24) or 24), 24 * 90)
+    bucket = request.args.get("bucket", "hour")
+    profile_name = request.args.get("profile") or None
+    if bucket not in ("hour", "day"):
+        bucket = "hour"
+    return jsonify({
+        "hours":   hours,
+        "bucket":  bucket,
+        "profile": profile_name,
+        "series":  get_db().traffic_timeseries(
+            hours=hours, bucket=bucket, profile_name=profile_name
+        ),
     })
 
 
@@ -859,6 +939,23 @@ def _spawn_run(profile_name: str) -> dict:
         )
 
     db = get_db()
+
+    # ── Cross-process guard ─────────────────────────────────────
+    # RunnerPool only knows about runs spawned by THIS dashboard
+    # instance. If dashboard was restarted while a run was alive,
+    # or if another tool started main.py directly, the pool is empty
+    # but Chrome/main.py might still be running. Check the DB (shared
+    # source of truth) and reap any stale entries automatically.
+    try:
+        from process_reaper import ensure_no_live_run_for_profile
+        err = ensure_no_live_run_for_profile(db, profile_name)
+        if err:
+            raise ValueError(err)
+    except ValueError:
+        raise
+    except Exception as e:
+        logging.warning(f"[api_run] pre-spawn guard failed (ignoring): {e}")
+
     max_parallel = int(db.config_get("runner.max_parallel", 4) or 4)
     if RUNNER_POOL.active_count() >= max_parallel:
         raise ValueError(
@@ -910,6 +1007,14 @@ def _spawn_run(profile_name: str) -> dict:
                 env=env,
             )
             slot.process = proc
+
+            # Record the PID in the DB so if this dashboard dies or
+            # restarts while the run is active, the next startup can
+            # find and kill this process tree via process_reaper.
+            try:
+                db.run_set_pid(run_id, proc.pid)
+            except Exception as e:
+                logging.warning(f"[api_run] run_set_pid failed: {e}")
 
             # Chrome-tree monitor — same logic as before, scoped to this slot.
             chrome_ever_seen = {"value": False}
@@ -1184,26 +1289,61 @@ SCHEDULER_PID_FILE = os.path.join(
 
 
 def _scheduler_pid_alive() -> int:
-    """Return PID of running scheduler, or 0."""
+    """Return PID of running scheduler, or 0.
+
+    Three-state resolution:
+      1. No PID file → scheduler never started (or was cleanly stopped).
+      2. PID file exists + PID is a live Python running scheduler.py → return PID.
+      3. PID file exists but PID is dead OR belongs to another process →
+         delete the stale file and return 0.
+
+    Previously this function accepted any live Python as the scheduler,
+    which meant a PID recycled by (say) the dashboard itself would report
+    "already running" and block manual starts. We now check cmdline.
+    """
     if not os.path.exists(SCHEDULER_PID_FILE):
         return 0
     try:
         pid = int(open(SCHEDULER_PID_FILE).read().strip())
     except Exception:
+        _clear_scheduler_pid_file("unreadable")
         return 0
     try:
         import psutil
         if psutil.pid_exists(pid):
             p = psutil.Process(pid)
-            if "python" in (p.name() or "").lower():
+            name = (p.name() or "").lower()
+            cmd  = " ".join(p.cmdline() or []).lower()
+            # Require BOTH a Python name AND scheduler.py in cmdline.
+            # This prevents a recycled PID (e.g. 12345 is now notepad.exe
+            # or a child of dashboard_server) from blocking Start.
+            if "python" in name and "scheduler.py" in cmd:
                 return pid
-    except Exception:
-        pass
+            # PID is live but NOT ours — stale file from a crashed scheduler
+            # whose PID got reused by another program.
+            _clear_scheduler_pid_file(
+                f"pid={pid} recycled to unrelated process (name={name!r})"
+            )
+            return 0
+    except Exception as e:
+        logging.debug(f"[scheduler-pid] psutil check failed: {e}")
+    _clear_scheduler_pid_file("pid not alive")
+    return 0
+
+
+def _clear_scheduler_pid_file(reason: str):
+    """Remove the stale PID file and log WHY. Makes the next Start work."""
     try:
         os.remove(SCHEDULER_PID_FILE)
+        logging.info(f"[scheduler-pid] Cleared stale PID file: {reason}")
     except OSError:
         pass
-    return 0
+    # Also clear the heartbeat config so the UI's derived-state logic
+    # (which checks heartbeat freshness) doesn't keep showing "alive".
+    try:
+        get_db().config_set("scheduler.heartbeat_at", None)
+    except Exception:
+        pass
 
 
 @app.route("/api/scheduler/start", methods=["POST"])
@@ -1251,6 +1391,38 @@ def api_scheduler_stop():
     return jsonify({"ok": True})
 
 
+@app.route("/api/admin/reap-zombies", methods=["POST"])
+def api_admin_reap_zombies():
+    """Emergency "clean up everything" button. Force-kills any run
+    with stale heartbeat, marks their DB rows as finished. Also
+    clears stale scheduler PID file.
+
+    The user might hit this from the UI when the dashboard shows
+    ghost runs / profile appears locked / "already running" errors
+    that they know aren't true. Idempotent — safe to spam."""
+    try:
+        from process_reaper import reap_stale_runs
+        db = get_db()
+        stats = reap_stale_runs(db, reason_prefix="manual-reap")
+        # Also clear scheduler PID file if the PID isn't ours
+        # (forces next Start to work even if detection is confused).
+        scheduler_before = _scheduler_pid_alive()
+        # Even the "alive" check side-effects a cleanup — call it again
+        # to persist the clean state if the result changed.
+        scheduler_after  = _scheduler_pid_alive()
+        return jsonify({
+            "ok":                True,
+            "runs_killed":       stats["killed"],
+            "runs_marked_dead":  stats["marked_finished"],
+            "runs_left_alive":   stats["alive_left_alone"],
+            "scheduler_before":  scheduler_before,
+            "scheduler_after":   scheduler_after,
+        })
+    except Exception as e:
+        logging.exception("reap-zombies failed")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/scheduler/status", methods=["GET"])
 def api_scheduler_status():
     pid = _scheduler_pid_alive()
@@ -1265,18 +1437,38 @@ def api_scheduler_status():
 
     heartbeat_at = db.config_get("scheduler.heartbeat_at")
     is_alive_heartbeat = False
+    heartbeat_age = None
     if heartbeat_at:
         try:
-            age = (datetime.now() - datetime.fromisoformat(heartbeat_at)).total_seconds()
-            is_alive_heartbeat = age < 120
+            heartbeat_age = int(
+                (datetime.now() - datetime.fromisoformat(heartbeat_at)).total_seconds()
+            )
+            is_alive_heartbeat = heartbeat_age < 120
         except Exception:
             pass
 
+    # Derive a more informative health state. The UI uses this tag to
+    # colour the Scheduler card: green=healthy, amber=stale, red=dead.
+    if pid and is_alive_heartbeat:
+        health = "ok"
+    elif pid and not is_alive_heartbeat:
+        # Process alive but no recent heartbeat — scheduler thread wedged.
+        health = "stale"
+    elif not pid and heartbeat_at and heartbeat_age is not None and heartbeat_age < 300:
+        # No PID file but recent heartbeat — scheduler died uncleanly
+        # (crashed without clearing DB state). The next status poll will
+        # show "stopped" once the 5 min window elapses.
+        health = "crashed"
+    else:
+        health = "stopped"
+
     return jsonify({
         "is_running":         bool(pid) and is_alive_heartbeat,
+        "health":             health,
         "pid":                pid,
         "started_at":         db.config_get("scheduler.started_at"),
         "heartbeat_at":       heartbeat_at,
+        "heartbeat_age":      heartbeat_age,
         "next_run_at":        db.config_get("scheduler.next_run_at"),
         "last_run_profile":   db.config_get("scheduler.last_run_profile"),
         "runs_today":         runs_today,
@@ -2425,6 +2617,20 @@ if __name__ == "__main__":
     cleanup_stale_runs()
     # One-shot fix for broken v1 import/export (see function docstring)
     cleanup_orphan_config_keys()
+    # Traffic-stats retention cleanup — deletes rows older than
+    # traffic.retention_days (default 90). Runs once at startup; the
+    # background traffic collectors don't need a periodic task beyond
+    # this because writes are bounded (~50 rows/hour per profile).
+    try:
+        db = get_db()
+        retention = int(db.config_get("traffic.retention_days") or 90)
+        if retention > 0:
+            deleted = db.traffic_cleanup(retention_days=retention)
+            if deleted > 0:
+                print(f"[startup] Cleaned up {deleted} traffic rows older than "
+                      f"{retention} days")
+    except Exception as e:
+        print(f"[startup] traffic cleanup skipped: {e}")
 
     port = int(os.environ.get("PORT", 5000))
     url  = f"http://127.0.0.1:{port}"

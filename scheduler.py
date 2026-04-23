@@ -368,21 +368,45 @@ def run_one_iteration(profile_name: str) -> tuple:
         "[scheduler] Dashboard unreachable — falling back to direct "
         "subprocess. Run will NOT appear in dashboard UI."
     )
+
+    # Pre-spawn guard — without the dashboard as gatekeeper, WE have to
+    # check for live runs and reap stale ones. Otherwise we'd happily
+    # spawn a second main.py for a profile whose previous iteration
+    # wedged.
+    try:
+        from process_reaper import ensure_no_live_run_for_profile
+        err = ensure_no_live_run_for_profile(get_db(), profile_name)
+        if err:
+            logging.error(f"[scheduler] Refusing to spawn: {err}")
+            return -2, time.time() - started
+    except Exception as e:
+        logging.debug(f"[scheduler] pre-spawn guard skipped: {e}")
+
     env = os.environ.copy()
     env["GHOST_SHELL_PROFILE_NAME"] = profile_name
     env["GHOST_SHELL_PROFILE"]      = profile_name   # legacy alias
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-u", "main.py"],
             cwd=os.path.dirname(os.path.abspath(__file__)),
             env=env,
-            timeout=30 * 60,
         )
-        return result.returncode, time.time() - started
-    except subprocess.TimeoutExpired:
-        logging.error(f"Run for {profile_name} timed out after 30 min")
-        return -1, time.time() - started
+        # main.py will call db.run_set_pid() itself once it inits —
+        # but there's a race window where this scheduler sees "no pid"
+        # while main.py is still booting. That's fine: reap will just
+        # skip it until heartbeat appears.
+        try:
+            proc.wait(timeout=30 * 60)
+            return proc.returncode, time.time() - started
+        except subprocess.TimeoutExpired:
+            logging.error(f"Run for {profile_name} timed out after 30 min — killing tree")
+            try:
+                from process_reaper import kill_process_tree
+                kill_process_tree(proc.pid, reason="scheduler 30-min timeout")
+            except Exception as e:
+                logging.warning(f"[scheduler] kill_process_tree failed: {e}")
+            return -1, time.time() - started
     except Exception as e:
         logging.error(f"subprocess failed: {e}")
         return -1, time.time() - started
@@ -394,8 +418,13 @@ def run_one_iteration(profile_name: str) -> tuple:
 
 def main():
     db = get_db()
-    db.config_set("scheduler.started_at",
-                  datetime.now().isoformat(timespec="seconds"))
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    db.config_set("scheduler.started_at", now_iso)
+    # Also record OUR PID in config. The dashboard's .scheduler.pid file
+    # is the primary source of truth — but in case it gets deleted, the
+    # UI can still detect a running scheduler through config + heartbeat
+    # freshness.
+    db.config_set("scheduler.pid", os.getpid())
     heartbeat()
 
     cfg = load_cfg()

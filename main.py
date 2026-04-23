@@ -29,6 +29,8 @@ import time
 import random
 import logging
 import json
+import atexit
+import threading
 import requests
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, unquote, quote
@@ -218,6 +220,52 @@ RUN_ID = int(os.environ.get("GHOST_SHELL_RUN_ID", "0")) or None
 if RUN_ID is None:
     RUN_ID = DB.run_start(PROFILE_NAME, proxy_url=PROXY)
     logging.info(f"[main] Created standalone run #{RUN_ID}")
+
+# Also record our PID in the runs table. The dashboard does this too
+# when it spawns us, but standalone runs (python main.py directly) skip
+# that code path — and we still want reap_stale_runs to find us after
+# a crash. Safe to set twice.
+try:
+    DB.run_set_pid(RUN_ID, os.getpid())
+except Exception as e:
+    logging.debug(f"[main] run_set_pid skipped: {e}")
+
+
+# ──────────────────────────────────────────────────────────────
+# Heartbeat — lets process_reaper distinguish "alive but slow"
+# from "genuinely wedged" runs. We ping every HEARTBEAT_INTERVAL
+# seconds; if the main thread is fully stuck (e.g. driver hang),
+# this background thread keeps pinging, which means the hang
+# detection has to rely on the BROWSER watchdog instead (see
+# ghost_shell_browser.py). Conversely, if main dies uncleanly
+# (kill -9, OOM), the daemon thread dies with it and heartbeats
+# stop — reap_stale_runs will correctly clean up.
+# ──────────────────────────────────────────────────────────────
+
+HEARTBEAT_INTERVAL = 15  # seconds
+
+def _heartbeat_loop():
+    import threading as _t
+    while not getattr(_heartbeat_loop, "_stop", False):
+        try:
+            DB.run_heartbeat(RUN_ID)
+        except Exception as e:
+            logging.debug(f"[main] heartbeat failed: {e}")
+        # Sleep in small slices so shutdown is responsive
+        for _ in range(HEARTBEAT_INTERVAL):
+            if getattr(_heartbeat_loop, "_stop", False):
+                return
+            time.sleep(1)
+
+_heartbeat_thread = threading.Thread(
+    target=_heartbeat_loop, daemon=True, name="main-heartbeat"
+)
+_heartbeat_thread.start()
+
+def _stop_heartbeat():
+    _heartbeat_loop._stop = True
+
+atexit.register(_stop_heartbeat)
 
 # Dup file for manual inspection
 COMPETITOR_URLS_FILE = "competitor_urls.txt"

@@ -140,6 +140,10 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "intel",
             "webgpu_arch":   "xe",
+            # tier → codec matrix lookup. Values: "integrated_old",
+            # "integrated_modern", "discrete_mid", "discrete_high".
+            # Drives WebGPU adapterInfo + AV1 hardware decode reporting.
+            "tier":          "integrated_modern",
         },
         "screen":  {"width": 1920, "height": 1080, "taskbar": 48, "dpr": 1.0},
         "battery": None,
@@ -153,6 +157,7 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "intel",
             "webgpu_arch":   "xe",
+            "tier":          "integrated_modern",
         },
         "screen":  {"width": 1920, "height": 1080, "taskbar": 48, "dpr": 1.0},
         "battery": {"charging": True, "level": None},
@@ -166,6 +171,7 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "nvidia",
             "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_mid",
         },
         "screen":  {"width": 1920, "height": 1080, "taskbar": 48, "dpr": 1.0},
         "battery": None,
@@ -179,6 +185,7 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "nvidia",
             "webgpu_arch":   "ada-lovelace",
+            "tier":          "discrete_high",
         },
         "screen":  {"width": 2560, "height": 1440, "taskbar": 48, "dpr": 1.0},
         "battery": None,
@@ -192,6 +199,7 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (AMD, AMD Radeon RX 6600 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "amd",
             "webgpu_arch":   "rdna-2",
+            "tier":          "discrete_mid",
         },
         "screen":  {"width": 1920, "height": 1080, "taskbar": 48, "dpr": 1.0},
         "battery": None,
@@ -205,12 +213,65 @@ DEVICE_TEMPLATES = [
             "gl_renderer":   "ANGLE (Intel, Intel(R) UHD Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
             "webgpu_vendor": "intel",
             "webgpu_arch":   "gen11",
+            "tier":          "integrated_old",
         },
         "screen":  {"width": 1366, "height": 768, "taskbar": 40, "dpr": 1.0},
         "battery": {"charging": False, "level": None},
         "weight":  3,
     },
 ]
+
+# ──────────────────────────────────────────────────────────────
+# CODEC SUPPORT MATRIX — per GPU tier
+#
+# navigator.mediaCapabilities.decodingInfo() returns a triple
+# {supported, smooth, powerEfficient} for each queried codec. Real
+# hardware varies meaningfully here:
+#
+#   - Integrated GPUs from ~2018 (UHD Graphics) have no AV1 hwaccel —
+#     they decode AV1 in software, so powerEfficient=false even though
+#     supported=true.
+#   - Modern Intel Arc / Iris Xe added AV1 HW decode (Gen12+).
+#   - NVIDIA RTX 30/40 series have full HW decode for AV1/VP9/H264/H265.
+#   - Budget GPUs of UHD Graphics era don't hwaccel VP9 Profile 2 (HDR).
+#
+# Detectors (creepjs, iphey) fingerprint the EXACT combination of these
+# flags. All Ghost Shell profiles reporting the same matrix is a tell.
+# Keying by GPU tier makes a profile's media-capabilities consistent
+# with its WebGL renderer string.
+# ──────────────────────────────────────────────────────────────
+CODEC_MATRIX_BY_TIER: Dict[str, Dict[str, Dict[str, bool]]] = {
+    # Old integrated (UHD Graphics 620/630 class) — no AV1 HW, VP9 soft
+    "integrated_old": {
+        "av1":  {"supported": True,  "smooth": False, "power_efficient": False},
+        "vp9":  {"supported": True,  "smooth": True,  "power_efficient": False},
+        "h264": {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h265": {"supported": False, "smooth": False, "power_efficient": False},
+    },
+    # Modern integrated (Iris Xe / UHD 770 / Arc A-series) — AV1 HW,
+    # H265 partial support
+    "integrated_modern": {
+        "av1":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "vp9":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h264": {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h265": {"supported": True,  "smooth": True,  "power_efficient": False},
+    },
+    # Discrete mid-range (RTX 30/40 60-class, RX 6600) — full HW, partial
+    # power-efficiency advantages on lower codecs
+    "discrete_mid": {
+        "av1":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "vp9":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h264": {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h265": {"supported": True,  "smooth": True,  "power_efficient": True},
+    },
+    # Discrete high (RTX 70/80/90-class) — everything full HW
+    "discrete_high": {
+        "av1":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "vp9":  {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h264": {"supported": True,  "smooth": True,  "power_efficient": True},
+        "h265": {"supported": True,  "smooth": True,  "power_efficient": True},
+    },
+}
 
 # Windows 10/11 шрифты — CORE is allгyes
 WINDOWS_FONTS_CORE = [
@@ -295,7 +356,10 @@ def _weighted_choice(rnd: random.Random, items: list) -> dict:
 # =============================================================================
 
 class DeviceTemplateBuilder:
-    VERSION = "3.0.0"
+    # 3.0.0 — original fingerprint schema
+    # 3.1.0 — Feature #5/#8: extended noise (canvas/webgl/audio), per-tier
+    #         codec matrix, unified GPU field (WebGL + WebGPU consistency)
+    VERSION = "3.1.0"
 
     def __init__(self, profile_name: str, preferred_language: str = None,
                  force_template: str = None):
@@ -431,6 +495,44 @@ class DeviceTemplateBuilder:
             ],
         }
 
+    def _build_gpu(self) -> Dict[str, Any]:
+        """
+        Top-level 'gpu' dict consumed by the C++ patches for:
+          - gl.getParameter(UNMASKED_VENDOR_WEBGL / UNMASKED_RENDERER_WEBGL)
+          - navigator.gpu.requestAdapter().requestAdapterInfo() — the new
+            WebGPU fingerprint vector added in Chrome 113
+
+        IMPORTANT: the strings here MUST match what _build_graphics writes
+        to gl_vendor/gl_renderer. Real hardware is identical across WebGL
+        and WebGPU queries; any mismatch is an instant detector signal.
+        We derive both from the same template data to guarantee coherence.
+        """
+        return {
+            "unmasked_vendor":   self.template["gpu"]["gl_vendor"],
+            "unmasked_renderer": self.template["gpu"]["gl_renderer"],
+            # Ghost Shell tier tag, not surfaced to JS but useful in logs
+            # and for the codec matrix lookup below.
+            "tier":              self.template["gpu"].get("tier", "integrated_modern"),
+        }
+
+    def _build_codecs(self) -> Dict[str, Any]:
+        """
+        Per-codec capability matrix for navigator.mediaCapabilities.
+        Keyed by GPU tier so the reported hardware decoding matches the
+        reported GPU. A profile claiming an "integrated_old" UHD Graphics
+        shouldn't also claim smooth+powerEfficient AV1 decode — that
+        combination doesn't exist in real hardware.
+        """
+        tier = self.template["gpu"].get("tier", "integrated_modern")
+        # Defensive fallback — if someone adds a tier to the template list
+        # but forgets to extend CODEC_MATRIX_BY_TIER, we serve the safest
+        # answer (modern integrated) rather than crashing.
+        matrix = CODEC_MATRIX_BY_TIER.get(
+            tier, CODEC_MATRIX_BY_TIER["integrated_modern"]
+        )
+        # Copy so caller can't mutate our module-level constant
+        return {k: dict(v) for k, v in matrix.items()}
+
     def _build_audio(self) -> Dict[str, Any]:
         return {
             "sample_rate":       self.rnd.choice([44100, 48000]),
@@ -508,12 +610,52 @@ class DeviceTemplateBuilder:
         }
 
     def _build_noise(self) -> Dict[str, Any]:
+        """
+        Per-profile noise seeds — fed into the C++ patches to jitter
+        fingerprint outputs in ways that mimic real-hardware variability.
+        Each value stays *stable* for a given profile (so creep.js
+        stability score still passes), but DIFFERS between profiles
+        (so a pool of 50 profiles doesn't collide on one identical
+        hash). The ranges below are tuned against Creep.js, f.vision.
+
+        canvas_shift   int 1-7     pixel-level shift in Canvas 2D output
+        canvas_noise   0..0.003    per-pixel RGB jitter in readback
+        webgl_noise    0..0.002    float noise on WebGL precision probes
+        webgl_params_mask  int bits  which WebGL params to jitter
+        audio_offset   0..3e-4     floating-point offset in Audio samples
+        audio_rate_jitter  0 or ±1  sampleRate drift ±1 Hz from 48000
+        rect_offset    0.001..0.02 getBoundingClientRect noise
+        font_width_off ±0.5..1.5   offsetWidth/Height for text metrics
+        screen_avail_jitter int 0-12  availWidth/Height taskbar-sized variance
+        timezone_offset_jitter 0 or ±1  minute drift in Date().getTimezoneOffset()
+        """
         return {
-            "seed":              self.rnd.randint(1_000_000, 9_999_999),
-            "canvas_shift":      self.rnd.randint(1, 7),
-            "audio_offset":      round(self.rnd.uniform(0.00001, 0.00009), 7),
-            "rect_offset":       round(self.rnd.uniform(0.001, 0.009), 4),
-            "font_width_offset": round(self.rnd.uniform(-0.5, 0.5), 3),
+            "seed":                    self.rnd.randint(1_000_000, 9_999_999),
+            # Canvas — bumped range so jitter is *detectable* as variance,
+            # but still well below the fingerprint-changing threshold
+            # (a real GPU in a PC over an hour varies similarly).
+            "canvas_shift":            self.rnd.randint(1, 7),
+            "canvas_noise":            round(self.rnd.uniform(0.0005, 0.003), 5),
+            # WebGL — new. Precision probes (RangeMin/Max/Precision) are
+            # our top tell — closes that detector. Mask picks WHICH
+            # params get jittered so not every profile jitters the same set.
+            "webgl_noise":             round(self.rnd.uniform(0.0004, 0.002), 5),
+            "webgl_params_mask":       self.rnd.randint(0x3, 0x3F),  # 6-bit
+            # Audio — the original 0.00001-9 range was below detector
+            # sensitivity. 3e-5..3e-4 sits in the zone real DAC jitter lives.
+            "audio_offset":            round(self.rnd.uniform(0.00003, 0.00030), 6),
+            "audio_rate_jitter":       self.rnd.choice([-1, 0, 0, 0, 1]),  # biased toward 0
+            # Rects — bumped 10× so getBoundingClientRect fingerprinters
+            # actually see a profile-specific offset.
+            "rect_offset":             round(self.rnd.uniform(0.001, 0.020), 4),
+            "font_width_offset":       round(self.rnd.uniform(-1.5, 1.5), 3),
+            # Screen — simulates different taskbar/dock heights 0-12 px.
+            # Handled in GetAvail*() getters; screen_*_ already set.
+            "screen_avail_jitter":     self.rnd.randint(0, 12),
+            # Timezone — extremely rare in practice (some users on custom
+            # tz db builds), but enough variance that two profiles in the
+            # same city don't have pixel-identical tz offsets.
+            "timezone_offset_jitter":  self.rnd.choice([-1, 0, 0, 0, 0, 1]),
         }
 
     def _build_fonts(self) -> List[str]:
@@ -612,6 +754,13 @@ class DeviceTemplateBuilder:
             "ua_metadata":   self._build_ua_metadata(),
             "plugins":       STANDARD_CHROME_PLUGINS,
             "permissions":   self._build_permissions(),
+            # New for Feature #8 — WebGL/WebGPU consistency + per-tier
+            # codec matrix. Consumed by:
+            #   - ghost_shell_config.cc GPU parser (unmasked_vendor/renderer)
+            #   - ghost_shell_config.cc codecs parser (codec map)
+            #   - patches 6 + 7 in CHROMIUM_PATCHES_4.md
+            "gpu":           self._build_gpu(),
+            "codecs":        self._build_codecs(),
         }
 
     def get_cli_flag(self) -> str:

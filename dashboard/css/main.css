@@ -2555,6 +2555,62 @@ a:hover { text-decoration: underline; }
   border-color: rgba(239, 68, 68, 0.5);
 }
 
+/* ── Heartbeat health indicators ─────────────────────────────
+   Used on the active-runs-panel (per-run badge) and on the
+   Scheduler status card (overall scheduler health). Both share
+   the same 3-state palette — ok never shows a badge (clean UI),
+   amber = something's slow but not dead, red = intervention needed. */
+.active-run-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  font-family: var(--font-mono, monospace);
+}
+.active-run-badge.slow {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+.active-run-badge.wedged {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+  /* Subtle pulse so a wedged run catches the eye without strobing. */
+  animation: pulse-wedged 2.2s ease-in-out infinite;
+}
+@keyframes pulse-wedged {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
+.health-pill {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: 10px;
+  font-family: var(--font-mono, monospace);
+  vertical-align: middle;
+}
+.health-pill-stale {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+}
+.health-pill-crashed {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+}
+
 /* ── Profile tag chips ──────────────────────────────────────── */
 .profile-tags {
   display: inline-flex;
@@ -2935,4 +2991,110 @@ a:hover { text-decoration: underline; }
 .param-input.param-json-err:focus {
   border-color: var(--critical);
   box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.25);
+}
+
+/* ═══ Traffic page ════════════════════════════════════════════ */
+.traffic-table-wrap {
+  max-height: 500px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.traffic-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.traffic-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--card-alt, #111827);
+  text-align: left;
+  padding: 10px 12px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  z-index: 1;
+}
+.traffic-table tbody tr {
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+.traffic-table tbody tr:hover { background: rgba(99, 102, 241, 0.04); }
+.traffic-table tbody td {
+  padding: 8px 12px;
+  vertical-align: middle;
+}
+
+/* Horizontal bar + numeric overlay used in both Profile/Domain tables.
+   The bar shows relative magnitude at a glance — the biggest row is
+   100% width, all others scale down proportionally. */
+.tr-bar-wrap {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  background: rgba(148, 163, 184, 0.06);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.tr-bar {
+  height: 100%;
+  background: linear-gradient(90deg,
+    rgba(96, 165, 250, 0.35),
+    rgba(96, 165, 250, 0.20));
+  border-right: 1px solid rgba(96, 165, 250, 0.45);
+  transition: width 0.25s ease-out;
+}
+.tr-bar-label {
+  position: absolute;
+  top: 50%;
+  left: 8px;
+  transform: translateY(-50%);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: #e2e8f0;
+  white-space: nowrap;
+  text-shadow: 0 0 3px rgba(15, 20, 25, 0.9);
+}
+
+.tr-profile-link {
+  color: #c7d2fe;
+  text-decoration: none;
+  font-weight: 600;
+}
+.tr-profile-link:hover { color: #fff; text-decoration: underline; }
+
+.tr-domain {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: #cbd5e1;
+  background: rgba(148, 163, 184, 0.06);
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+/* ═══ Overview Traffic card ═══════════════════════════════════ */
+.ov-traffic-card {
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.15s;
+}
+.ov-traffic-card:hover {
+  background: rgba(99, 102, 241, 0.06);
+  border-color: rgba(99, 102, 241, 0.3);
+  transform: translateY(-1px);
+}
+.stat-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: rgba(245, 158, 11, 0.15);
+  color: #fcd34d;
+  border: 1px solid rgba(245, 158, 11, 0.4);
 }

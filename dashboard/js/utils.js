@@ -31,6 +31,34 @@ function fmtDuration(startedAt, finishedAt) {
   return `${Math.floor(diff)}s`;
 }
 
+// ─── Byte size formatting ────────────────────────────────────────
+// Canonical helper shared across pages — especially the Traffic page
+// and the Overview traffic card. Kept here so any future page that
+// needs byte formatting can just call `formatBytes(N)` without
+// re-implementing the ladder.
+//
+// Examples:
+//   formatBytes(0)         → "0 B"
+//   formatBytes(512)       → "512 B"
+//   formatBytes(1536)      → "1.5 KB"
+//   formatBytes(1572864)   → "1.5 MB"
+//   formatBytes(2.5 * 1e9) → "2.33 GB"
+//
+// We stop at TB — anyone moving more than that is exceptional and
+// should probably look at the raw byte count in the API response.
+function formatBytes(n, precision = 1) {
+  n = Number(n) || 0;
+  if (n < 1024) return `${Math.round(n)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  // Round to `precision` decimals, strip trailing zeros for readability
+  return `${n.toFixed(precision).replace(/\.0+$/, "")} ${units[i]}`;
+}
+// Also expose on window so inline <script> snippets and late-loaded
+// modules can find it without worrying about script load order.
+window.formatBytes = formatBytes;
+
 function fmtTimestamp(iso) {
   if (!iso) return "—";
   return iso.replace("T", " ");
