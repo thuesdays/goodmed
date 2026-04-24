@@ -488,27 +488,50 @@ class ProfileEnricher:
     # ОБЩАЯ ФУНКЦИЯ
     # ──────────────────────────────────────────────────────────
 
-    def enrich_all(self, history_days: int = 30):
-        """Обогащает everything that can. Вызывать before первым запуском browserа."""
+    def enrich_all(self, history_days: int = 30, seed_history_enabled: bool = False):
+        """Enrich a freshly-created profile so it doesn't look synthetic.
+
+        seed_history_enabled=False by default since Chrome 149's History
+        schema evolves frequently and a mismatched INSERT triggers
+        FATAL: Cannot call mutating statements on an invalid statement
+        the moment Chrome opens the DB. User-reported crashes traced to
+        this: seed_history wrote `urls`/`visits` with our best-guess
+        schema, Chrome validated on open, found columns missing or
+        extra, and hard-exited.
+
+        Bookmarks and Top Sites are JSON files (Bookmarks) or small
+        fixed-schema SQLite DBs (Top Sites) that Chrome tolerates
+        wider version drift on — those stay enabled.
+
+        For realistic History, users should run the Chrome History
+        Import feature (dashboard → Edit Profile → "Warm up from real
+        Chrome") which COPIES the host Chrome's actual History DB with
+        exactly matching schema, guaranteed compatible."""
         logging.info(f"[ProfileEnricher] 🌱 Обогащаем профиль: {self.profile_path}")
 
-        try:
-            self.seed_history(days_back=history_days)
-        except Exception as e:
-            logging.warning(f"[ProfileEnricher] history: {e}")
+        if seed_history_enabled:
+            try:
+                self.seed_history(days_back=history_days)
+            except Exception as e:
+                logging.warning(f"[ProfileEnricher] history: {e}")
+        else:
+            logging.info(
+                "[ProfileEnricher] skipping synthetic history seed "
+                "(use Dashboard → Edit Profile → Warm up from real Chrome "
+                "for real history with guaranteed-compatible schema)"
+            )
 
         try:
             self.seed_bookmarks()
         except Exception as e:
             logging.warning(f"[ProfileEnricher] bookmarks: {e}")
 
+        # Top Sites and Last Session are also SQLite/binary files
+        # Chrome hard-validates on open. Same FATAL risk as History.
+        # Skipped by default. Real Top Sites arrive through
+        # chrome_importer's WAL-safe copy when users opt in.
         try:
-            self.seed_top_sites()
-        except Exception as e:
-            logging.warning(f"[ProfileEnricher] top_sites: {e}")
-
-        try:
-            self.seed_last_session()
+            self.seed_last_session()   # writes only "SNSS" magic — safe
         except Exception as e:
             logging.warning(f"[ProfileEnricher] last_session: {e}")
 

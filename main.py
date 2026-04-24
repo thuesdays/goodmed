@@ -395,6 +395,88 @@ def build_search_url(query: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# MID-RUN CRASH RECOVERY
+# ──────────────────────────────────────────────────────────────
+
+# Module-level counter so we don't restart endlessly. Chrome on
+# Windows very occasionally dies mid-run (InvalidSessionId while
+# clicking a heavy ad landing page; GPU process crash on video
+# ads; memory pressure from heavy SPA targets). Recovering once
+# or twice per run is sensible — beyond that, something's wrong
+# with the profile or the IP and restarting won't help.
+_RECOVERY_ATTEMPTS = {
+    "count":    0,
+    "max":      2,         # two restarts per run, then we bail
+}
+
+
+def _browser_dead(exc: Exception = None) -> bool:
+    """Check if an exception indicates the driver is actually dead vs
+    just a transient error. Used to decide whether to attempt recovery
+    or just retry the current operation."""
+    if exc is None:
+        return False
+    name = type(exc).__name__
+    msg  = str(exc).lower()
+    if name in (
+        "InvalidSessionIdException",
+        "NoSuchWindowException",
+        "WebDriverException",
+    ):
+        # WebDriverException is broad — it also fires on network blips.
+        # Only treat as dead if the message suggests permanent failure.
+        if name == "WebDriverException":
+            return any(k in msg for k in (
+                "chrome not reachable",
+                "disconnected",
+                "target window already closed",
+                "no such session",
+                "session not created",
+                "unable to receive message",
+            ))
+        return True
+    return False
+
+
+def _try_recover_browser(browser, reason: str = "") -> bool:
+    """Attempt one mid-run browser restart. Returns True if the driver
+    came back alive, False otherwise.
+
+    Preserves session state: Chrome's on-disk profile (cookies, history,
+    localStorage) lives in user-data-dir and is untouched by restart.
+    The in-memory selenium driver is what gets rebuilt. Cookies are
+    re-imported via _auto_save_session() → session_manager.import_cookies
+    on the fresh Chrome, so the "already warmed up" state survives.
+
+    Budget: 2 restarts per run, enforced by _RECOVERY_ATTEMPTS. Past
+    that, the run is probably doomed (profile corrupted / IP burned /
+    memory exhausted) and more restarts just waste time.
+    """
+    if _RECOVERY_ATTEMPTS["count"] >= _RECOVERY_ATTEMPTS["max"]:
+        logging.error(
+            f"  ✗ browser recovery budget exhausted "
+            f"({_RECOVERY_ATTEMPTS['count']}/{_RECOVERY_ATTEMPTS['max']}) — "
+            f"giving up on this run"
+        )
+        return False
+
+    _RECOVERY_ATTEMPTS["count"] += 1
+    logging.warning(
+        f"  ⚠ browser died mid-run ({reason or 'unknown'}), "
+        f"attempting recovery "
+        f"[{_RECOVERY_ATTEMPTS['count']}/{_RECOVERY_ATTEMPTS['max']}]..."
+    )
+    try:
+        browser.restart()
+        if browser.is_alive():
+            logging.info("  ✓ browser recovered, continuing run")
+            return True
+    except Exception as e:
+        logging.error(f"  ✗ browser recovery failed: {type(e).__name__}: {e}")
+    return False
+
+
+# ──────────────────────────────────────────────────────────────
 # AD PARSER
 # ──────────────────────────────────────────────────────────────
 
@@ -428,9 +510,25 @@ def extract_domain(url: str) -> str:
 
 
 def parse_ads(driver, query: str) -> list[dict]:
-    """
-    Extract ad blocks from SERP using TreeWalker + data-text-ad fallback.
-    Returns list of {query, title, display_url, clean_url, google_click_url, domain, found_at}.
+    """Extract ad blocks from SERP — all formats.
+
+    Covers: classic text ads (Sponsored label + heading + destination link),
+    the shopping "Рекламируемые товары / Sponsored products" carousel, and
+    the PLA (Product Listing Ad) grid below-fold. These three use
+    different DOM shapes and we historically only handled the first.
+
+    Return value: list of dicts with an `anchor_id` the DOM now carries
+    on the exact <a> element the click should target. click_ad can then
+    drill down by ID without re-guessing selectors and accidentally
+    picking a sibling card (that was the "clicked our own goodmedika
+    instead of the competitor" symptom — the carousel's first item was
+    own domain, and the old click_ad just grabbed the first DOM ad link).
+
+    Own-domain filtering happens in Python (below) using MY_DOMAINS
+    — we do NOT rely on CSS class names Google could change without
+    notice. We ALSO stamp each ad card with `data-gs-ad-id` attribute
+    in the DOM itself so we can refer to the same element later by
+    querySelector(`[data-gs-ad-id="..."]`).
     """
     js_script = r"""
     const SPONSORED_MARKERS = [
@@ -438,9 +536,89 @@ def parse_ads(driver, query: str) -> list[dict]:
         'Anuncio', 'Annonce', 'Werbung', 'Annuncio'
     ];
 
-    const adBlocks = new Set();
+    // Random ID per scan — so re-parsing the same page doesn't
+    // accidentally pick up anchors stamped during a previous query
+    // on the same tab (Google sometimes keeps SERP markup live when
+    // you nav back via history).
+    const scanId = Math.random().toString(36).slice(2, 10);
 
-    // Method 1: find "Sponsored" / "Реклама" label via TreeWalker
+    // Map of anchor_id -> {title, displayUrl, googleClickUrl, cleanFromDataRw, format}
+    const byAnchorId = {};
+    let anchorCounter = 0;
+
+    /** Stamp an element with a unique id and return that id. */
+    function stampAnchor(el) {
+        const id = `gs-${scanId}-${anchorCounter++}`;
+        el.setAttribute('data-gs-ad-id', id);
+        return id;
+    }
+
+    /** Pull title / displayUrl / hrefs from a block + its best anchor. */
+    function extractFromBlock(block, format) {
+        let title = '';
+        const heading = block.querySelector('[role="heading"], h3, h4, .LC20lb');
+        if (heading) title = heading.textContent.trim();
+
+        let displayUrl = '';
+        const cite = block.querySelector(
+            'cite, span.VuuXrf, span.x2VHCd, span[role="text"], .x3G5ab'
+        );
+        if (cite) displayUrl = cite.textContent.trim();
+
+        let googleClickUrl = '';
+        let cleanUrl       = '';
+        let primaryAnchor  = null;
+
+        const allLinks = block.querySelectorAll('a[href]');
+        for (const link of allLinks) {
+            const href = link.href || '';
+            if (!href.startsWith('http')) continue;
+            if (href.includes('/aclk?') ||
+                href.includes('googleadservices.com') ||
+                href.includes('googlesyndication.com')) {
+                if (!googleClickUrl) {
+                    googleClickUrl = href;
+                    primaryAnchor = link;
+                }
+                for (const attr of ['data-rw', 'data-pcu', 'data-rh', 'data-agdh']) {
+                    const val = link.getAttribute(attr);
+                    if (val && val.startsWith('http') && !cleanUrl) {
+                        cleanUrl = val;
+                    }
+                }
+            }
+        }
+        // Fallback: first http link in block
+        if (!primaryAnchor) {
+            for (const link of allLinks) {
+                const href = link.href || '';
+                if (href.startsWith('http') && !href.includes('google.com/search')) {
+                    primaryAnchor = link;
+                    if (!googleClickUrl) googleClickUrl = href;
+                    break;
+                }
+            }
+        }
+
+        if (!primaryAnchor) return null;
+        const anchorId = stampAnchor(primaryAnchor);
+
+        return {
+            anchorId:         anchorId,
+            title:            title,
+            displayUrl:       displayUrl,
+            googleClickUrl:   googleClickUrl,
+            cleanFromDataRw:  cleanUrl,
+            format:           format,   // 'text' | 'shopping_carousel' | 'pla_grid' | 'other'
+            anchorHref:       primaryAnchor.href || '',
+        };
+    }
+
+    // ── Method 1: Classic text ads via "Sponsored" / "Реклама" label
+    // Walk up from the label text to the enclosing ad card. 8 levels of
+    // parent because Google nests these deeply and the exact depth
+    // varies by layout A/B.
+    const textAdBlocks = new Set();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
     let node;
     while (node = walker.nextNode()) {
@@ -452,63 +630,74 @@ def parse_ads(driver, query: str) -> list[dict]:
                 if (!parent) break;
                 const link = parent.querySelector('a[href]');
                 if (link && link.href && link.href.startsWith('http')) {
-                    adBlocks.add(parent);
+                    textAdBlocks.add(parent);
                     break;
                 }
             }
         }
     }
+    // Also data-text-ad attribute (explicit marker)
+    document.querySelectorAll('div[data-text-ad]').forEach(el => textAdBlocks.add(el));
 
-    // Method 2: data-text-ad attribute
-    document.querySelectorAll('div[data-text-ad]').forEach(el => adBlocks.add(el));
-
-    const results = [];
-    adBlocks.forEach(block => {
-        let title = '';
-        const heading = block.querySelector('[role="heading"], h3');
-        if (heading) title = heading.textContent.trim();
-
-        let displayUrl = '';
-        const cite = block.querySelector('cite, span.VuuXrf, span.x2VHCd, span[role="text"]');
-        if (cite) displayUrl = cite.textContent.trim();
-
-        let googleClickUrl = '';
-        let cleanUrl       = '';
-
-        const allLinks = block.querySelectorAll('a[href]');
-        for (const link of allLinks) {
-            const href = link.href || '';
-            if (href.includes('/aclk?') || href.includes('googleadservices.com')) {
-                if (!googleClickUrl) googleClickUrl = href;
-                for (const attr of ['data-rw', 'data-pcu', 'data-rh', 'data-agdh']) {
-                    const val = link.getAttribute(attr);
-                    if (val && val.startsWith('http') && !cleanUrl) {
-                        cleanUrl = val;
-                    }
-                }
-            }
-        }
-        if (!googleClickUrl) {
-            for (const link of allLinks) {
-                const href = link.href || '';
-                if (href && href.startsWith('http')) {
-                    googleClickUrl = href;
-                    break;
-                }
-            }
-        }
-
-        if (googleClickUrl || displayUrl) {
-            results.push({
-                title: title,
-                displayUrl: displayUrl,
-                googleClickUrl: googleClickUrl,
-                cleanFromDataRw: cleanUrl,
-            });
-        }
+    textAdBlocks.forEach(block => {
+        const extracted = extractFromBlock(block, 'text');
+        if (extracted) byAnchorId[extracted.anchorId] = extracted;
     });
 
-    return results;
+    // ── Method 2: Shopping carousel ("Рекламируемые товары" row)
+    // This is the critical format we were missing. Each card is its own
+    // ad with its own pricing and clickable anchor. When Google surfaces
+    // the user's OWN domain as the #1 shopping item (common for brand
+    // queries), click_ad would blindly grab the first anchor it found
+    // and click onto our own site. Now we parse each carousel card
+    // separately, mark each with an anchor_id, and per-card own-domain
+    // filtering happens in Python.
+    const shoppingCards = new Set();
+    // Multiple selectors — Google A/Bs these layouts constantly. Any
+    // element with these data-docid / class combos that sits under a
+    // "Sponsored" / "Реклама" container counts as a shopping ad card.
+    document.querySelectorAll(
+        '.pla-unit, .pla-unit-container .pla-unit, ' +
+        '.mnr-c.pla-unit, g-inner-card.mnr-c, ' +
+        'div[data-docid][data-pla], [data-hveid][data-docid] a[href*="aclk"], ' +
+        'div.KZmu8e, div.cu-container div[data-docid]'
+    ).forEach(el => {
+        // Walk up to the card container (element that contains a
+        // heading + price + link). Cap at 5 levels.
+        let p = el;
+        for (let i = 0; i < 5 && p; i++) {
+            if (p.querySelector('a[href*="aclk"]')) {
+                shoppingCards.add(p);
+                break;
+            }
+            p = p.parentElement;
+        }
+    });
+    shoppingCards.forEach(card => {
+        const extracted = extractFromBlock(card, 'shopping_carousel');
+        if (extracted) byAnchorId[extracted.anchorId] = extracted;
+    });
+
+    // ── Method 3: PLA (Product Listing Ad) grids below-fold
+    // Separate from the carousel — this is a full grid that sometimes
+    // appears on commercial queries. Same per-card approach.
+    document.querySelectorAll(
+        'div.commercial-unit-desktop-top, ' +
+        'div.commercial-unit-desktop-rhs, ' +
+        '.cu-container.cu-container-unit'
+    ).forEach(container => {
+        container.querySelectorAll('div[data-docid], .pla-unit').forEach(card => {
+            if (card.querySelector('a[href*="aclk"]')) {
+                const extracted = extractFromBlock(card, 'pla_grid');
+                if (extracted && !byAnchorId[extracted.anchorId]) {
+                    byAnchorId[extracted.anchorId] = extracted;
+                }
+            }
+        });
+    });
+
+    // Return flat list, preserving insertion order (text → shopping → pla)
+    return Object.values(byAnchorId);
     """
 
     try:
@@ -519,6 +708,7 @@ def parse_ads(driver, query: str) -> list[dict]:
 
     ads = []
     seen_domains = set()
+    own_filtered_count = 0
 
     for raw in raw_ads:
         try:
@@ -526,8 +716,11 @@ def parse_ads(driver, query: str) -> list[dict]:
             clean_from_rw    = raw.get("cleanFromDataRw", "")
             display_url      = raw.get("displayUrl", "")
             title            = raw.get("title", "")
+            anchor_id        = raw.get("anchorId", "")
+            ad_format        = raw.get("format", "text")
+            anchor_href      = raw.get("anchorHref", "")
 
-            # Clean URL priority: data-rw > parsed aclk > display
+            # Clean URL priority: data-rw > parsed aclk > display > anchor href
             clean_url = ""
             if clean_from_rw and clean_from_rw.startswith("http"):
                 clean_url = clean_from_rw
@@ -546,20 +739,41 @@ def parse_ads(driver, query: str) -> list[dict]:
                     if first and "." in first:
                         clean_url = "https://" + first
 
+            # Last-resort: for shopping cards the displayUrl is often a
+            # pretty label ("Oxydoc", "Ravita.Shop") and aclk URL hides
+            # the real target. Use anchor_href as a fallback — sometimes
+            # Google's own click URL contains &adurl=... which we pick
+            # up via extract_real_url, but for shopping it may need the
+            # raw anchor href.
+            if not clean_url and anchor_href:
+                d = extract_domain(anchor_href)
+                if d and "google" not in d:
+                    clean_url = anchor_href
+
             domain = extract_domain(clean_url) or extract_domain(display_url)
             if not domain:
                 continue
 
             # Filter Google internal domains
-            if any(g in domain for g in ("google.com", "google.ua", "googleusercontent.com")):
+            if any(g in domain for g in ("google.com", "google.ua",
+                                         "googleusercontent.com",
+                                         "googlesyndication.com")):
                 continue
 
-            # Filter our own domains
-            if any(my in domain for my in MY_DOMAINS):
-                logging.info(f"  - [own] {domain} — {title[:50]}")
+            # ── OWN-DOMAIN FILTER — hard gate ──────────────────────
+            # Own-domain ads NEVER get into the returned list. This is
+            # the single source of truth for "is this ad ours". click_ad
+            # then trusts this list and clicks ONLY ads that came
+            # through this filter — no independent DOM scan.
+            if any(my.lower() in domain.lower() for my in MY_DOMAINS):
+                own_filtered_count += 1
+                fmt_tag = f" [{ad_format}]" if ad_format != "text" else ""
+                logging.info(f"  - [own]{fmt_tag} {domain} — {title[:50]}")
                 continue
 
-            # Dedup within query
+            # Dedup within query (same domain across text + shopping =
+            # one record). Keep the first occurrence — usually that's
+            # the highest-position text ad.
             if domain in seen_domains:
                 continue
             seen_domains.add(domain)
@@ -573,12 +787,18 @@ def parse_ads(driver, query: str) -> list[dict]:
                 "domain":            domain,
                 "found_at":          datetime.now().isoformat(timespec="seconds"),
                 "is_target":         any(t in domain for t in TARGET_DOMAINS),
+                "anchor_id":         anchor_id,   # used by click_ad
+                "ad_format":         ad_format,   # 'text' / 'shopping_carousel' / 'pla_grid'
             })
             mark = "★" if ads[-1]["is_target"] else "·"
-            logging.info(f"  {mark} {domain} — {title[:60]}")
+            fmt_tag = f" [{ad_format}]" if ad_format != "text" else ""
+            logging.info(f"  {mark}{fmt_tag} {domain} — {title[:60]}")
 
         except Exception as e:
             logging.debug(f"  block processing error: {e}")
+
+    if own_filtered_count > 0:
+        logging.debug(f"  parser: filtered {own_filtered_count} own-domain ad(s) across all formats")
 
     return ads
 
@@ -688,11 +908,29 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
         # Timeout / network error — caller's refresh loop handles retry
         err = type(e).__name__
         logging.warning(f"  navigation {err}: {str(e)[:80]}")
-        try:
-            driver.execute_script("window.stop();")
-        except Exception:
-            pass
-        # Still continue — DOM might be usable even after a timeout
+
+        # If the exception was actually a browser death (InvalidSessionId,
+        # etc.), the refresh loop can't do anything — driver is gone.
+        # Try to resurrect once before returning. Session (cookies,
+        # localStorage) is preserved on disk so the resurrected browser
+        # picks up where it left off.
+        if _browser_dead(e) or not browser.is_alive():
+            if _try_recover_browser(browser, reason=f"navigation {err}"):
+                driver = browser.driver   # rebind — old reference is stale
+                try:
+                    driver.set_page_load_timeout(15)
+                    browser.stealth_get(url, referer="https://www.google.com/")
+                except Exception as e2:
+                    logging.warning(f"  navigation after recovery also failed: {e2}")
+                    return []
+            else:
+                return []
+        else:
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            # Still continue — DOM might be usable even after a timeout
 
     _beat()
 
@@ -857,16 +1095,27 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
 
         # Before we attempt refresh — is the browser still alive?
         if not browser.is_alive():
-            logging.warning("  browser died during wait — aborting query")
-            return []
+            # Don't just give up — try to recover once. Mid-run crashes
+            # are usually recoverable because profile state (cookies,
+            # localStorage) lives on disk. The in-memory driver object
+            # is what needs rebuilding.
+            if not _try_recover_browser(browser, reason="is_alive=False before refresh"):
+                logging.warning("  browser died during wait and recovery failed — aborting query")
+                return []
+            driver = browser.driver   # rebind — old ref is stale after restart
 
         try:
             driver.refresh()
         except Exception as e:
             err = type(e).__name__
             logging.warning(f"  refresh {err}: {str(e)[:80]}")
-            if not browser.is_alive():
-                return []
+            # Same pattern — if this was actually a dead browser, try
+            # to bring it back before aborting.
+            if _browser_dead(e) or not browser.is_alive():
+                if not _try_recover_browser(browser, reason=f"refresh {err}"):
+                    return []
+                driver = browser.driver
+                continue
             try:
                 driver.execute_script("window.stop();")
             except Exception:
@@ -1084,6 +1333,28 @@ def run_monitor():
             except Exception as e:
                 logging.debug(f"  rotation check: {e}")
 
+        # ── SELFCHECK + DIAGNOSTICS THROTTLING ─────────────────────
+        # health_check() runs ~34 JS probes (1-2s each run).
+        # ProxyDiagnostics.full_check() makes 1 ipapi request + WebRTC
+        # probe. Running both EVERY run is overkill — fingerprint
+        # doesn't change between runs of the same profile (it's
+        # deterministic per-profile), and exit IP already gets checked
+        # during rotation. For high-cadence schedules (run every 10min)
+        # that's ~150 selfchecks/day wasting 3-5 min of cumulative time.
+        #
+        # Throttle: run selfcheck + diagnostics on run 1, then every
+        # Nth run (configurable, default 10). Always run them after a
+        # rotation since fingerprint + IP both might have changed.
+        selfcheck_every = int(CFG.get("browser.selfcheck_every_n_runs", 10) or 10)
+        if selfcheck_every < 1:
+            selfcheck_every = 1
+
+        should_selfcheck = (
+            should_rotate or                           # always after rotation
+            profile_run_n == 1 or                      # always on first run
+            profile_run_n % selfcheck_every == 1       # every N runs
+        )
+
         # 1. Profile health sanity check (soft: never aborts on first runs)
         sqm = SessionQualityMonitor(browser.user_data_path)
         should_abort, reason = sqm.should_abort()
@@ -1091,16 +1362,27 @@ def run_monitor():
             logging.warning(f"  ⚠ profile health: {reason}")
             logging.warning(f"    (proceeding anyway — disable this check if too strict)")
 
-        # 2. Fingerprint self-check (writes to DB + profile file)
-        browser.health_check(verbose=True)
+        if should_selfcheck:
+            # 2. Fingerprint self-check (writes to DB + profile file)
+            browser.health_check(verbose=True)
 
-        # 3. Proxy diagnostics with geo-mismatch detection.
-        diag = ProxyDiagnostics(driver, proxy_url=PROXY)
-        report = diag.full_check(
-            expected_timezone = EXPECTED_TIMEZONE,
-            expected_country  = EXPECTED_COUNTRY,
-        )
-        diag.print_report(report)
+            # 3. Proxy diagnostics with geo-mismatch detection.
+            diag = ProxyDiagnostics(driver, proxy_url=PROXY)
+            report = diag.full_check(
+                expected_timezone = EXPECTED_TIMEZONE,
+                expected_country  = EXPECTED_COUNTRY,
+            )
+            diag.print_report(report)
+        else:
+            wait = selfcheck_every - (profile_run_n % selfcheck_every)
+            logging.info(
+                f"⏸ skipping selfcheck + diagnostics — run #{profile_run_n}, "
+                f"next in {wait} run(s) (selfcheck_every_n_runs={selfcheck_every})"
+            )
+            # Still need a minimal `report` object for the ip_record_start
+            # block below — it reads report['ip_info']. Build a stub with
+            # whatever we already know.
+            report = {"ip_info": {"ip": current_ip}}
 
         # Record the current exit IP in ip_history — this is the only
         # place that catches static (non-rotating) proxy IPs. For rotating
@@ -1339,8 +1621,12 @@ def run_monitor():
                 dog.heartbeat()
 
                 if not browser.is_alive():
-                    logging.warning("⚠ Chrome window was closed — stopping run")
-                    break
+                    # Mid-run death — try to recover once before giving up.
+                    if _try_recover_browser(browser, reason="is_alive=False in legacy loop"):
+                        logging.info("  continuing legacy loop after recovery")
+                    else:
+                        logging.warning("⚠ Chrome window was closed and recovery failed — stopping run")
+                        break
 
                 t0 = time.time()
                 try:
@@ -1349,8 +1635,8 @@ def run_monitor():
                                        watchdog=dog)
                 except Exception as e:
                     # Catch "chrome not reachable" / "session deleted" / etc
-                    # — these mean the browser died mid-query (user closed it,
-                    # or it crashed). Don't try to continue with a dead driver.
+                    # — these mean the browser died mid-query. Try to
+                    # recover once before breaking out of the run loop.
                     err_str = str(e).lower()
                     if any(tok in err_str for tok in (
                             "chrome not reachable",
@@ -1358,10 +1644,21 @@ def run_monitor():
                             "no such window",
                             "invalid session id",
                             "disconnected: not connected to devtools")):
+                        if _try_recover_browser(
+                            browser,
+                            reason=f"query {i}/{len(SEARCH_QUERIES)} raised {type(e).__name__}"
+                        ):
+                            # Skip this query — it's lost — but keep the
+                            # run alive for remaining queries.
+                            logging.info(
+                                f"  query {i} aborted due to crash, "
+                                f"continuing with remaining queries"
+                            )
+                            continue
                         logging.warning(
                             f"⚠ Chrome died during query {i}/"
-                            f"{len(SEARCH_QUERIES)} — stopping run "
-                            f"({type(e).__name__})"
+                            f"{len(SEARCH_QUERIES)} and recovery failed — "
+                            f"stopping run ({type(e).__name__})"
                         )
                         break
                     raise
@@ -1391,11 +1688,24 @@ def run_monitor():
                 # Record metrics — both in DB (sqm) AND in local counters.
                 # Local counters are the source of truth for the run
                 # summary since sqm.record() has silent-fail modes.
+                #
+                # Counter semantics (important — this was recently fixed):
+                #   total_queries  = every query that ran (with or without ads)
+                #                    — this is the "searches" metric everyone
+                #                    expects on the dashboard
+                #   total_ads      = actual ad count across all queries
+                #   total_empty    = subset of total_queries that got 0 ads
+                #
+                # Previously total_queries incremented only when ads were
+                # found, which made Run #49 (0 ads across 3 queries) report
+                # `queries: 0/3` and the dashboard chart show a flat zero
+                # line even though 3 searches had happened. Overview's
+                # SEARCHES column now matches reality.
+                RUN_COUNTERS["total_queries"] += 1
                 if ads:
                     sqm.record("search_ok", query=query,
                                results_count=len(ads), duration_sec=duration)
-                    RUN_COUNTERS["total_ads"]     += len(ads)
-                    RUN_COUNTERS["total_queries"] += 1
+                    RUN_COUNTERS["total_ads"] += len(ads)
                     if IS_ROTATING_PROXY and current_ip:
                         browser.report_rotating(current_ip, success=True)
                 else:
@@ -1453,7 +1763,7 @@ if __name__ == "__main__":
             # last 24h AND miscounted `search_ok` as ads. See the
             # RUN_COUNTERS definition at the top for rationale.
             stats_dict = {
-                "queries_done":  RUN_COUNTERS["total_queries"] + RUN_COUNTERS["total_empty"],
+                "queries_done":  RUN_COUNTERS["total_queries"],
                 "queries_total": len(SEARCH_QUERIES),
                 "total_ads":     RUN_COUNTERS["total_ads"],
                 "captchas":      RUN_COUNTERS["total_captchas"],

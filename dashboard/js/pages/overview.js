@@ -36,6 +36,18 @@ const Overview = {
       resetBtn.addEventListener("click", () => this.resetStats());
     }
 
+    // ── Live invalidation on run completion ─────────────────────
+    // Previously Overview relied solely on a 15s setInterval poll, so
+    // a just-completed run would show stale numbers until the next
+    // tick. Now the server broadcasts a `run_finished` event over the
+    // SSE channel and we refresh the cheap stats immediately.
+    // Unsub stored for teardown().
+    this._unsubRunFinished = onSystemEvent("run_finished", () => {
+      this.loadHeadlineStats();
+      this.loadRecentActivity();
+      this.loadTrafficCard();
+    });
+
     // ── Auto-refresh loop ───────────────────────────────────────
     // Previously Overview loaded once on mount and never refreshed.
     // If a run completed while the user was looking at Overview, they
@@ -43,6 +55,10 @@ const Overview = {
     // re-pull stats every 15s while the page is active. The interval
     // clears itself as soon as the user moves to a different page
     // (currentPage !== "overview") to avoid wasted requests.
+    // Backstop poll — the run_finished event handles the common
+    // "run just ended" case instantly. This interval exists for
+    // mid-run metric drift (traffic accumulating, etc) and is the
+    // safety net if an SSE event gets dropped.
     clearInterval(this._pollTimer);
     this._pollTimer = setInterval(() => {
       if (currentPage !== "overview") {
@@ -50,19 +66,20 @@ const Overview = {
         this._pollTimer = null;
         return;
       }
-      // Only refresh the cheap bits — headline stats, traffic card and
-      // recent activity. Top competitors / profile health rarely change
-      // fast enough to matter; skipping them halves the DB load.
       this.loadHeadlineStats();
       this.loadRecentActivity();
       this.loadTrafficCard();
-    }, 15000);
+    }, 5000);
   },
 
   teardown() {
     if (this._pollTimer) {
       clearInterval(this._pollTimer);
       this._pollTimer = null;
+    }
+    if (this._unsubRunFinished) {
+      this._unsubRunFinished();
+      this._unsubRunFinished = null;
     }
   },
 

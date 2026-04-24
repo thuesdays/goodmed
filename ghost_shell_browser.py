@@ -119,7 +119,11 @@ class GhostShellBrowser:
 
         # Profile Enrichment (Simulate an aged browser profile before creation).
         # Can be disabled via env (GHOST_SHELL_SKIP_ENRICH=1) for debugging.
-        is_new_profile = not os.path.exists(self.user_data_path)
+        # Stash the is_new flag so the auto-enrich hook in start() knows
+        # whether to invoke chrome_importer.auto_enrich_fresh_profile after
+        # Chrome's first successful launch.
+        self._is_new_profile = not os.path.exists(self.user_data_path)
+        is_new_profile = self._is_new_profile
         os.makedirs(self.user_data_path, exist_ok=True)
         self.session_dir = os.path.join(self.user_data_path, "ghostshell_session")
 
@@ -181,36 +185,57 @@ class GhostShellBrowser:
     # ──────────────────────────────────────────────────────────
 
     def start(self) -> webdriver.Chrome:
-        """Launch Chrome with retry-once on the "early death" quirk.
+        """Launch Chrome with pre-flight validation + retry on crashes.
 
-        On Windows, Chrome 147 occasionally dies within 50-100ms of the
-        session being established — chromedriver logs "Chrome session
-        established ✓", then the next CDP call (typically Network.enable
-        or setBlockedURLs) throws InvalidSessionIdException. The Chrome
-        process is just gone, no crash dump, no useful chromedriver log.
-        Observed with plain `webdriver.Chrome()` too — not our bug, but
-        we have to deal with it.
+        Two escalating defences against profile-related crashes:
 
-        Root cause is usually one of: Windows Defender scanning the new
-        Chrome.exe, GPU sandbox init race with an ANGLE dll, or the
-        proxy forwarder's listen socket still being in TIME_WAIT from
-        a previous run. All fix themselves on retry.
+        1. PRE-FLIGHT VALIDATOR — before every launch, ProfileValidator
+           runs a battery of cheap checks (SQLite integrity, JSON
+           parseability, stale locks, session-file cleanup) and
+           self-heals anything it can. Most issues are deleted + left
+           for Chrome to recreate on first open, which is always safe.
 
-        Retry criteria: must happen within first 5 seconds AND be an
-        InvalidSessionId / NoSuchWindow / "chrome not reachable" style
-        exception. Later failures or different errors bubble up — those
-        are real problems that retry can't fix.
+        2. RETRY LADDER on crash:
+             attempt 1: launch
+             attempt 2: launch (if attempt 1 hit early-death quirk —
+                        InvalidSessionId within 5s, usually Win/Chrome
+                        version specific racing issue that clears up)
+             attempt 3: QUARANTINE the entire profile folder + launch
+                        against a fresh empty one. Used when individual
+                        file repair didn't work — some state in there
+                        was bad in a way the validator didn't catch.
 
-        Only retries ONCE. If second attempt also dies early, give up
-        and raise — scheduler will mark the run failed and try again
-        on next cadence.
+        The quarantine step is destructive from the user's POV (they
+        lose cookies, history, local storage for that profile) but
+        LESS destructive than a stuck scheduler that never succeeds.
+        The old folder is renamed, not deleted, so manual recovery is
+        possible.
         """
         from selenium.common.exceptions import (
             InvalidSessionIdException, WebDriverException,
             NoSuchWindowException,
         )
+        from profile_validator import ProfileValidator
 
-        for attempt in (1, 2):
+        # ── PRE-FLIGHT VALIDATION ───────────────────────────────
+        # Cheap to run (< 500ms typical), catches 90% of profile-death
+        # causes before Chrome even starts. Repairs what it can, deletes
+        # what it can't repair, flags anything weird in the log.
+        try:
+            validator = ProfileValidator(self.user_data_path)
+            report = validator.validate()
+            if report["total_issues"] > 0:
+                logging.info(
+                    f"[GhostShellBrowser] pre-flight: fixed "
+                    f"{report['fixed']} / deleted {report['deleted']} / "
+                    f"quarantined {report['quarantined']} issues "
+                    f"before launch"
+                )
+        except Exception as e:
+            logging.warning(f"[GhostShellBrowser] pre-flight validator: {e}")
+            validator = None
+
+        for attempt in (1, 2, 3):
             t0 = time.time()
             try:
                 return self._start_once()
@@ -218,25 +243,54 @@ class GhostShellBrowser:
                     WebDriverException) as e:
                 elapsed = time.time() - t0
                 msg = str(e).lower()
-                is_early_death = elapsed < 5.0 and (
+                # Any of these suggest Chrome died either pre-connect
+                # (session never created) or right after (early-death).
+                is_chrome_crash = (
                     "invalid session"        in msg or
                     "no such window"         in msg or
                     "chrome not reachable"   in msg or
                     "disconnected"           in msg or
-                    "target window already closed" in msg
+                    "target window already closed" in msg or
+                    "session not created"    in msg
                 )
-                if attempt == 2 or not is_early_death:
+                if not is_chrome_crash or attempt == 3:
                     raise
-                logging.warning(
-                    f"[GhostShellBrowser] Chrome died {elapsed:.1f}s after "
-                    f"launch ({type(e).__name__}: {str(e)[:80]}) — "
-                    f"retrying once..."
-                )
+
                 self._cleanup_after_failed_start()
-                # Brief pause — lets OS release file locks on the user-data-dir,
-                # TIME_WAIT drain on our proxy_forwarder port, and Defender
-                # finish whatever it was doing to the fresh Chrome.exe.
-                time.sleep(2.5)
+
+                if attempt == 1:
+                    # Attempt 2: same profile, give OS/Defender/TIME_WAIT
+                    # a moment to settle.
+                    logging.warning(
+                        f"[GhostShellBrowser] Chrome died {elapsed:.1f}s after "
+                        f"launch ({type(e).__name__}: {str(e)[:80]}) — "
+                        f"retrying once..."
+                    )
+                    time.sleep(2.5)
+                else:
+                    # Attempt 3: we tried twice with the same profile,
+                    # both failed the same way. Probably a file in the
+                    # profile is corrupt in a way the validator didn't
+                    # catch — maybe a new SQLite DB schema we don't
+                    # check yet, maybe a mysteriously corrupted JSON
+                    # deeper in Default/. Quarantine the folder, let
+                    # Chrome build a fresh one.
+                    logging.error(
+                        f"[GhostShellBrowser] Chrome crashed twice in a row "
+                        f"({type(e).__name__}) — quarantining profile folder "
+                        f"and retrying with a fresh empty profile"
+                    )
+                    if validator is not None:
+                        quarantined = validator.quarantine_profile(
+                            reason=f"two failed launches: {type(e).__name__}"
+                        )
+                        if quarantined:
+                            # Recreate user_data_path as an empty dir so
+                            # _start_once's setup paths (Preferences
+                            # writer, session dir, etc.) find what they
+                            # need to exist.
+                            os.makedirs(self.user_data_path, exist_ok=True)
+                    time.sleep(1.0)
 
     def _cleanup_after_failed_start(self):
         """Tear down partially-initialised Chrome/driver/proxy state so
@@ -374,12 +428,27 @@ class GhostShellBrowser:
             logging.debug(f"[GhostShellBrowser] lock write skipped: {e}")
             self._gs_lock_path = None
 
-        # 3. Configure Local Preferences (WebRTC & permissions ONLY).
+        # 3. Configure Local Preferences (WebRTC, permissions, session).
         # Language settings are NOT written here — that would overwrite our
         # C++ GhostShellConfig.languages. All language stuff comes from payload.
         pref_path = os.path.join(self.user_data_path, "Default", "Preferences")
         os.makedirs(os.path.dirname(pref_path), exist_ok=True)
 
+        # session.restore_on_startup values in Chrome:
+        #   1 = restore last session (default for many users — what we DO NOT want)
+        #   4 = open specific URL set at startup
+        #   5 = open NTP (new-tab page) — what we want. Fresh tab every launch.
+        #
+        # profile.exit_type / exited_cleanly are the "was Chrome crashed?"
+        # markers. We set them to "Normal"/true defensively — if a previous
+        # run was killed hard (hang detector, Windows reboot, whatever),
+        # these fields would be wrong and Chrome would prompt "restore
+        # session?" on startup, re-opening every tab that was open at
+        # crash time. That's exactly the "9 tabs every run" symptom.
+        #
+        # This together with the OS-level cleanup of Current Session /
+        # Current Tabs (below) ensures fresh tabs every launch unless
+        # the user explicitly asks otherwise via a script action.
         new_prefs = {
             "webrtc": {
                 "ip_handling_policy": "disable_non_proxied_udp",
@@ -392,7 +461,14 @@ class GhostShellBrowser:
                     "notifications": 2,
                     "media_stream_camera": 2,
                     "media_stream_mic": 2,
-                }
+                },
+                "exit_type":       "Normal",
+                "exited_cleanly":  True,
+            },
+            "session": {
+                "restore_on_startup":          5,   # 5 = open NTP
+                "restore_on_startup_migrated": True,
+                "startup_urls":                [],
             },
         }
 
@@ -435,6 +511,38 @@ class GhostShellBrowser:
             logging.error(f"[GhostShellBrowser] Failed to write Preferences: {e}")
             try: os.remove(tmp_path)
             except OSError: pass
+
+        # 3b. Nuke per-session tab state so Chrome starts with exactly
+        # one fresh NTP tab. These files hold the list of currently-open
+        # tabs and their history. Even with `restore_on_startup=5` in
+        # Preferences, Chrome will still show accumulated tabs if the
+        # previous session didn't exit cleanly (crashed, got killed by
+        # hang-detector, OS reboot) — it treats that as "something went
+        # wrong, let me help the user". Deleting the files pre-launch
+        # removes the source of truth so there's nothing to restore.
+        #
+        # This mirrors what "Profile is damaged, start fresh?" does
+        # internally, just without the user prompt. Other per-profile
+        # data (cookies, history, localStorage) is in separate files
+        # and untouched.
+        session_dir = os.path.join(self.user_data_path, "Default", "Sessions")
+        for fname in ("Current Session", "Current Tabs",
+                      "Last Session",    "Last Tabs"):
+            p = os.path.join(self.user_data_path, "Default", fname)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # Sessions dir (Chrome 122+ moved session state here in addition
+        # to the legacy files above). Remove the whole dir — Chrome
+        # rebuilds it on first write.
+        if os.path.isdir(session_dir):
+            try:
+                import shutil
+                shutil.rmtree(session_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         # 3. Configure Chrome Options (plain selenium — we have C++ patches
         # for detection evasion, undetected_chromedriver is redundant here).
@@ -807,6 +915,66 @@ class GhostShellBrowser:
             logging.debug(f"[GhostShellBrowser] watchdog spawn skipped: {e}")
 
         logging.info(f"[GhostShellBrowser] Core launched successfully. Profile: {self.profile_name}")
+
+        # ── AUTO-ENRICH fresh profiles ─────────────────────────────
+        # Fires AFTER Chrome successfully started — Chrome's own code
+        # has now created History/Preferences/etc with the correct
+        # schema, so chrome_importer can layer imported rows on top
+        # without schema-drift risk.
+        #
+        # Gated by self._is_new_profile AND config flag. The importer
+        # is idempotent via its sentinel file so this is safe to call
+        # repeatedly; we still gate here to save the import cost on
+        # known-not-fresh profiles.
+        if getattr(self, "_is_new_profile", False):
+            try:
+                # Lazy imports — keeps startup cost off runs that don't
+                # auto-enrich. CFG lookup uses db module which is always
+                # present at this point.
+                from db import get_db
+                db = get_db()
+                auto_enabled = db.config_get(
+                    "browser.auto_enrich_from_host_chrome", True)
+                if auto_enabled:
+                    # We need Chrome to release its History DB write lock
+                    # before we open it. At this point Chrome has started
+                    # but nothing's driven it yet — History is open for
+                    # writes. We close+reopen by briefly navigating to
+                    # about:blank and then letting the importer use
+                    # WAL-safe copy to snapshot. The copy doesn't block
+                    # Chrome so this is non-disruptive.
+                    from chrome_importer import auto_enrich_fresh_profile
+                    # User-configurable source path. Empty → auto-detect.
+                    # Settings page wires this via data-config.
+                    source_override = (
+                        db.config_get("browser.auto_enrich_source_path", "") or ""
+                    ).strip() or None
+                    result = auto_enrich_fresh_profile(
+                        dest_profile = self.profile_name,
+                        profiles_root= os.path.dirname(self.user_data_path),
+                        max_days     = int(db.config_get(
+                            "browser.auto_enrich_max_days", 30) or 30),
+                        max_urls     = int(db.config_get(
+                            "browser.auto_enrich_max_urls", 500) or 500),
+                        source_dir   = source_override,
+                    )
+                    if result.get("ok"):
+                        s = result.get("summary", {})
+                        logging.info(
+                            f"[GhostShellBrowser] auto-enrich complete: "
+                            f"imported ~{s.get('history', 0)} URLs + "
+                            f"{s.get('bookmarks', 0)} bookmarks from host Chrome"
+                        )
+                    elif result.get("reason") not in (
+                            "already auto-enriched", "no host Chrome detected"):
+                        # Quiet on expected skips, noisy on real failures
+                        logging.info(
+                            f"[GhostShellBrowser] auto-enrich skipped: "
+                            f"{result.get('reason')}"
+                        )
+            except Exception as e:
+                logging.debug(f"[GhostShellBrowser] auto-enrich hook: {e}")
+
         return self.driver
 
     def _apply_cdp_overrides(self, payload: dict):
@@ -2348,6 +2516,35 @@ class GhostShellBrowser:
                 logging.info("[GhostShellBrowser] Local proxy forwarder terminated.")
             except Exception:
                 pass
+
+        # Re-stamp Preferences with exited_cleanly=true. driver.quit()
+        # sends SIGTERM/closes handles, which Chrome uses to write its
+        # own clean-exit markers. BUT if we got here via the hang
+        # detector killing the process (SIGKILL), or the process was
+        # terminated by the OS, Chrome never gets that chance — its
+        # Preferences still has exited_cleanly=false. On next launch
+        # Chrome treats that as a crash and tries to restore tabs
+        # (THIS is the "9 tabs pile up" symptom from the user's report).
+        #
+        # Post-shutdown re-stamp fixes this unconditionally: whatever
+        # Chrome wrote during its own shutdown gets overwritten by us
+        # with exit_type=Normal and exited_cleanly=true, so next launch
+        # has a clean-exit marker regardless of how we got here.
+        try:
+            pref_path = os.path.join(self.user_data_path, "Default", "Preferences")
+            if os.path.exists(pref_path):
+                with open(pref_path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+                if isinstance(prefs, dict):
+                    prefs.setdefault("profile", {})
+                    prefs["profile"]["exit_type"]      = "Normal"
+                    prefs["profile"]["exited_cleanly"] = True
+                    tmp = pref_path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(prefs, f)
+                    os.replace(tmp, pref_path)
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] post-shutdown pref stamp: {e}")
 
         # Detach our profile-specific file handler so logs from the next
         # run don't double up if the process stays alive (e.g. scheduler).

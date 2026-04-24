@@ -21,6 +21,17 @@ const Logs = {
     const mode = window.LOGS_MODE || { type: "live" };
     this.applyMode(mode);
 
+    // The global LOG_BUFFER may already contain data if runner.js
+    // primed it before navigation — if so render immediately. If it's
+    // empty (dashboard just loaded on /logs directly, or user cleared),
+    // explicitly pull the ring buffer so the page is never blank
+    // after reload.
+    if (mode.type === "live" && LOG_BUFFER.length === 0) {
+      try {
+        await primeLogBuffer();
+      } catch {}
+    }
+
     // Seed the filter dropdown from whatever's in the buffer right now.
     this._rescanKnownProfiles();
     this._renderProfileDropdown();

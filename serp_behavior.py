@@ -200,7 +200,7 @@ def click_organic_result(driver, dwell_min_sec: float = 8.0,
         href = link_el.get_attribute("href") or ""
         if not href.startswith("http"):
             return False
-        original_handle = driver.current_window_handle
+        original_handle  = driver.current_window_handle
         original_handles = set(driver.window_handles)
 
         # Open in new tab via JS — Ctrl+click is unreliable through
@@ -214,42 +214,65 @@ def click_organic_result(driver, dwell_min_sec: float = 8.0,
         if not new_handles:
             logging.debug("[serp_behavior] new tab didn't open")
             return False
-        driver.switch_to.window(new_handles[0])
+        new_tab_handle = new_handles[0]
+        driver.switch_to.window(new_tab_handle)
 
         # Dwell — simulate reading the article. Break into small
         # chunks with micro-scrolls so there are real activity events.
+        # Any exception here is swallowed so the finally block ALWAYS
+        # closes the tab (otherwise a broken page leaves tabs piling
+        # up across runs — the "9 tabs on startup" symptom).
         dwell = random.uniform(dwell_min_sec, dwell_max_sec)
-        t_end = time.time() + dwell
-        while time.time() < t_end:
-            try:
-                driver.execute_script(
-                    f"window.scrollBy(0, {random.randint(40, 180)});"
-                )
-            except Exception:
-                pass
-            if watchdog is not None:
-                try: watchdog.heartbeat()
-                except Exception: pass
-            time.sleep(min(random.uniform(2.0, 4.5),
-                           max(0.3, t_end - time.time())))
-
-        # Close the tab, return to SERP
         try:
-            driver.close()
-        except Exception:
-            pass
-        driver.switch_to.window(original_handle)
+            t_end = time.time() + dwell
+            while time.time() < t_end:
+                try:
+                    driver.execute_script(
+                        f"window.scrollBy(0, {random.randint(40, 180)});"
+                    )
+                except Exception:
+                    pass
+                if watchdog is not None:
+                    try: watchdog.heartbeat()
+                    except Exception: pass
+                time.sleep(min(random.uniform(2.0, 4.5),
+                               max(0.3, t_end - time.time())))
+        except Exception as e:
+            logging.debug(f"[serp_behavior] dwell interrupted: {e}")
+
         logging.info(f"  ◯ organic click: dwelt {dwell:.0f}s on {href[:70]}")
         return True
 
     except Exception as e:
         logging.debug(f"[serp_behavior] organic click failed: {e}")
-        # Best-effort recovery — make sure we're back on the SERP tab
-        try:
-            driver.switch_to.window(driver.window_handles[0])
-        except Exception:
-            pass
         return False
+    finally:
+        # ── BULLETPROOF TAB CLEANUP ────────────────────────────────
+        # Always runs, even if dwell loop or driver.execute_script raised.
+        # Close EVERY handle that wasn't there before we started, then
+        # settle back on the original SERP tab. This is why users were
+        # seeing 9+ tabs pile up: previous code only closed in the
+        # happy path; any mid-dwell exception left the new tab open,
+        # and because we wrote those tabs into Chrome's session state,
+        # they came back on every subsequent launch.
+        try:
+            starting_handles = original_handles if 'original_handles' in locals() else set()
+            for h in driver.window_handles:
+                if h not in starting_handles:
+                    try:
+                        driver.switch_to.window(h)
+                        driver.close()
+                    except Exception:
+                        pass
+            # Settle back on original. If even that was closed somehow
+            # (shouldn't happen but defensive), pick the first remaining.
+            remaining = driver.window_handles
+            if remaining:
+                target = original_handle if ('original_handle' in locals()
+                                             and original_handle in remaining) else remaining[0]
+                driver.switch_to.window(target)
+        except Exception as e:
+            logging.debug(f"[serp_behavior] tab cleanup failed: {e}")
 
 
 def _find_organic_link(driver, exclude_domains: list = None):

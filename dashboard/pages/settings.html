@@ -293,6 +293,83 @@
     </div>
   </div>
 
+  <!-- ─── Auto-enrich (DANGER ZONE) ──────────────────────────── -->
+  <!-- Dimmed red border + warning banner make this section visually
+       distinct from routine config. The setting inside is genuinely
+       sensitive: it reads the user's ACTUAL Chrome profile data
+       (history, bookmarks) and copies bits of it into the Ghost
+       Shell profile. Users should understand that clearly before
+       leaving it enabled on a shared machine. -->
+  <div class="card card-danger">
+    <div class="card-title">
+      🔴 Auto-enrich from host Chrome
+      <span class="muted">— uses your personal browser data</span>
+    </div>
+
+    <div class="danger-banner">
+      <strong>⚠ DANGER ZONE — reads your personal browsing data.</strong><br>
+      When a fresh Ghost Shell profile starts for the first time, we
+      automatically copy a random slice (30 days, ~500 URLs) of your
+      <strong>real Chrome history + bookmarks</strong> into that
+      profile. This makes the profile look like a real user to Google,
+      but it also means your own browsing history — visited sites,
+      bookmarks — ends up in the Ghost Shell profile folder.
+      <br><br>
+      Sensitive domains (banking, health, signed-in social) are
+      always filtered out. Each Ghost Shell profile gets a different
+      random slice of history, so they don't look identical to each
+      other. Runs only once per profile — a sentinel file prevents
+      re-imports on subsequent runs.
+    </div>
+
+    <div class="form-group">
+      <label class="checkbox-row">
+        <input type="checkbox" data-config="browser.auto_enrich_from_host_chrome">
+        <span>Enable auto-enrich for fresh profiles</span>
+      </label>
+      <div class="form-hint">
+        Disable this to start every new profile with a completely
+        empty history. Profiles will look more "synthetic" to Google
+        which may reduce ad load, but nothing personal leaves your
+        browser.
+      </div>
+    </div>
+
+    <div class="input-row">
+      <div class="form-group">
+        <label class="form-label">Max days to import</label>
+        <input type="number" class="input" min="1" max="365"
+               data-config="browser.auto_enrich_max_days"
+               placeholder="30">
+        <div class="form-hint">Actual dose is randomized per-profile
+          between half this value and the full value.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Max URLs to import</label>
+        <input type="number" class="input" min="10" max="10000"
+               data-config="browser.auto_enrich_max_urls"
+               placeholder="500">
+        <div class="form-hint">Actual dose is randomized per-profile
+          between 60% of this value and the full value.</div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Source Chrome profile path</label>
+      <input type="text" class="input"
+             data-config="browser.auto_enrich_source_path"
+             placeholder="Leave empty to auto-detect your default Chrome">
+      <div class="form-hint">
+        If empty, we auto-discover: <code>%LOCALAPPDATA%\Google\Chrome\User Data\Default</code>
+        on Windows (or Chromium / Brave / Edge). Set this explicitly to
+        import from a different Chrome profile (e.g.
+        <code>"%LOCALAPPDATA%\Google\Chrome\User Data\Profile 2"</code>)
+        or to point at an old backed-up profile folder. Works while
+        Chrome is open — we snapshot via WAL-safe copy.
+      </div>
+    </div>
+  </div>
+
   <!-- ─── Export ──────────────────────────────────────────────── -->
   <div class="card">
     <div class="card-title">📦 Export configuration</div>

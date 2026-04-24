@@ -21,9 +21,15 @@ const runStatus  = () => document.getElementById("run-status");
 
 // Global log buffer — shared with the Logs page. Lives for the whole
 // dashboard session so we don't lose messages when switching pages.
+// Backed by a server-side ring buffer (see /api/logs/recent) so a page
+// reload fills in with the last ~2000 lines instead of showing empty.
 const LOG_BUFFER = [];
-const LOG_MAX    = 500;
+const LOG_MAX    = 2000;
 const logSubscribers = [];
+
+// Highest seq we've seen from the server. Used on SSE reconnect to
+// backfill any messages we missed during the disconnect window.
+let _lastLogSeq = 0;
 
 function onLogEntry(cb) {
   logSubscribers.push(cb);
@@ -33,14 +39,70 @@ function onLogEntry(cb) {
   };
 }
 
+// System-event subscribers — separate from logSubscribers because
+// events (like "run_finished") are structured signals, not text
+// for the log viewer. The Overview page uses this to refresh stats
+// immediately on run completion instead of polling every 15s.
+const eventSubscribers = [];
+
+/** Subscribe to named system events broadcast over the SSE channel.
+ *  Returns an unsubscribe fn. Called by any page that wants
+ *  live invalidation without polling.
+ */
+function onSystemEvent(eventName, cb) {
+  const wrapper = (e) => { if (e.event === eventName) cb(e); };
+  eventSubscribers.push(wrapper);
+  return () => {
+    const i = eventSubscribers.indexOf(wrapper);
+    if (i >= 0) eventSubscribers.splice(i, 1);
+  };
+}
+
+/** Internal — push entry to buffer, trim, track seq, notify subs. */
+function _pushLogEntry(entry) {
+  if (typeof entry.seq === "number" && entry.seq > _lastLogSeq) {
+    _lastLogSeq = entry.seq;
+  }
+  // Demultiplex: structured events go to eventSubscribers only,
+  // actual log lines go to logSubscribers and the buffer.
+  if (entry.type === "event") {
+    eventSubscribers.forEach(fn => { try { fn(entry); } catch {} });
+    return;
+  }
+  LOG_BUFFER.push(entry);
+  if (LOG_BUFFER.length > LOG_MAX) LOG_BUFFER.shift();
+  logSubscribers.forEach(fn => { try { fn(entry); } catch {} });
+}
+
+/** Pull the ring-buffer from the server and prime LOG_BUFFER.
+ *  Called once on boot and again whenever SSE reconnects. On reconnect
+ *  we send ?since_seq so we only get the gap.
+ */
+async function primeLogBuffer() {
+  try {
+    const url = _lastLogSeq > 0
+      ? `/api/logs/recent?since_seq=${_lastLogSeq}`
+      : `/api/logs/recent?limit=2000`;
+    const r = await fetch(url);
+    if (!r.ok) return;
+    const data = await r.json();
+    const entries = data.entries || [];
+    for (const e of entries) _pushLogEntry(e);
+  } catch {
+    // Silent — if /api/logs/recent is down, SSE will still work for
+    // future messages. No point spamming errors.
+  }
+}
+
 function startLogStream() {
+  // Prime the buffer FIRST so by the time the page renders, the user
+  // sees the last 2000 lines of history rather than empty.
+  primeLogBuffer();
+
   const src = new EventSource("/api/logs/live");
   src.onmessage = (e) => {
     try {
-      const entry = JSON.parse(e.data);
-      LOG_BUFFER.push(entry);
-      if (LOG_BUFFER.length > LOG_MAX) LOG_BUFFER.shift();
-      logSubscribers.forEach(fn => { try { fn(entry); } catch {} });
+      _pushLogEntry(JSON.parse(e.data));
     } catch {}
   };
   src.onerror = () => {

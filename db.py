@@ -386,6 +386,30 @@ DEFAULT_CONFIG = {
     # setting). Default 10 = about 5-15 min of ripening per IP in a
     # typical scheduler cadence.
     "proxy.rotate_every_n_runs":  10,
+    # Run fingerprint self-check + proxy diagnostics once every N runs
+    # (plus always after rotation, plus always on run #1). Checks are
+    # deterministic per-profile — running 34 JS probes every run burns
+    # 1-2s for no diagnostic gain. Default 10 = once every ~2 hrs at
+    # 10 min cadence, which is enough to catch drift without wasting
+    # time.
+    "browser.selfcheck_every_n_runs": 10,
+    # On fresh-profile first launch, automatically import a slice of
+    # the host's real Chrome history (if present) so the profile looks
+    # like a casual user rather than a factory-fresh browser. Each
+    # profile gets a DIFFERENT random slice (seeded by profile name)
+    # to avoid all Ghost Shell profiles looking identical to Google.
+    # Idempotent — a sentinel file marks profiles that already ran this.
+    # Users can still run Warm up from real Chrome manually via the
+    # dashboard to force a fresh import or change the dose.
+    "browser.auto_enrich_from_host_chrome": True,
+    "browser.auto_enrich_max_days": 30,
+    "browser.auto_enrich_max_urls": 500,
+    # Explicit source path override. Empty string → auto-discover via
+    # chrome_importer.discover_source() (finds %LOCALAPPDATA%\Google
+    # \Chrome\User Data\Default on Windows). Set this to point at a
+    # specific Chrome profile — e.g. "Profile 2" instead of "Default",
+    # or an archived profile folder.
+    "browser.auto_enrich_source_path": "",
 
     "captcha.twocaptcha_key":     "",
 

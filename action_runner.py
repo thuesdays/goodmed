@@ -234,38 +234,70 @@ def _human_scroll(driver, total_min: int = 300, total_max: int = 900,
 # ──────────────────────────────────────────────────────────────
 
 def _act_click_ad(driver, action: dict, ctx: dict):
-    """Actually click the ad element (Ctrl+Click → new tab)."""
-    ad = ctx.get("ad") or {}
+    """Click the EXACT ad anchor that parse_ads returned.
 
-    # Find the ad's anchor element by URL or by known SERP selectors
-    url    = ad.get("google_click_url") or ad.get("clean_url") or ""
+    parse_ads stamps the chosen <a> with data-gs-ad-id during its scan.
+    That attribute stays on the element until the page is rebuilt. We
+    look up by that ID = 100% deterministic; we click exactly what the
+    parser saw + approved, no "find any ad anchor" fallback that could
+    grab a different card (that was the bug where click_ad would pick
+    up the shopping carousel's first item = the user's own domain).
+
+    ONLY if anchor_id lookup fails (page was reloaded between parse and
+    click, shouldn't happen but defensively) do we fall back to URL
+    fragment + own-domain filter. We NEVER silently grab "the first ad
+    anchor" as a last resort — better to abort the click than click the
+    wrong ad.
+    """
+    ad = ctx.get("ad") or {}
+    anchor_id = ad.get("anchor_id") or ""
+    own_domains = [d.lower() for d in (ctx.get("my_domains") or []) if d]
+
+    def _href_is_own(href: str) -> bool:
+        if not href:
+            return False
+        h = href.lower()
+        return any(d in h for d in own_domains)
+
     anchor = None
 
-    # Strategy 1: find an <a> whose href matches the ad we parsed
-    if url:
+    # ── PRIMARY: lookup by stamped anchor_id ────────────────────
+    # This is the happy path. parse_ads already validated the domain
+    # and stamped the right element.
+    if anchor_id:
         try:
             anchor = driver.find_element(
-                By.CSS_SELECTOR,
-                f"a[href*='{url[:80]}']"
+                By.CSS_SELECTOR, f'a[data-gs-ad-id="{anchor_id}"]'
             )
         except Exception:
-            pass
+            anchor = None
 
-    # Strategy 2: find any ad anchor (first Sponsored card)
+    # ── FALLBACK: URL fragment match with own-domain guard ──────
+    # Only reached if the stamped anchor vanished (page re-rendered,
+    # Google dynamically swapped the ad block, etc). Still requires
+    # owndomain verification on whatever we find.
     if anchor is None:
-        for sel in ("[data-text-ad] a.sVXRqc",
-                    "[data-text-ad] a[href*='aclk']",
-                    "div[data-rw] a[href*='aclk']",
-                    ".uEierd a",
-                    "a[data-rw][href*='aclk']"):
+        url = ad.get("google_click_url") or ad.get("clean_url") or ""
+        if url:
             try:
-                anchor = driver.find_element(By.CSS_SELECTOR, sel)
-                break
+                candidate = driver.find_element(
+                    By.CSS_SELECTOR, f"a[href*='{url[:80]}']"
+                )
+                cand_href = candidate.get_attribute("href") or ""
+                if not _href_is_own(cand_href):
+                    anchor = candidate
+                    log.debug("    click_ad: anchor_id lookup failed, fell back to URL match")
+                else:
+                    log.info(f"    click_ad: URL-match fallback hit own domain, aborting")
             except Exception:
-                continue
+                pass
 
     if anchor is None:
-        log.warning("    click_ad: couldn't locate ad anchor")
+        log.warning(
+            f"    click_ad: couldn't locate ad anchor "
+            f"(anchor_id='{anchor_id}', domain='{ad.get('domain','')}') — "
+            f"refusing to guess. No click will happen."
+        )
         return
 
     # Scroll element into view (humanly)
@@ -297,7 +329,27 @@ def _act_click_ad(driver, action: dict, ctx: dict):
     tabs = [h for h in driver.window_handles if h != original]
     if tabs:
         driver.switch_to.window(tabs[-1])
-        log.info(f"    → clicked ad, now on: {driver.current_url[:80]}")
+        landed_url = driver.current_url or ""
+        log.info(f"    → clicked ad, now on: {landed_url[:80]}")
+
+        # ── POST-CLICK SAFETY NET ──────────────────────────────────
+        # Last line of defence: even with anchor_id deterministic match,
+        # Google's /aclk redirect chain can occasionally land on an own
+        # domain (rare — happens when a competitor's ad URL 302s through
+        # our site as part of affiliate tracking, or when Google swaps
+        # the landing page at serve time). If we end up on our own site,
+        # close immediately — no dwell, no self-click cost.
+        if _href_is_own(landed_url):
+            log.warning(
+                f"    click_ad: LANDED on own domain ({landed_url[:60]}) — "
+                f"closing tab immediately without dwell"
+            )
+            try:
+                driver.close()
+            finally:
+                try: driver.switch_to.window(original)
+                except Exception: pass
+            return
 
     # Dwell
     dwell_lo = float(action.get("dwell_min", 6))
@@ -353,29 +405,80 @@ def _act_click_selector(driver, action: dict, ctx: dict):
 
 
 def _act_visit(driver, action: dict, ctx: dict):
-    """Navigate directly to a URL."""
+    """Navigate directly to a URL. Either in a new tab (default) or the
+    current one.
+
+    Own-domain protection: if the target URL matches any of our own
+    domains (from ctx.my_domains), abort before navigating. This is
+    the last stop for accidental self-visits. Note `visit` typically
+    uses the ad's click URL from ctx, so if parse_ads already filtered
+    own domains out, this guard is redundant — but defence-in-depth.
+    """
     ad  = ctx.get("ad") or {}
     url = action.get("url") or ad.get("google_click_url") or ad.get("clean_url")
     if not url:
         return
+
+    own_domains = [d.lower() for d in (ctx.get("my_domains") or []) if d]
+    if own_domains and any(d in url.lower() for d in own_domains):
+        log.info(f"    visit: skipping own-domain URL ({url[:60]})")
+        return
+
     new_tab = bool(action.get("new_tab", True))
     log.info(f"    → visit {url[:80]}")
 
     if new_tab:
         original = driver.current_window_handle
-        driver.execute_script(f"window.open('{url}', '_blank');")
+        original_handles = set(driver.window_handles)
+        driver.execute_script(f"window.open(arguments[0], '_blank');", url)
         _random_sleep(1.0, 2.0)
-        new_handles = [h for h in driver.window_handles if h != original]
-        if new_handles:
+        new_handles = [h for h in driver.window_handles
+                       if h not in original_handles]
+        if not new_handles:
+            log.debug("    visit: new tab didn't open")
+            return
+
+        try:
             driver.switch_to.window(new_handles[-1])
 
-        dwell_lo = float(action.get("dwell_min", 5))
-        dwell_hi = float(action.get("dwell_max", 15))
-        _random_sleep(dwell_lo, dwell_hi)
+            # Landing URL check — same rationale as click_ad's
+            # post-click guard: a URL that looked safe in ad metadata
+            # can 302 onto an own domain.
+            landed = driver.current_url or ""
+            if own_domains and any(d in landed.lower() for d in own_domains):
+                log.warning(
+                    f"    visit: LANDED on own domain ({landed[:60]}), "
+                    f"closing tab immediately"
+                )
+                return
 
-        if action.get("close_after", True):
-            try: driver.close()
-            finally: driver.switch_to.window(original)
+            dwell_lo = float(action.get("dwell_min", 5))
+            dwell_hi = float(action.get("dwell_max", 15))
+            _random_sleep(dwell_lo, dwell_hi)
+        except Exception as e:
+            log.debug(f"    visit: dwell raised: {e}")
+        finally:
+            # Bulletproof cleanup — ALWAYS close tabs we opened, even
+            # if the dwell loop crashed. Without this, any mid-dwell
+            # exception (page crash, target site's JS blew up) leaked
+            # a tab. Those tabs then persist into Chrome's session
+            # state and re-open on every subsequent run (the "9 tabs
+            # stacking up" symptom).
+            if action.get("close_after", True):
+                try:
+                    for h in driver.window_handles:
+                        if h not in original_handles:
+                            try:
+                                driver.switch_to.window(h)
+                                driver.close()
+                            except Exception:
+                                pass
+                    if original in driver.window_handles:
+                        driver.switch_to.window(original)
+                    elif driver.window_handles:
+                        driver.switch_to.window(driver.window_handles[0])
+                except Exception as e:
+                    log.debug(f"    visit: cleanup failed: {e}")
     else:
         driver.get(url)
         dwell_lo = float(action.get("dwell_min", 5))

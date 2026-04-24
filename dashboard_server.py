@@ -125,6 +125,29 @@ class RunnerPool:
         self._subscribers    = set()   # set of queue.Queue
         self._subs_lock      = threading.Lock()
 
+        # Server-side ring buffer of recent log entries. Serves two
+        # purposes that SSE alone can't:
+        #
+        #   1. Page-reload replay — when the user refreshes the Logs
+        #      tab, SSE starts a new connection that only sees FUTURE
+        #      messages. Without this buffer the page would be empty
+        #      until the next log line arrives (could be minutes on a
+        #      quiet scheduler). Now the frontend fetches this buffer
+        #      on init and renders it as "history", then SSE picks up
+        #      from whatever arrived after.
+        #
+        #   2. Late-joiners — if a user opens the dashboard mid-run
+        #      they should see what's been happening, not just
+        #      whatever fires next.
+        #
+        # Size budget: 2000 entries, ~250 bytes each ≈ 500 KB. Larger
+        # than the frontend's LOG_MAX (500) because some scheduler
+        # setups do bursts and we want to retain context across them.
+        # Ring buffer (deque with maxlen) auto-evicts oldest.
+        from collections import deque
+        self._log_history      = deque(maxlen=2000)
+        self._log_history_lock = threading.Lock()
+
     # ── Lifecycle ───────────────────────────────────────────────
     def add(self, slot: RunnerSlot) -> None:
         with self._lock:
@@ -192,6 +215,15 @@ class RunnerPool:
             self._subscribers.discard(q)
 
     def broadcast_log(self, entry: dict) -> None:
+        # Stamp with a monotonic sequence number so clients can
+        # request "everything after this seq" after a reconnect
+        # without worrying about clock skew or duplicate replay.
+        with self._log_history_lock:
+            self._seq_counter = getattr(self, "_seq_counter", 0) + 1
+            entry = dict(entry)   # copy so we don't mutate the caller's dict
+            entry["seq"] = self._seq_counter
+            self._log_history.append(entry)
+
         # Fan out to a snapshot of subscribers — capture under the lock
         # so adding/removing subscribers during iteration is safe.
         with self._subs_lock:
@@ -206,6 +238,31 @@ class RunnerPool:
                     q.put_nowait(entry)
                 except Exception:
                     pass
+
+    def recent_logs(self, limit: int = 2000,
+                    profile_name: str = None,
+                    level: str = None,
+                    since_id: int = None) -> list[dict]:
+        """Snapshot of the ring buffer, optionally filtered.
+
+        `since_id` is the sequence number of the last entry the caller
+        already has — returns only entries newer than that. Useful when
+        the SSE reconnects after a transient disconnect and wants to
+        backfill the gap without replaying everything.
+        """
+        with self._log_history_lock:
+            entries = list(self._log_history)
+        # Filters applied in Python because the buffer is small (2000)
+        # and this is called once per page load — not worth indexing.
+        if since_id is not None:
+            entries = [e for e in entries if e.get("seq", 0) > since_id]
+        if profile_name:
+            entries = [e for e in entries if e.get("profile_name") == profile_name]
+        if level:
+            entries = [e for e in entries if e.get("level") == level]
+        if limit and len(entries) > limit:
+            entries = entries[-limit:]   # keep most recent N
+        return entries
 
     # ── Helpers ─────────────────────────────────────────────────
     def _slot_to_dict(self, slot: RunnerSlot) -> dict:
@@ -1236,20 +1293,38 @@ def _launch_run_thread(slot: "RunnerSlot", proxy_url: str) -> None:
             proc.wait()
             exit_code = proc.returncode
 
-            # Run-end stats — aggregate events written by this run.
-            total = db.events_summary(hours=24)
-            db.run_finish(
-                run_id,
-                exit_code    = exit_code,
-                total_queries= total.get("search_ok", 0) + total.get("search_empty", 0),
-                total_ads    = total.get("search_ok", 0),
-                captchas     = total.get("captcha", 0),
-            )
+            # Finalize run row — ONLY exit_code here. Child process
+            # (main.py) already wrote total_queries / total_ads /
+            # captchas from its own RUN_COUNTERS via its final
+            # run_finish call. If we overwrote them here with
+            # events_summary (which reads 24h cumulative, not
+            # per-run!) we'd clobber the correct numbers.
+            #
+            # events_summary fell out of favour for per-run stats because
+            # (a) it's 24h window so every run inflates with siblings'
+            # data, and (b) sqm.record() has silent-fail modes where
+            # events don't get written at all. RUN_COUNTERS in main.py
+            # is the single source of truth.
+            db.run_finish(run_id, exit_code=exit_code)
             slot.log(
                 f"Monitor #{run_id} finished (code {exit_code})",
                 "info" if exit_code == 0 else "error",
             )
             RUNNER_POOL.mark_finished(run_id, exit_code=exit_code)
+
+            # Notify all SSE subscribers that stats changed so the
+            # Overview page refreshes IMMEDIATELY rather than waiting
+            # for its 15s poll. Uses the log broadcast channel — the
+            # frontend recognizes entries with type="event" as signals
+            # rather than log lines and dispatches them to listeners.
+            RUNNER_POOL.broadcast_log({
+                "type":         "event",
+                "event":        "run_finished",
+                "run_id":       run_id,
+                "profile_name": slot.profile_name,
+                "exit_code":    exit_code,
+                "ts":           datetime.now().isoformat(timespec="seconds"),
+            })
 
         except Exception as e:
             db.run_finish(run_id, exit_code=-1, error=str(e))
@@ -1770,6 +1845,41 @@ def api_scheduler_status():
 # ──────────────────────────────────────────────────────────────
 # API: LOGS
 # ──────────────────────────────────────────────────────────────
+
+@app.route("/api/logs/recent", methods=["GET"])
+def api_logs_recent():
+    """Return recent log entries from the in-memory ring buffer.
+
+    Called by the Logs page on every load so users see the last
+    2000 log lines immediately after reload instead of a blank screen.
+    Also used as a gap-filler after SSE reconnects: the frontend
+    remembers the last `seq` it received and asks for everything
+    newer.
+
+    Query params:
+      ?limit        — cap on entries returned (default 2000, max 2000)
+      ?profile      — filter to one profile name
+      ?level        — info | warning | error
+      ?since_seq    — monotonic seq of last entry client already has
+
+    Does NOT read from the DB `logs` table (slow + lossy since we only
+    persist run-summary events there). Ring buffer is authoritative
+    for recent-window views; DB is for long-term history via
+    /api/logs/history.
+    """
+    limit        = min(int(request.args.get("limit", 2000) or 2000), 2000)
+    profile_name = request.args.get("profile") or None
+    level        = request.args.get("level") or None
+    since_seq    = request.args.get("since_seq", type=int)
+
+    entries = RUNNER_POOL.recent_logs(
+        limit         = limit,
+        profile_name  = profile_name,
+        level         = level,
+        since_id      = since_seq,
+    )
+    return jsonify({"entries": entries, "count": len(entries)})
+
 
 @app.route("/api/logs/live")
 def api_logs_live():

@@ -530,6 +530,138 @@ class ChromeImporter:
 
 
 # ──────────────────────────────────────────────────────────────
+# AUTO-ENRICH on fresh profile
+# ──────────────────────────────────────────────────────────────
+#
+# Triggered automatically for profiles that have:
+#   1. No prior auto-enrich (a sentinel file flags whether we already
+#      did this), AND
+#   2. A reachable host Chrome on this machine (discover_source
+#      returns something), AND
+#   3. An empty / near-empty History DB (profile hasn't been manually
+#      enriched by the user either).
+#
+# Keeps the dose small (30 days / 500 URLs by default) because:
+#   - We want VARIETY per profile — if 10 profiles all import my
+#     whole 90-day history they look like the same user 10×.
+#   - Smaller imports = less traffic + less forensic value if
+#     someone inspects the profile.
+#   - Chrome's own user telemetry on realistic browsing shows median
+#     daily visits around 30-60. 500 URLs over 30 days ≈ 17/day,
+#     normal for casual users.
+#
+# A per-profile RANDOM SEED (based on profile name) drives which
+# subset of the user's history is picked — so profile_01 gets a
+# different slice than profile_02 even when pointing at the same
+# source Chrome.
+
+_AUTO_ENRICH_SENTINEL = ".gs_auto_enriched"
+
+
+def auto_enrich_fresh_profile(
+    dest_profile: str,
+    profiles_root: str = "profiles",
+    max_days: int = 30,
+    max_urls: int = 500,
+    skip_sensitive: bool = True,
+    source_dir: str = None,
+) -> dict:
+    """One-shot auto-enrich for a freshly-created profile. Idempotent —
+    writes a sentinel file on success so subsequent runs are no-ops.
+
+    Why a sentinel (vs checking history row count): import could
+    legitimately run into 0 new rows (user's Chrome is itself empty).
+    Sentinel means "we tried" which is what we actually want to track.
+
+    Returns a dict with status and whatever import_all returned.
+    Never raises — failures are logged and returned as {"ok": False,
+    "reason": ...}.
+
+    Triggers:
+      - Called from ghost_shell_browser.start() AFTER Chrome's first
+        successful launch on a fresh profile folder. That timing
+        matters: Chrome creates its own History DB with the correct
+        schema, THEN we layer imported rows on top via
+        chrome_importer's Chrome-compatible schema.
+    """
+    dest_dir = os.path.join(profiles_root, dest_profile, "Default")
+    if not os.path.isdir(dest_dir):
+        return {"ok": False, "reason": "dest profile has no Default dir yet"}
+
+    sentinel = os.path.join(dest_dir, _AUTO_ENRICH_SENTINEL)
+    if os.path.exists(sentinel):
+        return {"ok": False, "reason": "already auto-enriched"}
+
+    # Find host Chrome
+    src = source_dir or discover_source()
+    if not src or not os.path.isdir(src):
+        # Create the sentinel anyway — retrying every run when host
+        # Chrome doesn't exist is wasteful. The sentinel only blocks
+        # FUTURE auto-enrich; user can still do manual import via
+        # dashboard regardless.
+        try:
+            with open(sentinel, "w") as f:
+                f.write("no host Chrome found on this machine\n")
+        except OSError:
+            pass
+        return {"ok": False, "reason": "no host Chrome detected"}
+
+    # Per-profile random variation: same profile name → same slice
+    # across runs (deterministic debug), different profile names →
+    # different slices.
+    import random as _r
+    prof_seed = sum(ord(c) for c in dest_profile)
+    rng = _r.Random(prof_seed)
+    # Randomize the actual dose a bit so profiles don't all have
+    # exactly the same URL count (another easy detection signal).
+    dose_urls = rng.randint(int(max_urls * 0.6), max_urls)
+    dose_days = rng.randint(max(7, max_days // 2), max_days)
+
+    logging.info(
+        f"[auto-enrich] fresh profile '{dest_profile}' detected, "
+        f"importing up to {dose_urls} URLs from last {dose_days} days "
+        f"of host Chrome at {src}"
+    )
+
+    try:
+        importer = ChromeImporter(
+            source_dir=src, dest_profile=dest_profile,
+            profiles_root=profiles_root
+        )
+        summary = importer.import_all(
+            days=dose_days,
+            skip_sensitive=skip_sensitive,
+            max_urls=dose_urls,
+        )
+        # Write sentinel so we don't re-run. File content is the
+        # summary for forensic value if user later inspects the
+        # profile.
+        try:
+            with open(sentinel, "w", encoding="utf-8") as f:
+                f.write(
+                    f"auto-enriched {datetime.now().isoformat()} from {src}\n"
+                    f"dose: {dose_urls} URLs, {dose_days} days\n"
+                    f"result: {summary}\n"
+                )
+        except OSError:
+            pass
+        return {"ok": True, "source": src, "summary": summary,
+                "dose_urls": dose_urls, "dose_days": dose_days}
+    except Exception as e:
+        logging.warning(f"[auto-enrich] failed: {type(e).__name__}: {e}")
+        # Still write sentinel — we don't want to retry every run on a
+        # persistently-broken source Chrome (e.g. locked in a way our
+        # WAL-safe copy can't handle).
+        try:
+            with open(sentinel, "w") as f:
+                f.write(f"auto-enrich attempted {datetime.now().isoformat()} "
+                        f"but failed: {e}\n")
+        except OSError:
+            pass
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}"}
+
+
+# ──────────────────────────────────────────────────────────────
 # CLI entry
 # ──────────────────────────────────────────────────────────────
 
