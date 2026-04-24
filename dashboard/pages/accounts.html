@@ -1,0 +1,263 @@
+<!--
+  Vault — encrypted storage for accounts, crypto wallets, API keys,
+  TOTP secrets, secure notes.
+
+  Three states driven by /api/vault/status:
+    1. not initialized → "Set a master password" onboarding
+    2. initialized but locked → "Unlock the vault" form
+    3. unlocked → full manager (filters, table, add/edit modal)
+-->
+<section class="vault-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🔐 Credential vault</div>
+      <div class="page-subtitle">
+        Encrypted storage for logins, crypto wallets, API keys, TOTP
+        secrets — everything that needs to stay off disk in plaintext.
+      </div>
+    </div>
+    <div class="vault-header-actions" id="vault-header-actions" style="display:none;">
+      <button class="btn btn-secondary btn-small" id="vault-lock-btn">🔒 Lock</button>
+    </div>
+  </div>
+
+  <!-- ═══ State 1: Set master password ═══════════════════════ -->
+  <div class="vault-state vault-setup" id="vault-setup" style="display: none;">
+    <div class="vault-setup-icon">🔑</div>
+    <div class="vault-setup-title">Set a master password</div>
+    <div class="vault-setup-hint">
+      This password encrypts everything you store here. It is <strong>never
+      written to disk</strong> — if you forget it, your secrets are gone.
+      There is no recovery. Pick something memorable but strong.
+    </div>
+    <div class="vault-setup-form">
+      <div class="form-group">
+        <label class="form-label">Master password</label>
+        <input type="password" class="input" id="vault-setup-pw1"
+               placeholder="min 4 characters, recommend a passphrase"
+               autocomplete="new-password">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Confirm master password</label>
+        <input type="password" class="input" id="vault-setup-pw2"
+               placeholder="type it again"
+               autocomplete="new-password">
+      </div>
+      <div class="dense-callout" style="margin-bottom: 14px;">
+        <span class="dense-callout-icon">⚠</span>
+        <div class="dense-callout-body">
+          <strong>We derive a Fernet key from this password with PBKDF2-HMAC-SHA256
+          (200k iterations)</strong>. Stored secrets can only be opened from a session
+          that knows the password. Nothing fancier than that — this is local-only,
+          not a cloud service.
+        </div>
+      </div>
+      <button class="btn btn-primary" id="vault-setup-submit">
+        🔒 Initialize vault
+      </button>
+      <div class="form-hint" id="vault-setup-error" style="color:#fca5a5; display:none;"></div>
+    </div>
+  </div>
+
+  <!-- ═══ State 2: Unlock ═══════════════════════════════════ -->
+  <div class="vault-state vault-unlock" id="vault-unlock" style="display: none;">
+    <div class="vault-setup-icon">🔒</div>
+    <div class="vault-setup-title">Vault is locked</div>
+    <div class="vault-setup-hint">
+      Enter your master password to decrypt stored secrets for this session.
+    </div>
+    <form class="vault-setup-form" id="vault-unlock-form">
+      <div class="form-group">
+        <label class="form-label">Master password</label>
+        <input type="password" class="input" id="vault-unlock-pw"
+               autofocus autocomplete="current-password">
+      </div>
+      <button class="btn btn-primary" id="vault-unlock-submit" type="submit">
+        🔓 Unlock
+      </button>
+      <div class="form-hint" id="vault-unlock-error" style="color:#fca5a5; display:none;"></div>
+      <details class="vault-danger-toggle">
+        <summary>Forgot your password?</summary>
+        <div class="vault-danger-body">
+          Lost master → lost secrets. There is no reset path that preserves data.
+          You can, however, wipe everything and start over:
+          <br><br>
+          <button class="btn btn-danger btn-small" id="vault-reset-btn">
+            🗑 Reset vault (destroys all encrypted data)
+          </button>
+        </div>
+      </details>
+    </form>
+  </div>
+
+  <!-- ═══ State 3: Manager ══════════════════════════════════ -->
+  <div class="vault-state vault-manager" id="vault-manager" style="display: none;">
+
+    <!-- Kind + status counters -->
+    <div class="dense-statbar">
+      <div class="dense-stat">
+        <div class="dense-stat-label">Total items</div>
+        <div class="dense-stat-value" id="vault-kpi-total">—</div>
+      </div>
+      <div class="dense-stat">
+        <div class="dense-stat-label">Accounts</div>
+        <div class="dense-stat-value" id="vault-kpi-accounts">—</div>
+      </div>
+      <div class="dense-stat">
+        <div class="dense-stat-label">Wallets</div>
+        <div class="dense-stat-value" id="vault-kpi-wallets">—</div>
+      </div>
+      <div class="dense-stat">
+        <div class="dense-stat-label">API keys</div>
+        <div class="dense-stat-value" id="vault-kpi-apikeys">—</div>
+      </div>
+      <div class="dense-stat">
+        <div class="dense-stat-label">Banned / Locked</div>
+        <div class="dense-stat-value" id="vault-kpi-blocked">—</div>
+      </div>
+    </div>
+
+    <!-- Filter bar -->
+    <div class="cmp-filter-bar">
+      <input type="text" class="input cmp-filter-search" id="vault-search"
+             placeholder="🔍  Search name, identifier, service, tag…">
+      <div class="cmp-period-picker" id="vault-kind-filter"
+           role="tablist" aria-label="Kind filter">
+        <button class="cmp-period-btn active" data-kind="">All</button>
+        <!-- kind-specific buttons injected by JS -->
+      </div>
+      <div class="cmp-filter-actions">
+        <button class="btn btn-primary" id="vault-add-btn">+ Add item</button>
+      </div>
+    </div>
+
+    <!-- Main table -->
+    <div class="dense-panel">
+      <div class="dense-table-wrap">
+        <table class="dense-table vault-table">
+          <thead>
+            <tr>
+              <th style="width: 36px;"></th>
+              <th class="col-kind" style="width: 140px;">Kind</th>
+              <th>Name</th>
+              <th class="col-id">Identifier</th>
+              <th class="col-service" style="width: 120px;">Service</th>
+              <th class="col-tags">Tags</th>
+              <th class="col-profile" style="width: 130px;">Profile</th>
+              <th class="col-status" style="width: 110px;">Status</th>
+              <th class="col-actions" style="width: 180px;"></th>
+            </tr>
+          </thead>
+          <tbody id="vault-tbody">
+            <tr><td colspan="9" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Add / Edit modal ══════════════════════════════════════ -->
+<div class="profile-modal" id="vault-edit-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="vault-edit-modal"></div>
+  <div class="profile-modal-content" style="width: 620px; max-height: 90vh;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title" id="vault-edit-title">Add vault item</div>
+      <button class="profile-modal-close" data-close="vault-edit-modal">×</button>
+    </div>
+    <div class="profile-modal-body" id="vault-edit-body">
+      <!-- Kind picker (hidden when editing) -->
+      <div class="form-group" id="vault-edit-kind-wrap">
+        <label class="form-label">Item kind</label>
+        <div class="vault-kind-grid" id="vault-kind-grid">
+          <!-- radios injected by JS -->
+        </div>
+      </div>
+
+      <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div class="form-group">
+          <label class="form-label">Name</label>
+          <input type="text" class="input" id="vault-f-name" placeholder="My Gmail">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Service (optional)</label>
+          <input type="text" class="input" id="vault-f-service"
+                 placeholder="google, binance, openai…">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" id="vault-f-ident-label">Identifier</label>
+        <input type="text" class="input" id="vault-f-identifier">
+        <div class="form-hint" id="vault-f-ident-hint"></div>
+      </div>
+
+      <!-- Dynamic secret fields — populated per-kind by JS -->
+      <div id="vault-f-secrets">
+        <!-- {label, input} pairs injected by JS -->
+      </div>
+
+      <!-- Custom-kind key/value editor — only visible when kind=custom -->
+      <div id="vault-f-custom-editor" style="display: none;">
+        <label class="form-label">Custom fields</label>
+        <div class="form-hint" style="margin-bottom: 6px;">
+          Add any key/value pairs. Values are all encrypted.
+        </div>
+        <div id="vault-f-custom-list"></div>
+        <button class="btn btn-secondary btn-small" id="vault-f-custom-add">+ Add field</button>
+      </div>
+
+      <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px;">
+        <div class="form-group">
+          <label class="form-label">Linked profile (optional)</label>
+          <select class="select" id="vault-f-profile">
+            <option value="">— none —</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Status</label>
+          <select class="select" id="vault-f-status">
+            <option value="active">Active</option>
+            <option value="banned">Banned</option>
+            <option value="locked">Locked</option>
+            <option value="needs_review">Needs review</option>
+            <option value="disabled">Disabled</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Tags (space- or comma-separated)</label>
+        <input type="text" class="input" id="vault-f-tags"
+               placeholder="marketing, hot, test">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Notes</label>
+        <textarea class="input dense-textarea" id="vault-f-notes"
+                  rows="3" placeholder="freeform text — encrypted along with secrets"></textarea>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="vault-edit-modal">Cancel</button>
+      <button class="btn btn-primary" id="vault-edit-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Reveal modal (decrypted view) ═════════════════════════ -->
+<div class="profile-modal" id="vault-reveal-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="vault-reveal-modal"></div>
+  <div class="profile-modal-content" style="width: 520px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title" id="vault-reveal-title">Decrypted secrets</div>
+      <button class="profile-modal-close" data-close="vault-reveal-modal">×</button>
+    </div>
+    <div class="profile-modal-body" id="vault-reveal-body">
+      <div class="muted">Loading…</div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="vault-reveal-modal">Close</button>
+    </div>
+  </div>
+</div>

@@ -431,6 +431,7 @@ const Profiles = {
     menu.innerHTML = `
       <div class="context-menu-item" data-action="setactive">★ Set as default</div>
       <div class="context-menu-item" data-action="view">🪪 Edit profile</div>
+      <div class="context-menu-item" data-action="fingerprint">🧬 Fingerprint…</div>
       <div class="context-menu-divider"></div>
       <div class="context-menu-item danger" data-action="delete">🗑 Delete profile</div>
     `;
@@ -446,9 +447,10 @@ const Profiles = {
       item.addEventListener("click", async () => {
         const action = item.dataset.action;
         menu.remove();
-        if (action === "setactive") await this.setActive(name);
-        if (action === "view")      this.viewDetail(name);
-        if (action === "delete")    await this.deleteProfile(name);
+        if (action === "setactive")    await this.setActive(name);
+        if (action === "view")         this.viewDetail(name);
+        if (action === "fingerprint")  this.openFingerprint(name);
+        if (action === "delete")       await this.deleteProfile(name);
       });
     });
 
@@ -481,6 +483,17 @@ const Profiles = {
     // Set as active so profile-detail.js picks it up, then navigate
     if (configCache.browser) configCache.browser.profile_name = name;
     navigate("profile");
+  },
+
+  // Context-menu shortcut — jumps to the Fingerprint editor pre-scoped
+  // to this profile. The editor reads ?profile=… from the hash on init,
+  // so setting the hash BEFORE navigate() makes it land on the right one.
+  // We don't regenerate here — the editor has three regen modes (full /
+  // template-only / reshuffle) and a self-test tab, which is the right
+  // place to make that choice rather than silently rolling a new fp.
+  openFingerprint(name) {
+    location.hash = `#fingerprint?profile=${encodeURIComponent(name)}`;
+    navigate("fingerprint");
   },
 
   async deleteProfile(name) {

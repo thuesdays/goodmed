@@ -15,7 +15,9 @@ const PAGES = {
   // row clicks rather than a sidebar slot. Hash may include ?profile=foo
   // to preselect a profile.
   fingerprint: { html: "/pages/fingerprint.html", init: () => FingerprintPage.init() },
-  competitors: { html: "/pages/competitors.html", init: () => Competitors.init() },
+  session:     { html: "/pages/session.html",     init: () => SessionPage.init(),     teardown: () => SessionPage.teardown?.() },
+  accounts:    { html: "/pages/accounts.html",    init: () => VaultPage.init() },
+  competitors: { html: "/pages/competitors.html", init: () => Competitors.init(), teardown: () => Competitors.teardown?.() },
   behavior:    { html: "/pages/behavior.html",    init: () => Behavior.init() },
   // "Scripts" page (was "Actions") — pipeline/script builder
   scripts:     { html: "/pages/scripts.html",     init: () => ScriptsPage.init() },

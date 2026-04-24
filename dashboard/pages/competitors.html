@@ -1,79 +1,168 @@
+<!--
+  Competitors — ad-intel dashboard.
+  Layout:
+    page-header       · title + filter bar (search / period / export)
+    KPI strip         · total, unique, new, active, quieting
+    Trend panel       · line chart, top N competitors over the window
+    Tabs              · By domain | By query | Recent ads
+      By domain       · main table with activity badges, sparkline, expandable rows + inline actions
+      By query        · share-of-voice bars per query
+      Recent ads      · raw feed of the latest observations
+-->
 <section class="competitors-workspace">
   <div class="page-header">
     <div>
-      <div class="page-title">Competitors</div>
+      <div class="page-title">🏢 Competitors</div>
       <div class="page-subtitle">
-        Advertisers seen across all your monitored queries.
+        Advertisers observed across all monitored queries.
+        Expand a row for per-ad detail, or use inline actions to
+        push a domain into your Domains lists.
       </div>
     </div>
   </div>
 
-  <!-- Inline stats bar — replaces the old .stats-grid card row -->
+  <!-- ═══ Filter bar ═══════════════════════════════════════ -->
+  <div class="cmp-filter-bar">
+    <input type="text" class="input cmp-filter-search" id="cmp-filter-search"
+           placeholder="🔍  Search domain or ad title…">
+    <div class="cmp-period-picker" role="tablist" aria-label="Period">
+      <button class="cmp-period-btn" data-days="1">24h</button>
+      <button class="cmp-period-btn active" data-days="7">7d</button>
+      <button class="cmp-period-btn" data-days="30">30d</button>
+      <button class="cmp-period-btn" data-days="0">All</button>
+    </div>
+    <div class="cmp-filter-actions">
+      <button class="btn btn-secondary btn-small" id="cmp-export-csv"
+              title="Download current filter as CSV">📤 CSV</button>
+      <button class="btn btn-secondary btn-small" id="cmp-export-json"
+              title="Download current filter as JSON">{} JSON</button>
+    </div>
+  </div>
+
+  <!-- ═══ KPI strip ═══════════════════════════════════════ -->
   <div class="dense-statbar">
     <div class="dense-stat">
-      <div class="dense-stat-label">Total records</div>
-      <div class="dense-stat-value" id="comp-total">—</div>
+      <div class="dense-stat-label">Records</div>
+      <div class="dense-stat-value" id="cmp-kpi-records">—</div>
+      <div class="dense-stat-sub" id="cmp-kpi-records-sub">in selected period</div>
     </div>
     <div class="dense-stat">
       <div class="dense-stat-label">Unique domains</div>
-      <div class="dense-stat-value" id="comp-domains">—</div>
+      <div class="dense-stat-value" id="cmp-kpi-domains">—</div>
+      <div class="dense-stat-sub" id="cmp-kpi-domains-sub">all time: —</div>
     </div>
     <div class="dense-stat">
-      <div class="dense-stat-label">Actions performed</div>
-      <div class="dense-stat-value" id="comp-actions">—</div>
-      <div class="dense-stat-sub" id="comp-actions-sub">—</div>
+      <div class="dense-stat-label">New <span class="cmp-badge cmp-badge-new" style="margin-left: 4px;">7d</span></div>
+      <div class="dense-stat-value" id="cmp-kpi-new">—</div>
+      <div class="dense-stat-sub">first seen this week</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Active <span class="cmp-badge cmp-badge-active" style="margin-left: 4px;">3d</span></div>
+      <div class="dense-stat-value" id="cmp-kpi-active">—</div>
+      <div class="dense-stat-sub">seen in last 3 days</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Quieting <span class="cmp-badge cmp-badge-quieting" style="margin-left: 4px;">&gt;14d</span></div>
+      <div class="dense-stat-value" id="cmp-kpi-quieting">—</div>
+      <div class="dense-stat-sub">no impression in 14+ days</div>
     </div>
   </div>
 
-  <!-- Top advertisers -->
+  <!-- ═══ Trend chart ═════════════════════════════════════ -->
   <div class="dense-panel">
     <div class="dense-panel-header">
-      <div class="dense-panel-title">By domain</div>
-      <div class="dense-panel-hint">aggregated view, top advertisers first</div>
-    </div>
-    <div class="dense-table-wrap">
-      <table class="dense-table competitors-table">
-        <thead>
-          <tr>
-            <th class="col-domain">Domain</th>
-            <th class="col-num">Mentions</th>
-            <th class="col-num"
-                title="Post-click actions performed — clicks, visits, etc.">Actions</th>
-            <th class="col-queries">Matched queries</th>
-            <th class="col-when">First seen</th>
-            <th class="col-when">Last seen</th>
-          </tr>
-        </thead>
-        <tbody id="competitors-tbody">
-          <tr><td colspan="6" class="dense-empty-cell">Loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Recent records -->
-  <div class="dense-panel">
-    <div class="dense-panel-header">
-      <div class="dense-panel-title">
-        Recent records
-        <span class="dense-panel-badge" id="recent-badge">0</span>
+      <div class="dense-panel-title">📈 Volume trend
+        <span class="dense-panel-hint">top competitors by mentions in the selected period</span>
       </div>
-      <div class="dense-panel-hint">last ads observed, newest first</div>
+      <div style="display: flex; gap: 4px;">
+        <button class="cmp-trend-btn active"   data-trend="line">Line</button>
+        <button class="cmp-trend-btn"          data-trend="stacked">Stacked</button>
+      </div>
     </div>
-    <div class="dense-table-wrap">
-      <table class="dense-table competitors-table">
-        <thead>
-          <tr>
-            <th class="col-when" style="width: 110px;">Time</th>
-            <th class="col-query">Query</th>
-            <th class="col-domain">Domain</th>
-            <th class="col-url">Google click URL</th>
-          </tr>
-        </thead>
-        <tbody id="recent-tbody">
-          <tr><td colspan="4" class="dense-empty-cell">Loading…</td></tr>
-        </tbody>
-      </table>
+    <div class="dense-panel-body cmp-chart-wrap">
+      <canvas id="cmp-trend-chart" height="180"></canvas>
+      <div class="cmp-chart-empty" id="cmp-chart-empty" style="display:none;">
+        Not enough data in this period yet.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tabs ════════════════════════════════════════════ -->
+  <div class="fp-tabs" id="cmp-tabs">
+    <div class="fp-tab active" data-tab="by-domain">
+      <span class="fp-tab-label">By domain</span>
+      <span class="fp-tab-badge" id="cmp-tab-domain-badge">—</span>
+    </div>
+    <div class="fp-tab" data-tab="by-query">
+      <span class="fp-tab-label">By query</span>
+      <span class="fp-tab-badge" id="cmp-tab-query-badge">—</span>
+    </div>
+    <div class="fp-tab" data-tab="recent">
+      <span class="fp-tab-label">Recent ads</span>
+      <span class="fp-tab-badge" id="cmp-tab-recent-badge">—</span>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: By domain ══════════════════════════════════ -->
+  <div class="fp-tabpane active" data-tabpane="by-domain">
+    <div class="dense-panel">
+      <div class="dense-table-wrap">
+        <table class="dense-table cmp-table">
+          <thead>
+            <tr>
+              <th style="width: 20px;"></th>
+              <th class="col-domain">Domain</th>
+              <th class="col-status">Status</th>
+              <th class="col-num num">Mentions</th>
+              <th class="col-trend">7-day trend</th>
+              <th class="col-num num">Actions</th>
+              <th class="col-num num">Queries</th>
+              <th class="col-when">Last seen</th>
+              <th class="col-actions" style="width: 180px;">Add to list</th>
+            </tr>
+          </thead>
+          <tbody id="cmp-tbody">
+            <tr><td colspan="9" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: By query ═══════════════════════════════════ -->
+  <div class="fp-tabpane" data-tabpane="by-query">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Share of voice</div>
+        <span class="dense-panel-hint">
+          For each query, the split between advertisers you\'ve seen.
+        </span>
+      </div>
+      <div class="cmp-byquery-list" id="cmp-byquery-list">
+        <div class="dense-empty" style="padding: 32px 20px;">Loading…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: Recent ads ═════════════════════════════════ -->
+  <div class="fp-tabpane" data-tabpane="recent">
+    <div class="dense-panel">
+      <div class="dense-table-wrap">
+        <table class="dense-table cmp-recent-table">
+          <thead>
+            <tr>
+              <th class="col-when" style="width: 140px;">Time</th>
+              <th class="col-query">Query</th>
+              <th class="col-domain">Domain</th>
+              <th class="col-title">Title</th>
+              <th class="col-url">Click URL</th>
+            </tr>
+          </thead>
+          <tbody id="cmp-recent-tbody">
+            <tr><td colspan="5" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </section>

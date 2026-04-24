@@ -1,28 +1,36 @@
+<!--
+  Scheduler — per-profile / group monitoring schedule.
+
+  Sections:
+    page-header      · title + live action buttons
+    Status strip     · 4 KPIs (status, runs today, next run, last profile)
+    Profiles panel   · filterable cards with bulk-select actions
+    Group panel      · card picker for "run the whole group"
+    Schedule panel   · tabbed (Simple | Interval | Cron) + active days
+    Failure handling · the existing backoff config
+-->
 <section class="scheduler-workspace">
   <div class="page-header">
     <div>
-      <div class="page-title">Scheduler</div>
+      <div class="page-title">🕰 Scheduler</div>
       <div class="page-subtitle">
-        Automatic monitoring runs across selected profiles.
+        Automatic monitoring runs across selected profiles — on your
+        schedule, or a custom cron expression if you need precise control.
       </div>
     </div>
     <div class="scheduler-header-actions">
       <button class="btn btn-secondary" id="sched-refresh-btn">↻ Refresh</button>
       <button class="btn btn-secondary" id="sched-reap-btn"
-              title="Force-kill stale runs and clear stuck scheduler state. Safe to click anytime.">
+              title="Force-kill stale runs and clear stuck scheduler state.">
         🧹 Clean zombies
       </button>
-      <button class="btn btn-primary" id="sched-start-btn">
-        ▶ Start scheduler
-      </button>
+      <button class="btn btn-primary" id="sched-start-btn">▶ Start scheduler</button>
       <button class="btn btn-secondary btn-danger" id="sched-stop-btn"
-              style="display:none;">
-        ■ Stop scheduler
-      </button>
+              style="display:none;">■ Stop scheduler</button>
     </div>
   </div>
 
-  <!-- Live status bar — 4 inline stats with health pill -->
+  <!-- ═══ Status strip ════════════════════════════════════ -->
   <div class="dense-statbar">
     <div class="dense-stat">
       <div class="dense-stat-label">
@@ -39,152 +47,277 @@
     </div>
     <div class="dense-stat">
       <div class="dense-stat-label">Next run</div>
-      <div class="dense-stat-value" id="sched-next-run"
-           style="font-size: 16px;">—</div>
+      <div class="dense-stat-value" id="sched-next-run" style="font-size: 16px;">—</div>
       <div class="dense-stat-sub" id="sched-next-in">—</div>
     </div>
     <div class="dense-stat">
       <div class="dense-stat-label">Last profile</div>
-      <div class="dense-stat-value" id="sched-last-profile"
-           style="font-size: 14px;">—</div>
+      <div class="dense-stat-value" id="sched-last-profile" style="font-size: 14px;">—</div>
     </div>
   </div>
 
-  <!-- Profile selection -->
+  <!-- ═══ Profiles panel ══════════════════════════════════ -->
   <div class="dense-panel">
     <div class="dense-panel-header">
       <div class="dense-panel-title">
-        Profiles to cycle through
+        👤 Profiles to cycle through
         <span class="dense-panel-badge" id="sched-profile-count">0</span>
       </div>
       <div class="dense-panel-hint">
-        check profiles to include, or leave empty to use the active profile
+        Check profiles to include. Empty selection = fall back to the
+        default active profile.
       </div>
     </div>
     <div class="dense-panel-body">
-      <div id="sched-profiles-list"
-           style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 6px;">
+
+      <!-- Search + bulk actions toolbar -->
+      <div class="sched-profile-toolbar">
+        <input type="text" class="input sched-profile-search" id="sched-profile-search"
+               placeholder="🔍  Filter by name, tag, or status…">
+        <div class="sched-bulk">
+          <button class="btn btn-secondary btn-small" data-bulk="all"     id="sched-bulk-all">All</button>
+          <button class="btn btn-secondary btn-small" data-bulk="none"    id="sched-bulk-none">None</button>
+          <button class="btn btn-secondary btn-small" data-bulk="invert"  id="sched-bulk-invert">Invert</button>
+          <button class="btn btn-secondary btn-small" data-bulk="healthy" id="sched-bulk-healthy"
+                  title="Select only profiles with no active blocks">✓ Healthy</button>
+        </div>
       </div>
-      <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
-        <label class="form-label">Selection mode</label>
-        <select class="select" data-config="scheduler.selection_mode"
-                style="max-width: 260px;">
-          <option value="random">Random (more natural)</option>
-          <option value="round-robin">Round-robin (even distribution)</option>
-        </select>
+
+      <!-- Profile cards — filled by scheduler.js -->
+      <div class="sched-profile-grid" id="sched-profiles-list">
+        <div class="dense-empty" style="grid-column: 1/-1;">Loading profiles…</div>
+      </div>
+
+      <!-- Selection-mode chip pair -->
+      <div class="sched-selection-mode">
+        <label class="form-label">Selection order</label>
+        <div class="sched-chip-picker" id="sched-selection-mode">
+          <label class="sched-chip">
+            <input type="radio" name="sched-sel-mode" value="random"
+                   data-config="scheduler.selection_mode">
+            <span>🎲 Random</span>
+            <small>more natural, avoids predictability</small>
+          </label>
+          <label class="sched-chip">
+            <input type="radio" name="sched-sel-mode" value="round-robin"
+                   data-config="scheduler.selection_mode">
+            <span>🔁 Round-robin</span>
+            <small>even distribution across all picked profiles</small>
+          </label>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ═══ Group panel ═════════════════════════════════════ -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">📁 Run as group <span class="muted">(optional)</span></div>
+      <div class="dense-panel-hint">
+        Overrides profile cycling — fires every group member per iteration.
+      </div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="dense-hint" style="margin-bottom: 12px;">
+        Useful for campaigns like <em>"run all 20 accounts every 3 hours"</em>.
+        When a group is selected, cycling above is ignored.
+      </div>
+
+      <!-- Card picker — includes special "None" card -->
+      <div class="sched-group-grid" id="sched-group-list">
+        <div class="dense-empty" style="grid-column: 1/-1;">Loading groups…</div>
+      </div>
+
+      <div class="sched-group-mode" id="sched-group-mode-row" style="display: none;">
+        <label class="form-label">Launch mode</label>
+        <div class="sched-chip-picker">
+          <label class="sched-chip">
+            <input type="radio" name="sched-group-mode" value="parallel"
+                   data-config="scheduler.group_mode">
+            <span>⚡ Parallel</span>
+            <small>all N Chromes at once — fastest, needs N× RAM</small>
+          </label>
+          <label class="sched-chip">
+            <input type="radio" name="sched-group-mode" value="serial"
+                   data-config="scheduler.group_mode">
+            <span>↻ Serial</span>
+            <small>one-by-one — gentle on resources</small>
+          </label>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- Group trigger (optional) -->
+  <!-- ═══ Schedule panel (tabbed) ═════════════════════════ -->
   <div class="dense-panel">
     <div class="dense-panel-header">
-      <div class="dense-panel-title">Run as group (optional)</div>
-      <div class="dense-panel-hint">
-        overrides profile cycling when set
-      </div>
+      <div class="dense-panel-title">⏱ Schedule</div>
+      <div class="dense-panel-hint">Pick a mode — Simple for most, Cron for precise control.</div>
     </div>
     <div class="dense-panel-body">
-      <div class="dense-hint">
-        Launch a whole Profile Group at once per iteration, instead of
-        cycling through profiles one at a time. Useful for "run all 20
-        Facebook profiles every 3 hours" style campaigns.
-        Leave empty for the old single-profile-per-iteration behavior.
+
+      <!-- Mode tabs -->
+      <div class="sched-mode-tabs" id="sched-mode-tabs" role="tablist">
+        <button class="sched-mode-tab active" data-mode="density"
+                title="Spread N runs across your active window with jitter">
+          <div class="sched-mode-tab-label">🎯 Simple</div>
+          <div class="sched-mode-tab-desc">density-based, best for organic patterns</div>
+        </button>
+        <button class="sched-mode-tab" data-mode="interval"
+                title="Fixed gap between runs">
+          <div class="sched-mode-tab-label">⏲ Interval</div>
+          <div class="sched-mode-tab-desc">fixed wait between runs</div>
+        </button>
+        <button class="sched-mode-tab" data-mode="cron"
+                title="Full cron expression — advanced">
+          <div class="sched-mode-tab-label">{} Cron</div>
+          <div class="sched-mode-tab-desc">precise control — minute/hour/dow</div>
+        </button>
       </div>
-      <div class="input-row">
-        <div class="form-group">
-          <label class="form-label">Group to run</label>
-          <select class="select" id="sched-group-select"
-                  data-config="scheduler.group_id">
-            <option value="">— none (cycle profiles instead) —</option>
-          </select>
+
+      <!-- ─ Simple / density mode ─────────────────────── -->
+      <div class="sched-mode-pane" data-mode-pane="density">
+        <div class="input-row-3">
+          <div class="form-group">
+            <label class="form-label">Runs per day</label>
+            <input type="number" class="input" data-config="scheduler.target_runs_per_day"
+                   min="1" max="500">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Active hour start</label>
+            <input type="number" class="input" data-config="scheduler.active_hours.0"
+                   min="0" max="23">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Active hour end</label>
+            <input type="number" class="input" data-config="scheduler.active_hours.1"
+                   min="1" max="24">
+          </div>
         </div>
+        <div class="input-row-3">
+          <div class="form-group">
+            <label class="form-label">Min gap (sec)</label>
+            <input type="number" class="input" data-config="scheduler.min_interval_sec" min="30">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Max gap (sec)</label>
+            <input type="number" class="input" data-config="scheduler.max_interval_sec" min="60">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Extra jitter (%)</label>
+            <input type="number" class="input" data-config="scheduler.jitter_percent"
+                   min="0" max="100">
+          </div>
+        </div>
+        <div class="form-hint">
+          Base interval = <code>remaining_window ÷ remaining_runs</code>. Gets
+          50–150% base randomization plus your extra <code>±jitter%</code>.
+          With 30 runs between 07:00–20:00 avg gap ~26min; with 25% jitter
+          each actual gap lands 10–60min.
+        </div>
+      </div>
+
+      <!-- ─ Interval mode ─────────────────────────────── -->
+      <div class="sched-mode-pane" data-mode-pane="interval" style="display: none;">
+        <div class="input-row">
+          <div class="form-group" style="max-width: 220px;">
+            <label class="form-label">Every N seconds</label>
+            <input type="number" class="input" id="sched-interval-sec"
+                   data-config="scheduler.interval_sec" min="30" value="600">
+            <div class="form-hint" id="sched-interval-human">— / —</div>
+          </div>
+          <div class="form-group" style="max-width: 140px;">
+            <label class="form-label">Start hour</label>
+            <input type="number" class="input" data-config="scheduler.active_hours.0"
+                   min="0" max="23">
+          </div>
+          <div class="form-group" style="max-width: 140px;">
+            <label class="form-label">End hour</label>
+            <input type="number" class="input" data-config="scheduler.active_hours.1"
+                   min="1" max="24">
+          </div>
+        </div>
+        <div class="form-hint">
+          Fires every N seconds, but only within the active window. Consecutive
+          failures still trigger the exponential backoff configured below.
+        </div>
+      </div>
+
+      <!-- ─ Cron mode ─────────────────────────────────── -->
+      <div class="sched-mode-pane" data-mode-pane="cron" style="display: none;">
         <div class="form-group">
-          <label class="form-label">Launch mode</label>
-          <select class="select" data-config="scheduler.group_mode">
-            <option value="parallel">Parallel — spawn all at once</option>
-            <option value="serial">Serial — run one by one</option>
-          </select>
-          <div class="form-hint">
-            Parallel fires all N Chrome instances simultaneously —
-            faster but needs N× RAM. Serial is gentler on resources.
+          <label class="form-label">Cron expression <span class="muted">(5-field: m h dom mon dow)</span></label>
+          <input type="text" class="input sched-cron-input" id="sched-cron-expr"
+                 data-config="scheduler.cron_expression"
+                 placeholder="*/15 7-20 * * 1-5"
+                 spellcheck="false">
+          <div class="form-hint" id="sched-cron-error" style="color: #fca5a5; display: none;"></div>
+        </div>
+        <div class="sched-cron-presets">
+          <span class="muted" style="font-size: 11px; margin-right: 4px;">Quick presets:</span>
+          <button class="sched-cron-preset" data-cron="*/15 * * * *">every 15 min</button>
+          <button class="sched-cron-preset" data-cron="0 * * * *">every hour</button>
+          <button class="sched-cron-preset" data-cron="0 */2 * * *">every 2 hours</button>
+          <button class="sched-cron-preset" data-cron="0 9,12,15,18 * * *">4×/day</button>
+          <button class="sched-cron-preset" data-cron="0 9-17 * * 1-5">hourly, Mon–Fri business</button>
+          <button class="sched-cron-preset" data-cron="*/30 8-22 * * *">every 30 min, 8am–10pm</button>
+        </div>
+
+        <div class="sched-cron-preview" id="sched-cron-preview" style="margin-top: 12px;">
+          <div class="sched-cron-preview-label">Next 5 runs</div>
+          <ul class="sched-cron-preview-list" id="sched-cron-preview-list">
+            <li class="muted">Type an expression to see preview…</li>
+          </ul>
+        </div>
+
+        <div class="dense-callout" style="margin-top: 12px;">
+          <span class="dense-callout-icon">ℹ</span>
+          <div class="dense-callout-body">
+            <strong>Supported:</strong>
+            <code>*</code>, <code>*/N</code>, <code>N-M</code>,
+            <code>N,M</code>, <code>N-M/S</code> · 5 fields: minute,
+            hour, day-of-month, month, day-of-week (Sun=0). Day-of-week
+            0 and 7 both mean Sunday.
           </div>
         </div>
       </div>
+
+      <!-- Active days of week — applies to ALL modes -->
+      <div class="sched-days-block">
+        <label class="form-label">Active days of week</label>
+        <div class="sched-days-chips" id="sched-days-chips">
+          <!-- populated by JS -->
+        </div>
+        <div class="form-hint">
+          Leave all enabled for everyday runs. Great for "weekdays only"
+          or "weekends only" patterns.
+        </div>
+      </div>
+
     </div>
   </div>
 
-  <!-- Schedule timing -->
+  <!-- ═══ Failure handling ════════════════════════════════ -->
   <div class="dense-panel">
     <div class="dense-panel-header">
-      <div class="dense-panel-title">Schedule</div>
-    </div>
-    <div class="dense-panel-body">
-      <div class="input-row-3">
-        <div class="form-group">
-          <label class="form-label">Runs per day</label>
-          <input type="number" class="input"
-                 data-config="scheduler.target_runs_per_day" min="1" max="500">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Active hour start</label>
-          <input type="number" class="input"
-                 data-config="scheduler.active_hours.0" min="0" max="23">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Active hour end</label>
-          <input type="number" class="input"
-                 data-config="scheduler.active_hours.1" min="1" max="24">
-        </div>
-      </div>
-      <div class="input-row-3">
-        <div class="form-group">
-          <label class="form-label">Min gap (sec)</label>
-          <input type="number" class="input"
-                 data-config="scheduler.min_interval_sec" min="30">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Max gap (sec)</label>
-          <input type="number" class="input"
-                 data-config="scheduler.max_interval_sec" min="60">
-        </div>
-        <div class="form-group">
-          <label class="form-label">Extra jitter (%)</label>
-          <input type="number" class="input"
-                 data-config="scheduler.jitter_percent" min="0" max="100">
-        </div>
-      </div>
-      <div class="form-hint">
-        Base interval = remaining time in window / remaining runs. It gets a
-        50–150% base randomization, then an extra <code>±jitter%</code> on top.
-        With 30 runs between 07:00–20:00 the average gap is ~26 min; with 25%
-        extra jitter each actual gap lands in ~10 min – 60 min.
-      </div>
-    </div>
-  </div>
-
-  <!-- Failure handling -->
-  <div class="dense-panel">
-    <div class="dense-panel-header">
-      <div class="dense-panel-title">Failure handling</div>
+      <div class="dense-panel-title">💥 Failure handling</div>
     </div>
     <div class="dense-panel-body">
       <div class="input-row">
         <div class="form-group">
           <label class="form-label">Max consecutive fails</label>
-          <input type="number" class="input"
-                 data-config="scheduler.max_consecutive_fails" min="1">
+          <input type="number" class="input" data-config="scheduler.max_consecutive_fails" min="1">
         </div>
         <div class="form-group">
           <label class="form-label">Long pause (sec) after threshold</label>
-          <input type="number" class="input"
-                 data-config="scheduler.fail_pause_sec" min="60">
+          <input type="number" class="input" data-config="scheduler.fail_pause_sec" min="60">
         </div>
       </div>
       <div class="form-hint">
-        After N consecutive runs exit with non-zero code, scheduler sleeps
-        for the long pause duration. Between 1 and N-1 consecutive fails an
-        exponential backoff (×2, ×4, ×8…) is applied to the interval.
+        After N consecutive runs exit non-zero, scheduler sleeps for the long
+        pause duration. Between 1 and N-1 failures an exponential backoff
+        (×2, ×4, ×8…) applies to the interval.
       </div>
     </div>
   </div>

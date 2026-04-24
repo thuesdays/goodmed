@@ -1,0 +1,333 @@
+<!--
+  Session & cookies manager — consolidated page for everything
+  that touches a profile's cookies + session state.
+
+  Layout:
+    page-header  · profile selector, session summary strip
+    4-tab body   · Warmup / Cookies / Snapshots / Chrome-import
+
+  Replaces the two cards that used to live on the profile detail
+  page (Chrome history import + Cookies table). The profile page
+  now shows only a summary card pointing here.
+-->
+<section class="session-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">🍪 Session & cookies</div>
+      <div class="page-subtitle">
+        Warmup robot, cookie pool, Chrome import — everything that
+        shapes the profile's identity to websites lives here.
+      </div>
+    </div>
+  </div>
+
+  <!-- Empty state — replaces the whole workspace when no profiles
+       exist. Shown once populateProfileSelector finds zero profiles. -->
+  <div class="session-empty-state" id="session-empty-state" style="display: none;">
+    <div class="session-empty-icon">🙅</div>
+    <div class="session-empty-title">No profiles yet</div>
+    <div class="session-empty-hint">
+      Session management works per-profile. Create at least one profile
+      first, then come back here to warm it up and manage its cookies.
+    </div>
+    <a href="#" data-nav="profiles" class="btn btn-primary">
+      Create a profile →
+    </a>
+  </div>
+
+  <!-- Main 2-col layout: profile nav on the left, content on the
+       right. Mirrors the Fingerprint page's template picker pattern
+       so navigation feels consistent across the app. -->
+  <div class="session-layout" id="session-layout">
+
+    <!-- ═══ Profile nav ═══════════════════════════════════════ -->
+    <aside class="session-profile-nav">
+      <div class="session-profile-nav-header">
+        <span>Profiles</span>
+        <span class="session-profile-count" id="session-profile-count">0</span>
+      </div>
+      <div class="session-profile-list" id="session-profile-list">
+        <div class="dense-empty" style="padding: 16px 12px;">Loading…</div>
+      </div>
+    </aside>
+
+    <!-- ═══ Main content column ═══════════════════════════════ -->
+    <div class="session-content" id="session-content">
+
+  <!-- ═══ Summary strip ═══════════════════════════════════════ -->
+  <div class="dense-statbar" id="session-statbar">
+    <div class="dense-stat">
+      <div class="dense-stat-label">Last warmup</div>
+      <div class="dense-stat-value" id="stat-last-warmup">—</div>
+      <div class="dense-stat-sub" id="stat-last-warmup-sub">never run</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Warmup status</div>
+      <div class="dense-stat-value" id="stat-warmup-status">—</div>
+      <div class="dense-stat-sub" id="stat-warmup-status-sub"></div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Cookie snapshots</div>
+      <div class="dense-stat-value" id="stat-snapshots">—</div>
+      <div class="dense-stat-sub" id="stat-snapshots-sub">in pool</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Pool cookies</div>
+      <div class="dense-stat-value" id="stat-pool-cookies">—</div>
+      <div class="dense-stat-sub" id="stat-pool-bytes">—</div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab bar ═════════════════════════════════════════════ -->
+  <div class="fp-tabs" id="session-tabs">
+    <div class="fp-tab active" data-tab="warmup">
+      <span class="fp-tab-label">🔥 Warmup robot</span>
+    </div>
+    <div class="fp-tab" data-tab="cookies">
+      <span class="fp-tab-label">🍪 Cookies</span>
+      <span class="fp-tab-badge" id="sess-tab-cookies-badge">—</span>
+    </div>
+    <div class="fp-tab" data-tab="snapshots">
+      <span class="fp-tab-label">💾 Snapshots</span>
+      <span class="fp-tab-badge" id="sess-tab-snapshots-badge">—</span>
+    </div>
+    <div class="fp-tab" data-tab="import">
+      <span class="fp-tab-label">📥 Chrome import</span>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: WARMUP ═════════════════════════════════════════ -->
+  <div class="fp-tabpane active" data-tabpane="warmup">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Run warmup</div>
+        <div class="dense-panel-hint">
+          Launches Chromium with this profile, visits realistic sites,
+          accepts cookie banners, dwells. Takes ~2–5 minutes.
+        </div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="session-warmup-form">
+          <div class="form-group">
+            <label class="form-label">Preset</label>
+            <div class="session-preset-grid" id="session-preset-grid">
+              <div class="dense-empty" style="grid-column: 1/-1;">Loading presets…</div>
+            </div>
+          </div>
+          <div class="session-warmup-row">
+            <div class="form-group" style="max-width: 180px;">
+              <label class="form-label">Site count</label>
+              <input type="number" class="input" id="session-warmup-sites"
+                     min="2" max="15" value="7">
+              <div class="form-hint">How many sites from the preset to visit.</div>
+            </div>
+            <button class="btn btn-primary" id="session-warmup-run-btn">
+              ▶ Run warmup now
+            </button>
+            <div id="session-warmup-live" class="session-warmup-live" style="display:none;">
+              <div class="spinner-sm"></div>
+              <div class="session-warmup-live-text">
+                <div id="session-warmup-live-title">Starting…</div>
+                <div id="session-warmup-live-sub" class="muted"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Warmup history</div>
+        <span class="dense-panel-hint">
+          Every past warmup for this profile. Click a row to see per-site details.
+        </span>
+      </div>
+      <div class="dense-table-wrap">
+        <table class="dense-table session-warmup-table">
+          <thead>
+            <tr>
+              <th class="col-when">Started</th>
+              <th class="col-preset">Preset</th>
+              <th class="col-trigger">Trigger</th>
+              <th class="col-sites num">Sites</th>
+              <th class="col-duration num">Duration</th>
+              <th class="col-status">Status</th>
+              <th class="col-notes">Notes</th>
+            </tr>
+          </thead>
+          <tbody id="session-warmup-tbody">
+            <tr><td colspan="7" class="dense-empty-cell">No warmups yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: COOKIES ════════════════════════════════════════ -->
+  <div class="fp-tabpane" data-tabpane="cookies">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">
+          Live cookies — persisted for next run
+          <span class="dense-panel-hint" id="sess-cookies-hint"></span>
+        </div>
+        <div style="display: flex; gap: 6px;">
+          <button class="btn btn-secondary btn-small" id="sess-cookies-reload">↻ Reload</button>
+          <button class="btn btn-secondary btn-small" id="sess-cookies-import">📥 Import…</button>
+          <button class="btn btn-secondary btn-small" id="sess-cookies-export">📤 Export</button>
+          <button class="btn btn-danger btn-small" id="sess-cookies-clear">🗑 Clear all</button>
+        </div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="form-hint" style="margin-bottom: 8px;">
+          Cookies stored for this profile's next run. Imported values take
+          effect on <strong>next start</strong> — if the profile is currently
+          running, Chrome's own in-memory state wins until it closes.
+        </div>
+        <input type="text" class="input sess-cookies-filter" id="sess-cookies-filter"
+               placeholder="filter by name or domain…">
+        <div class="dense-table-wrap">
+          <table class="dense-table session-cookies-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Domain</th>
+                <th>Value</th>
+                <th class="col-when">Expires</th>
+                <th>Flags</th>
+                <th class="col-actions" style="width: 40px;"></th>
+              </tr>
+            </thead>
+            <tbody id="sess-cookies-tbody">
+              <tr><td colspan="6" class="dense-empty-cell">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: SNAPSHOTS ══════════════════════════════════════ -->
+  <div class="fp-tabpane" data-tabpane="snapshots">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Cookie pool — session resurrection</div>
+        <div class="dense-panel-hint">
+          Every clean run auto-snapshots cookies. Restore a past
+          snapshot if the current session starts hitting captchas.
+        </div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="dense-callout" style="margin-bottom: 12px;">
+          <span class="dense-callout-icon">ℹ</span>
+          <div class="dense-callout-body">
+            Restore queues a cookie injection for the <strong>next browser
+            launch</strong> of this profile — not an immediate in-place
+            swap. Stop any active run first.
+          </div>
+        </div>
+        <div class="dense-table-wrap">
+          <table class="dense-table session-snapshots-table">
+            <thead>
+              <tr>
+                <th class="col-when">Created</th>
+                <th class="col-trigger">Trigger</th>
+                <th class="col-num num">Cookies</th>
+                <th class="col-num num">Domains</th>
+                <th class="col-bytes num">Bytes</th>
+                <th class="col-reason">Reason</th>
+                <th class="col-actions" style="width: 180px;"></th>
+              </tr>
+            </thead>
+            <tbody id="sess-snapshots-tbody">
+              <tr><td colspan="7" class="dense-empty-cell">No snapshots yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Tab: CHROME IMPORT ══════════════════════════════════ -->
+  <div class="fp-tabpane" data-tabpane="import">
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">Warm up from real Chrome</div>
+        <div class="dense-panel-hint">
+          — one-off import of history, bookmarks, preferences
+        </div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="form-hint" style="margin-bottom: 12px;">
+          Copy real browsing history from your own Chrome install into
+          this profile. Fresh Ghost Shell profiles look synthetic to
+          Google; filling them with actual history raises the ad load
+          you'll see. <strong>Safe to run while your Chrome is open</strong>
+          — we read a WAL-consistent live snapshot. The only requirement
+          is that this Ghost Shell profile itself isn't mid-run.
+        </div>
+        <div class="form-group">
+          <label class="form-label">Source Chrome profile path</label>
+          <input type="text" class="input" id="sess-import-source"
+                 style="font-family: ui-monospace, monospace;">
+          <div class="form-hint" id="sess-import-source-hint">
+            Leave blank to use auto-detected path.
+          </div>
+        </div>
+        <div class="form-row" style="display:grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="form-group">
+            <label class="form-label">History window (days)</label>
+            <input type="number" class="input" id="sess-import-days" min="1" max="365" value="90">
+            <div class="form-hint">Only URLs visited in the last N days.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Max URLs</label>
+            <input type="number" class="input" id="sess-import-maxurls" min="100" max="50000" value="5000">
+            <div class="form-hint">Top-N by visit count. Drops the long tail.</div>
+          </div>
+        </div>
+        <div class="checkbox-row" style="margin: 12px 0;">
+          <input type="checkbox" id="sess-import-sensitive" checked>
+          <label for="sess-import-sensitive">
+            Skip sensitive domains (banking, health, signed-in social)
+          </label>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <button class="btn btn-primary" id="sess-import-run-btn">
+            📥 Import from Chrome
+          </button>
+          <span class="muted" id="sess-import-status" style="font-size: 12px;"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+    </div><!-- /.session-content -->
+  </div><!-- /.session-layout -->
+</section>
+
+<!-- ═══ Cookie import modal (reused from old profile.html) ════ -->
+<div class="profile-modal" id="sess-cookie-import-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="sess-cookie-import-modal"></div>
+  <div class="profile-modal-content" style="width: 520px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">Import cookies</div>
+      <button class="profile-modal-close" data-close="sess-cookie-import-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Cookie JSON (array or Netscape format)</label>
+        <textarea id="sess-cookie-import-text" class="input dense-textarea"
+                  rows="10" spellcheck="false"
+                  placeholder='[{"name":"foo","domain":".example.com","value":"…"}]'></textarea>
+        <div class="form-hint">
+          Accepts the exported JSON format + standard Netscape cookies.txt.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="sess-cookie-import-modal">Cancel</button>
+      <button class="btn btn-primary" id="sess-cookie-import-submit">Import</button>
+    </div>
+  </div>
+</div>

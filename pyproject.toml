@@ -1,0 +1,46 @@
+# Project metadata for Ghost Shell antidetect browser.
+#
+# Install in development mode:
+#   pip install -e .
+#
+# Entry points (become available as commands after install):
+#   ghost-shell             → monitor run (the old `python main.py`)
+#   ghost-shell-dashboard   → Flask dashboard on :5000
+#   ghost-shell-scheduler   → scheduled task runner
+#
+# All three are also reachable via `python -m ghost_shell {command}`.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghost-shell"
+version = "0.2.0"
+description = "Self-hosted antidetect browser for monitoring Google Ads & competitors"
+requires-python = ">=3.11"
+readme = "README.md"
+
+# Runtime dependencies. We don't pin exact versions here — the venv
+# lockfile handles reproducibility. The minimums reflect the APIs we
+# actually use (Flask 2.x blueprints + type hints, Selenium 4 for CDP).
+dependencies = [
+  "flask>=2.2",
+  "flask-cors>=4.0",
+  "selenium>=4.15",
+  "requests>=2.31",
+  "beautifulsoup4>=4.12",
+  "python-dateutil>=2.8",
+  "cryptography>=42",           # required for the credential vault (Fernet + PBKDF2)
+]
+
+[project.scripts]
+ghost-shell           = "ghost_shell.__main__:main"
+ghost-shell-dashboard = "ghost_shell.__main__:main"   # dispatches via sys.argv
+ghost-shell-scheduler = "ghost_shell.__main__:main"
+
+[tool.setuptools.packages.find]
+# Only the `ghost_shell` package ships. `scripts/`, `tests/`, and the
+# legacy folder stay out of the installed artifact.
+include = ["ghost_shell*"]
+exclude = ["scripts*", "tests*", "_legacy*", "chrome_win64*", "profiles*"]

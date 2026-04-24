@@ -37,45 +37,65 @@
     </div>
 
     <nav class="sidebar-menu" id="sidebar-menu">
+      <!-- WORKSPACE: dashboards + profile management -->
+      <div class="sidebar-section-label">Workspace</div>
       <div class="sidebar-item" data-page="overview">
-        <span class="sidebar-item-icon">📊</span> Overview
+        <span class="sidebar-item-icon">📊</span><span>Overview</span>
       </div>
       <div class="sidebar-item" data-page="profiles">
-        <span class="sidebar-item-icon">👤</span> Profiles
+        <span class="sidebar-item-icon">👤</span><span>Profiles</span>
       </div>
       <div class="sidebar-item" data-page="groups">
-        <span class="sidebar-item-icon">📁</span> Groups
+        <span class="sidebar-item-icon">📁</span><span>Groups</span>
       </div>
-      <div class="sidebar-item" data-page="domains">
-        <span class="sidebar-item-icon">🌍</span> Domains
-      </div>
+
+      <!-- IDENTITY: things that shape what the browser looks like -->
+      <div class="sidebar-section-label">Identity</div>
       <div class="sidebar-item" data-page="proxy">
-        <span class="sidebar-item-icon">🌐</span> Proxy
+        <span class="sidebar-item-icon">🌐</span><span>Proxy</span>
       </div>
-      <div class="sidebar-item" data-page="competitors">
-        <span class="sidebar-item-icon">🏢</span> Competitors
-        <span class="sidebar-badge" id="badge-competitors">0</span>
+      <div class="sidebar-item" data-page="session">
+        <span class="sidebar-item-icon">🍪</span><span>Session/Cookies</span>
       </div>
       <div class="sidebar-item" data-page="behavior">
-        <span class="sidebar-item-icon">⚙️</span> Behavior
+        <span class="sidebar-item-icon">⚙️</span><span>Behavior</span>
       </div>
       <div class="sidebar-item" data-page="scripts">
-        <span class="sidebar-item-icon">🎬</span> Scripts
+        <span class="sidebar-item-icon">🎬</span><span>Scripts</span>
       </div>
+      <div class="sidebar-item" data-page="accounts">
+        <span class="sidebar-item-icon">🔐</span><span>Accounts & Vault</span>
+      </div>
+
+      <!-- TARGETS: what we're looking at out there -->
+      <div class="sidebar-section-label">Targets</div>
+      <div class="sidebar-item" data-page="domains">
+        <span class="sidebar-item-icon">🌍</span><span>Domains</span>
+      </div>
+      <div class="sidebar-item" data-page="competitors">
+        <span class="sidebar-item-icon">🏢</span><span>Competitors</span>
+        <span class="sidebar-badge" id="badge-competitors">0</span>
+      </div>
+
+      <!-- MONITORING: operational signals -->
+      <div class="sidebar-section-label">Monitoring</div>
       <div class="sidebar-item" data-page="runs">
-        <span class="sidebar-item-icon">🕐</span> Runs
+        <span class="sidebar-item-icon">🕐</span><span>Runs</span>
       </div>
       <div class="sidebar-item" data-page="traffic">
-        <span class="sidebar-item-icon">📈</span> Traffic
+        <span class="sidebar-item-icon">📈</span><span>Traffic</span>
       </div>
       <div class="sidebar-item" data-page="scheduler">
-        <span class="sidebar-item-icon">🕰</span> Scheduler
+        <span class="sidebar-item-icon">🕰</span><span>Scheduler</span>
       </div>
       <div class="sidebar-item" data-page="logs">
-        <span class="sidebar-item-icon">📜</span> Logs
+        <span class="sidebar-item-icon">📜</span><span>Logs</span>
       </div>
+
+      <!-- Separator before Settings — system-level, not a nav target -->
+      <div class="sidebar-section-gap"></div>
       <div class="sidebar-item" data-page="settings">
-        <span class="sidebar-item-icon">💾</span> Settings
+        <span class="sidebar-item-icon">💾</span><span>Settings</span>
       </div>
     </nav>
 
@@ -135,6 +155,8 @@
 <script src="/js/pages/proxy.js"></script>
 <script src="/js/pages/profile-detail.js"></script>
 <script src="/js/pages/fingerprint.js"></script>
+<script src="/js/pages/session.js"></script>
+<script src="/js/pages/accounts.js"></script>
 <script src="/js/pages/competitors.js"></script>
 <script src="/js/pages/behavior.js"></script>
 <script src="/js/pages/scripts.js"></script>

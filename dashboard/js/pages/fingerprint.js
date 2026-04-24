@@ -25,6 +25,7 @@ const FingerprintPage = (() => {
     currentProfile:   null,
     templates:        [],
     selectedTemplate: null,
+    categoryFilter:   "",     // "" = all; "desktop" | "laptop" | "phone"
     fingerprint:      null,
     locks:            new Set(),
     edits:            {},
@@ -165,6 +166,15 @@ const FingerprintPage = (() => {
     // to whichever profile is currently selected in the fp editor.
     // We stash the profile name in configCache so profile-detail.js
     // picks it up on init (it reads configCache.browser.profile_name).
+    // Category filter — re-renders template list with a narrower subset
+    document.addEventListener("click", (e) => {
+      const b = e.target.closest(".fp-category-btn");
+      if (!b) return;
+      $$(".fp-category-btn").forEach(x => x.classList.toggle("active", x === b));
+      state.categoryFilter = b.dataset.cat || "";
+      renderTemplateList();
+    });
+
     $("#fp-back-to-profile-btn")?.addEventListener("click", () => {
       if (state.currentProfile && typeof configCache === "object" && configCache?.browser) {
         configCache.browser.profile_name = state.currentProfile;
@@ -176,6 +186,7 @@ const FingerprintPage = (() => {
     $("#fp-reshuffle-btn").addEventListener("click", () => openRegenModal("reshuffle"));
     $("#fp-selftest-btn").addEventListener("click", runSelftest);
     $("#fp-revalidate-btn").addEventListener("click", revalidate);
+    $("#fp-mode-toggle-btn")?.addEventListener("click", toggleMode);
     $("#fp-create-btn")?.addEventListener("click", () => {
       doGenerate({ mode: "full", template_id: null,
                    locked_fields: {}, reason: "initial generation" });
@@ -248,6 +259,7 @@ const FingerprintPage = (() => {
 
   function renderAll() {
     renderHeaderStrip();
+    renderModeToggle();
     renderEmptyState();
     renderTemplateList();
     renderChecks();
@@ -302,6 +314,44 @@ const FingerprintPage = (() => {
     meta.innerHTML = parts.map(escapeHtml).join(" · ");
   }
 
+  // Show the mode-toggle button with a label reflecting the CURRENT mode.
+  // Hidden for profiles without a fingerprint yet — switching without a
+  // baseline is confusing.
+  function renderModeToggle() {
+    const btn = $("#fp-mode-toggle-btn");
+    if (!btn) return;
+    const fp = state.fingerprint;
+    if (!fp || !fp.payload) { btn.style.display = "none"; return; }
+    const tpl = state.templates.find(t => t.id === fp.payload.template_id);
+    const isMobile = !!(tpl && tpl.is_mobile);
+    btn.style.display = "inline-flex";
+    btn.textContent = isMobile ? "↔ Switch to desktop" : "↔ Switch to mobile";
+    btn.dataset.nextMode = isMobile ? "desktop" : "mobile";
+  }
+
+  async function toggleMode() {
+    const btn = $("#fp-mode-toggle-btn");
+    const nextMode = btn?.dataset?.nextMode;
+    if (!state.currentProfile || !nextMode) return;
+    const label = nextMode === "mobile" ? "mobile" : "desktop";
+    btn.disabled = true;
+    btn.textContent = `⏳ Switching to ${label}…`;
+    try {
+      const resp = await api(
+        `/api/fingerprint/${encodeURIComponent(state.currentProfile)}/mode`,
+        { method: "POST", body: JSON.stringify({ mode: nextMode }) }
+      );
+      toast(resp.source === "generated"
+        ? `✓ Generated fresh ${label} fingerprint`
+        : `✓ Switched to existing ${label} fingerprint from history`);
+      await selectProfile(state.currentProfile);
+    } catch (e) {
+      toast("Switch failed: " + e.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   function renderEmptyState() {
     const hasFP = !!state.fingerprint;
     $("#fp-empty-state").style.display = hasFP ? "none" : "flex";
@@ -324,19 +374,31 @@ const FingerprintPage = (() => {
 
     countEl.textContent = `${state.templates.length} templates`;
 
-    const sorted = [...state.templates].sort(
+    const filtered = state.categoryFilter
+      ? state.templates.filter(t => t.category === state.categoryFilter)
+      : state.templates;
+    const sorted = [...filtered].sort(
       (a, b) => (b.market_share_pct || 0) - (a.market_share_pct || 0)
     );
 
+    if (!sorted.length) {
+      list.innerHTML = `<div class="dense-empty">
+        No templates in the ${escapeHtml(state.categoryFilter || "filtered")} category.
+      </div>`;
+      return;
+    }
     list.innerHTML = sorted.map(t => {
       const selected = state.selectedTemplate === t.id;
       const current  = state.fingerprint?.payload?.template_id === t.id;
+      const mobileTag = t.is_mobile
+        ? '<span class="fp-template-mobile-badge">MOBILE</span>' : "";
       return `
         <div class="fp-template-row ${selected ? "selected" : ""} ${current ? "current" : ""}"
              data-template-id="${escapeHtml(t.id)}">
           <div class="fp-template-label">
             ${escapeHtml(t.label)}
             ${current ? '<span class="fp-template-current-badge">current</span>' : ""}
+            ${mobileTag}
           </div>
           <div class="fp-template-meta">
             <span class="fp-template-os">${escapeHtml(t.os)}</span>

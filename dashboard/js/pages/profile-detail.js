@@ -16,6 +16,7 @@ const ProfileDetail = {
       this.currentProfile = e.target.value;
       this.loadSelfcheck(this.currentProfile);
       this.loadFingerprint(this.currentProfile);
+      this.loadSessionSummary(this.currentProfile);
       this.loadProfileMeta(this.currentProfile);
       this.loadCookies(this.currentProfile);
       this.loadActiveScript(this.currentProfile);
@@ -92,6 +93,7 @@ const ProfileDetail = {
       await Promise.all([
         this.loadSelfcheck(this.currentProfile),
         this.loadFingerprint(this.currentProfile),
+        this.loadSessionSummary(this.currentProfile),
         this.loadProfileMeta(this.currentProfile),
         this.loadCookies(this.currentProfile),
         this.loadActiveScript(this.currentProfile),
@@ -249,6 +251,57 @@ const ProfileDetail = {
       await this.loadFingerprint(this.currentProfile);
     } catch (e) {
       toast("Regenerate failed: " + e.message, true);
+    }
+  },
+
+  // ─────────────────────────────────────────────────────────────
+  // Session summary mini-card (profile page). Mirrors the fingerprint
+  // card pattern — pulls /api/session/<name> and populates the card
+  // without fetching the full warmup history or snapshots (those live
+  // on the dedicated Session page).
+  // ─────────────────────────────────────────────────────────────
+  async loadSessionSummary(name) {
+    const countEl  = document.getElementById("profile-session-count");
+    const sumEl    = document.getElementById("profile-session-summary");
+    const metaEl   = document.getElementById("profile-session-meta");
+    const openBtn  = document.getElementById("profile-session-open-btn");
+    if (!countEl || !name) return;
+
+    // Patch the editor link to pre-select this profile (same pattern as
+    // the fingerprint card does) — fingerprint-page listener reads the
+    // ?profile=... hash on init.
+    if (openBtn) {
+      openBtn.onclick = (e) => {
+        e.preventDefault();
+        location.hash = `#session?profile=${encodeURIComponent(name)}`;
+        navigate("session");
+      };
+    }
+
+    try {
+      const r = await api(`/api/session/${encodeURIComponent(name)}`);
+      const last  = r?.warmup?.last;
+      const stats = r?.snapshots || {};
+      const running = r?.warmup?.running;
+
+      countEl.textContent = stats.n ?? "—";
+
+      const parts = [];
+      if (running) {
+        sumEl.textContent = "Warmup running…";
+      } else if (last) {
+        sumEl.textContent =
+          `Last warmup ${timeAgo(last.started_at)} · ${last.preset} · ${last.status}`;
+        parts.push(`${last.sites_succeeded}/${last.sites_planned} sites ok`);
+      } else {
+        sumEl.textContent = "No warmup yet — open session manager to run one.";
+      }
+      if (stats.total_cookies) parts.push(`${stats.total_cookies} cookies in pool`);
+      if (stats.last_at)       parts.push(`snapshot ${timeAgo(stats.last_at)}`);
+      metaEl.textContent = parts.join(" · ");
+    } catch (e) {
+      sumEl.textContent = "Failed to load session status: " + e.message;
+      metaEl.textContent = "";
     }
   },
 

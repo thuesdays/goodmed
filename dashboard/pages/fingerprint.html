@@ -59,6 +59,11 @@
               title="Re-run coherence checks without changing data.">
         ✓ Re-validate
       </button>
+      <button class="btn btn-secondary btn-small" id="fp-mode-toggle-btn"
+              title="Switch this profile's fingerprint between desktop and mobile. Uses an existing history entry if present, else generates a fresh one."
+              style="display:none;">
+        ↔ —
+      </button>
     </div>
   </div>
 
@@ -84,6 +89,14 @@
         <div class="dense-panel-header">
           <div class="dense-panel-title">Device templates</div>
           <span class="dense-panel-hint" id="fp-template-count">0</span>
+        </div>
+        <!-- Category chip filter — All / Desktop / Laptop / Phone.
+             Mobile entries (is_mobile=true) highlight with a green tag. -->
+        <div class="fp-category-filter" id="fp-category-filter">
+          <button class="fp-category-btn active" data-cat="">All</button>
+          <button class="fp-category-btn" data-cat="desktop">🖥 Desktop</button>
+          <button class="fp-category-btn" data-cat="laptop">💻 Laptop</button>
+          <button class="fp-category-btn" data-cat="phone">📱 Phone</button>
         </div>
         <div class="fp-template-list" id="fp-template-list">
           <div class="dense-empty">Loading…</div>
@@ -299,4 +312,12 @@
       <div class="form-group">
         <label class="form-label">Reason (optional — shows in history)</label>
         <input type="text" class="input" id="fp-regen-reason"
-               placeholder="e.g. Google started flagging the old 
+               placeholder="e.g. Google started flagging the old FP">
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="fp-regen-modal">Cancel</button>
+      <button class="btn btn-primary" id="fp-regen-confirm-btn">Regenerate</button>
+    </div>
+  </div>
+</div>

@@ -260,167 +260,34 @@
     </div>
   </div>
 
-  <!-- ─── CHROME HISTORY IMPORT (profile warm-up) ────────────── -->
-  <!-- Copies history/bookmarks/preferences from a REAL Chrome install
-       into this profile. Gives Google's ad auction "this is a lived-in
-       browser" signal, which raises ad load on subsequent queries. No
-       browsing happens — we just drag files across while both sides are
-       closed. Scrubs PII (signed-in Google account, autofill, banking
-       domains by default) on the way through. -->
+  <!-- ─── SESSION & COOKIES (summary card) ───────────────────── -->
+  <!-- Everything that used to be on this page (Chrome import, live
+       cookies table, cookie import modal) moved to the dedicated
+       Session & cookies page. This card is a compact rollup + entry
+       point, same pattern as Active script / Active proxy / Active
+       fingerprint above. -->
   <div class="card">
     <div class="card-title">
-      🧠 Warm up from real Chrome
-      <span class="muted">— import history, bookmarks &amp; preferences</span>
+      🍪 Session & cookies
+      <span class="muted">— warmup robot, cookie pool, Chrome import</span>
     </div>
-    <div class="form-hint" style="margin-bottom: 12px;">
-      Copy real browsing history from your own Chrome install into this
-      profile. Fresh Ghost Shell profiles look synthetic to Google;
-      filling them with actual history raises the ad load you'll see.
-      <br><br>
-      <strong>Safe to run while your Chrome is open</strong> — we read
-      a WAL-consistent live snapshot. The only requirement is that
-      this Ghost Shell profile itself isn't mid-run.
-    </div>
-
-    <div class="form-group">
-      <label class="form-label">Source Chrome profile path</label>
-      <input type="text" class="input" id="chrome-import-source"
-             placeholder="(auto-detecting…)">
-      <div class="form-hint" id="chrome-import-source-hint">
-        Usually <code>%LOCALAPPDATA%\Google\Chrome\User Data\Default</code>
-        on Windows. Leave blank to auto-detect.
+    <div class="profile-fp-card-row" id="profile-session-row">
+      <!-- Mini stats populated by profile-detail.js loadSessionSummary -->
+      <div class="profile-fp-mini-badge" id="profile-session-badge">
+        <div class="fp-mini-score" id="profile-session-count">—</div>
+        <div class="fp-mini-grade">snapshots</div>
       </div>
-    </div>
-
-    <div class="input-row">
-      <div class="form-group">
-        <label class="form-label">History window (days)</label>
-        <input type="number" class="input" id="chrome-import-days"
-               value="90" min="1" max="365">
-        <div class="form-hint">Only URLs visited in the last N days.</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Max URLs</label>
-        <input type="number" class="input" id="chrome-import-maxurls"
-               value="5000" min="100" max="50000">
-        <div class="form-hint">Top-N by visit count. Drops the long tail.</div>
-      </div>
-    </div>
-
-    <div class="checkbox-row">
-      <input type="checkbox" id="chrome-import-sensitive" checked>
-      <label for="chrome-import-sensitive">
-        Skip sensitive domains (banking, health, signed-in social)
-      </label>
-    </div>
-
-    <div style="margin-top: 16px; display: flex; gap: 8px; align-items: center;">
-      <button class="btn btn-primary" id="chrome-import-run-btn">
-        📥 Import from Chrome
-      </button>
-      <span class="muted" id="chrome-import-status" style="font-size: 12px;"></span>
-    </div>
-  </div>
-
-  <!-- ─── COOKIES / SESSION ──────────────────────────────────── -->
-  <div class="card">
-    <div class="card-title">
-      Cookies & session
-      <span class="muted">— persisted between runs</span>
-      <span class="badge" id="cookies-count-badge">0</span>
-      <div style="margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap;">
-        <button class="btn btn-secondary btn-small" id="cookies-reload-btn">↻ Reload</button>
-        <button class="btn btn-secondary btn-small" id="cookies-import-btn">📥 Import…</button>
-        <button class="btn btn-secondary btn-small" id="cookies-export-btn">📤 Export</button>
-        <button class="btn btn-secondary btn-small" id="cookies-clear-btn"
-                style="color: var(--critical);">🗑 Clear all</button>
-      </div>
-    </div>
-
-    <div class="form-hint" style="margin-bottom: 12px;">
-      Cookies stored for this profile's next run. Imported values take
-      effect on <strong>next start</strong> — if the profile is
-      currently running, Chrome's own in-memory state wins until it closes.
-    </div>
-
-    <div class="cookies-warning" id="cookies-warning-running"
-         style="display: none;">
-      ⚠️ This profile is running right now. Changes here won't apply
-      until the run finishes. Stop the run first if you need immediate effect.
-    </div>
-
-    <div class="cookies-filter-row">
-      <input type="text" class="input" id="cookies-search"
-             placeholder="filter by name or domain…" style="max-width: 300px;">
-      <span class="muted" style="font-size: 11px;">
-        <span id="cookies-visible-count">0</span> visible
-      </span>
-    </div>
-
-    <div class="cookies-table-wrap">
-      <table class="cookies-table" id="cookies-table">
-        <thead>
-          <tr>
-            <th style="width: 20%;">Name</th>
-            <th style="width: 22%;">Domain</th>
-            <th style="width: 30%;">Value</th>
-            <th style="width: 14%;">Expires</th>
-            <th style="width: 10%;">Flags</th>
-            <th style="width: 4%;"></th>
-          </tr>
-        </thead>
-        <tbody id="cookies-tbody"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- ─── COOKIE IMPORT MODAL ────────────────────────────────── -->
-  <div class="profile-modal" id="cookie-import-modal" style="display: none;">
-    <div class="profile-modal-backdrop" data-close="cookie-import-modal"></div>
-    <div class="profile-modal-content" style="max-width: 680px;">
-      <div class="profile-modal-header">
-        <div class="profile-modal-title">📥 Import cookies</div>
-        <button class="profile-modal-close" data-close="cookie-import-modal">×</button>
-      </div>
-      <div class="profile-modal-body">
-        <div class="form-hint" style="margin-bottom: 12px;">
-          Paste JSON (from EditThisCookie, Cookie-Editor, Cookie-Quick-Manager, etc.)
-          or a Netscape-format <code>cookies.txt</code>. Format is auto-detected.
+      <div>
+        <div class="profile-fp-summary-line" id="profile-session-summary">
+          Loading session status…
         </div>
-
-        <div class="form-group">
-          <label class="form-label">Upload a file</label>
-          <input type="file" id="cookie-import-file"
-                 accept=".json,.txt,application/json,text/plain">
-          <div class="form-hint">
-            Or drag the file onto this area. The contents will appear below.
-          </div>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">…or paste directly</label>
-          <textarea class="input" id="cookie-import-textarea"
-                    rows="10"
-                    placeholder='[{"name": "session", "value": "abc123", "domain": ".example.com", ...}]'></textarea>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">Mode</label>
-          <div style="display: flex; gap: 16px;">
-            <label class="checkbox-label-inline">
-              <input type="radio" name="cookie-import-mode" value="merge" checked>
-              Merge (keep existing, overwrite duplicates)
-            </label>
-            <label class="checkbox-label-inline">
-              <input type="radio" name="cookie-import-mode" value="replace">
-              Replace (discard existing first)
-            </label>
-          </div>
-        </div>
+        <div class="profile-fp-summary-meta" id="profile-session-meta"></div>
       </div>
-      <div class="profile-modal-footer">
-        <button class="btn btn-secondary" data-close="cookie-import-modal">Cancel</button>
-        <button class="btn btn-primary" id="cookie-import-submit">Import</button>
+      <div style="display: flex; gap: 6px;">
+        <a href="#" data-nav="session" class="btn btn-primary btn-small"
+           id="profile-session-open-btn">
+          Open session manager →
+        </a>
       </div>
     </div>
   </div>

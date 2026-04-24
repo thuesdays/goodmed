@@ -9,3 +9,7 @@ psutil>=5.9.0                    # watchdog PID discovery
 # Dashboard
 flask>=3.0.0
 flask-cors>=4.0.0
+
+# Credential vault — AES-128-CBC + HMAC via Fernet, PBKDF2 KDF.
+# Without this, the Accounts & Vault page refuses to initialize.
+cryptography>=42
