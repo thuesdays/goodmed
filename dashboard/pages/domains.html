@@ -1,0 +1,85 @@
+<section class="domains-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Domains</div>
+      <div class="page-subtitle">
+        Your own properties, target domains, and domains to ignore.
+      </div>
+    </div>
+  </div>
+
+  <!-- Info callout — textarea-driven lists -->
+  <div class="dense-callout">
+    <div class="dense-callout-icon">💡</div>
+    <div class="dense-callout-body">
+      <strong>Queries moved to Scripts.</strong>
+      Search terms are now configured directly inside a <code>loop</code>
+      step on the <a href="#" data-nav="scripts">Scripts</a> page — one
+      query list per loop, fully customizable. That lets you run different
+      queries in different rotations, with different per-ad pipelines,
+      in one script.
+    </div>
+  </div>
+
+  <!-- 3 list panels, one per domain category. Each is a dense-panel
+       with a small description and a big monospace textarea. -->
+  <div class="domains-grid">
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">🏠 My domains</div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="dense-hint">
+          Domains you own and don't want to count as competitors. Ads
+          matching any of these entries are excluded from the Competitors
+          table. Step-level <code>skip_on_my_domain</code> checks use this
+          list too — handy for not clicking your own ads and burning your
+          ad budget.
+        </div>
+        <textarea class="input dense-textarea" rows="6"
+                  data-config="search.my_domains" data-config-list="true"
+                  placeholder="example.com
+example.org
+www.example.com"></textarea>
+      </div>
+    </div>
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">🎯 Target domains</div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="dense-hint">
+          Ads that match any domain here trigger the <strong>on-target</strong>
+          script instead of the default post-click pipeline. Use for
+          competitors you want to treat specially — e.g. longer dwell time
+          or different interaction patterns.
+        </div>
+        <textarea class="input dense-textarea" rows="6"
+                  data-config="search.target_domains" data-config-list="true"
+                  placeholder="competitor-example-1.com
+competitor-example-2.net"></textarea>
+      </div>
+    </div>
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">🚫 Block list</div>
+        <div class="dense-panel-hint">optional</div>
+      </div>
+      <div class="dense-panel-body">
+        <div class="dense-hint">
+          Domains to skip entirely — the monitor sees them in the SERP but
+          doesn't record, click, or otherwise interact. Useful for massive
+          aggregators (marketplaces, news sites) that dilute your stats.
+        </div>
+        <textarea class="input dense-textarea" rows="5"
+                  data-config="search.block_domains" data-config-list="true"
+                  placeholder="aggregator.example.com
+large-marketplace.example.com"></textarea>
+      </div>
+    </div>
+
+  </div>
+</section>

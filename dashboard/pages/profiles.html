@@ -1,0 +1,183 @@
+<section class="profiles-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Profiles</div>
+      <div class="page-subtitle">
+        Browser profiles — create, start, inspect, manage.
+      </div>
+    </div>
+    <div class="profiles-header-actions">
+      <div class="column-picker">
+        <button class="btn btn-secondary" id="column-picker-btn">Columns ▾</button>
+        <div class="column-picker-dropdown" id="column-picker-dropdown" style="display:none;"></div>
+      </div>
+      <button class="btn btn-secondary" id="reload-profiles-btn">↻ Reload</button>
+      <button class="btn btn-primary" id="btn-create-profile">+ Create profile</button>
+    </div>
+  </div>
+
+  <!-- Toolbar: search + filter + counter inline -->
+  <div class="profiles-toolbar">
+    <input type="text" class="input profiles-search" id="profiles-search"
+           placeholder="Search profile name…">
+    <div class="profiles-tag-filter" id="profiles-tag-filter" style="display:none">
+      <span class="tag-filter-label">Filter:</span>
+      <span class="profile-tag-chip active" id="active-tag-label">—</span>
+      <button class="btn-tag-clear" id="btn-clear-tag-filter">✕</button>
+    </div>
+    <div class="profiles-toolbar-stats">
+      <strong id="profiles-count">0</strong>
+      <span>profile(s)</span>
+    </div>
+  </div>
+
+  <!-- Bulk action bar — hidden until something is selected -->
+  <div class="bulk-bar" id="bulk-bar" style="display:none">
+    <div class="bulk-bar-info">
+      <strong id="bulk-selected-count">0</strong> selected
+      <button class="btn-link" id="btn-bulk-clear">clear</button>
+    </div>
+    <div class="bulk-bar-actions">
+      <button class="btn btn-primary btn-small" id="btn-bulk-start">▶ Start</button>
+      <button class="btn btn-secondary btn-small" id="btn-bulk-stop">■ Stop</button>
+      <button class="btn btn-secondary btn-small" id="btn-bulk-tag">🏷 Tag…</button>
+      <button class="btn btn-secondary btn-small" id="btn-bulk-group">📁 Group…</button>
+      <button class="btn btn-secondary btn-small btn-danger" id="btn-bulk-delete">🗑 Delete</button>
+    </div>
+  </div>
+
+  <!-- Main table -->
+  <div class="profiles-table-wrap">
+    <table class="profiles-table">
+      <thead id="profiles-thead"></thead>
+      <tbody id="profiles-tbody">
+        <tr><td colspan="10" class="dense-empty-cell">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ─── TAG EDITOR MODAL ─────────────────────────────────────── -->
+<div class="profile-modal" id="tag-editor-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="tag-editor-modal"></div>
+  <div class="profile-modal-content" style="max-width: 480px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">🏷 Edit tags — <span id="tag-editor-profile-name">?</span></div>
+      <button class="profile-modal-close" data-close="tag-editor-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Current tags</label>
+        <div class="tag-editor-chips" id="tag-editor-chips"></div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Add a tag</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" class="input" id="tag-editor-input"
+                 placeholder="e.g. facebook-ads, us-east, test">
+          <button class="btn btn-primary" id="tag-editor-add-btn">+ Add</button>
+        </div>
+        <div class="form-hint">
+          Tags are lowercase, free-form labels. Use them to filter profiles,
+          select for bulk actions, or group campaigns.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="tag-editor-modal">Close</button>
+      <button class="btn btn-primary" id="tag-editor-save-btn">Save tags</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── CREATE PROFILE MODAL ──────────────────────────────────── -->
+<div class="profile-modal" id="profile-create-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="profile-create-modal"></div>
+  <div class="profile-modal-content">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">✨ Create new profile</div>
+      <button class="profile-modal-close" data-close="profile-create-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Profile name</label>
+        <div style="display: flex; gap: 8px;">
+          <input type="text" class="input" id="np-name" placeholder="profile_02" style="flex: 1;">
+          <button class="btn btn-secondary" id="np-name-random" title="Generate random name">🎲</button>
+        </div>
+        <div class="form-hint">Unique identifier. Used as folder name and SHA256 seed for fingerprint.</div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Device template</label>
+        <select class="select" id="np-template">
+          <option value="auto">Auto (random from all)</option>
+        </select>
+        <div class="form-hint">
+          Determines the pool of plausible UA / screen / GPU / fonts.
+          "Auto" picks one randomly so each profile looks different.
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Preferred language</label>
+        <select class="select" id="np-language">
+          <option value="uk-UA">Ukrainian (uk-UA)</option>
+          <option value="ru-RU">Russian (ru-RU)</option>
+          <option value="en-US">English (en-US)</option>
+          <option value="pl-PL">Polish (pl-PL)</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <label class="form-label" style="margin: 0;">Fingerprint preview</label>
+          <button class="btn btn-secondary btn-small" id="np-preview-btn">🔮 Preview</button>
+        </div>
+        <div class="fingerprint-preview" id="np-preview-panel" style="display: none;"></div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Proxy URL <span class="form-label-optional">(optional)</span></label>
+        <input type="text" class="input" id="np-proxy"
+               placeholder="http://user:pass@host:port"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">
+          Sets a per-profile proxy override on creation. Leave empty to inherit
+          the global proxy from the Proxy page. Supports HTTP, HTTPS, SOCKS5.
+        </div>
+      </div>
+
+      <div class="form-group">
+        <div class="checkbox-row">
+          <input type="checkbox" id="np-enrich" checked>
+          <label for="np-enrich">
+            Enrich on first run (history, bookmarks, top sites)
+            <span class="badge-recommended">recommended</span>
+          </label>
+        </div>
+        <div class="form-hint">
+          Seeds a realistic browsing history. Without this, first visit to Google
+          looks like a brand-new browser (detection signal).
+        </div>
+      </div>
+
+      <div class="form-group">
+        <div class="checkbox-row">
+          <input type="checkbox" id="np-open-after" checked>
+          <label for="np-open-after">
+            Open the profile editor after creation
+          </label>
+        </div>
+        <div class="form-hint">
+          Recommended — lets you finish configuration (tags, fingerprint regen,
+          rotation rules, notes) right away.
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="profile-create-modal">Cancel</button>
+      <button class="btn btn-primary" id="np-create-btn">Create profile</button>
+    </div>
+  </div>
+</div>

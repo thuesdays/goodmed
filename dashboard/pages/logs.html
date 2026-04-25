@@ -1,0 +1,61 @@
+<section class="logs-workspace">
+  <div class="page-header">
+    <div style="display: flex; align-items: center; gap: 12px; min-width: 0;">
+      <button class="btn btn-secondary" id="back-to-runs-btn"
+              style="display:none;">← Back to Runs</button>
+      <div style="min-width: 0;">
+        <div class="page-title" id="logs-title">Live logs</div>
+        <div class="page-subtitle" id="logs-subtitle">
+          Running monitor output (SSE)
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Filter toolbar — dense row above the terminal box. Select,
+       search, and action buttons all one compact row. -->
+  <div class="logs-toolbar">
+    <select class="select logs-filter" id="logs-filter-profile">
+      <option value="">All profiles</option>
+    </select>
+    <select class="select logs-filter" id="logs-filter-level">
+      <option value="">All levels</option>
+      <option value="info">Info</option>
+      <option value="warning">Warning</option>
+      <option value="error">Error</option>
+    </select>
+    <input type="text" class="input logs-filter logs-grep" id="logs-filter-text"
+           placeholder="grep text…">
+
+    <div class="logs-toolbar-spacer"></div>
+
+    <button class="btn btn-secondary btn-small" id="switch-to-live-btn"
+            style="display:none;" title="Return to live-tail mode">
+      ● Live
+    </button>
+    <button class="btn btn-secondary btn-small" id="copy-logs-btn"
+            title="Copy visible logs to clipboard">📋 Copy</button>
+    <button class="btn btn-secondary btn-small" id="download-logs-btn"
+            title="Save visible logs as .txt file">⬇ Save</button>
+    <button class="btn btn-secondary btn-small" id="clear-logs-btn"
+            title="Clear the visible log window (doesn't affect server)">
+      ✕ Clear
+    </button>
+  </div>
+
+  <!-- Active-filter chip strip — JS toggles display:none -->
+  <div class="logs-filter-summary" id="logs-filter-summary" style="display:none;">
+    <span class="logs-filter-summary-label">Filtering:</span>
+    <span id="logs-filter-chips"></span>
+    <button class="btn-link" id="logs-filter-reset">reset filters</button>
+  </div>
+
+  <!-- Terminal-style log box. Fills remaining height below toolbar. -->
+  <div class="logs-terminal">
+    <div class="logs-box" id="logs-box">
+      <div class="logs-placeholder">
+        Start the monitor to see logs here…
+      </div>
+    </div>
+  </div>
+</section>

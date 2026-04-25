@@ -1,0 +1,323 @@
+<!--
+  Fingerprint detail page (Phase 2 of the Coherence System).
+  Layout:
+    [ page-header · profile selector + score badge · action strip        ]
+    [ 2-col grid:                                                        ]
+    [   LEFT  — Template picker                                          ]
+    [   RIGHT — Tabs: Checks / Fields / History / Self-test              ]
+-->
+<section class="fp-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Fingerprint</div>
+      <div class="page-subtitle">
+        Coherence validator — checks that UA / GPU / fonts / timezone tell
+        the same story. A score below 75 means the profile is lying to
+        itself and detection systems will notice.
+      </div>
+    </div>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <button class="btn btn-secondary btn-small" id="fp-back-to-profile-btn"
+              title="Return to this profile's detail page">
+        ← Back to profile
+      </button>
+      <select class="select" id="fp-profile-selector" style="width: 260px;">
+        <option value="">— loading —</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- ═══ Score + summary strip + primary actions ════════════════ -->
+  <!-- Large badge on the left, summary + meta in the middle, action
+       buttons on the right. "No fingerprint yet" state replaces the
+       whole row when the profile has nothing generated. -->
+  <div class="fp-header-strip" id="fp-header-strip">
+    <div class="fp-score-box" id="fp-score-box">
+      <div class="fp-score-value" id="fp-score-value">—</div>
+      <div class="fp-score-label" id="fp-score-label">no data</div>
+    </div>
+    <div class="fp-summary-box">
+      <div class="fp-summary-line" id="fp-summary-line">
+        Select a profile to view its fingerprint.
+      </div>
+      <div class="fp-summary-meta" id="fp-summary-meta"></div>
+    </div>
+    <div class="fp-action-strip">
+      <button class="btn btn-primary btn-small" id="fp-regen-full-btn"
+              title="Throw away current fingerprint and generate a fresh one. Template picked from weighted market-share.">
+        ↻ Regenerate (full)
+      </button>
+      <button class="btn btn-secondary btn-small" id="fp-reshuffle-btn"
+              title="Keep the template, resample all free values.">
+        🎲 Reshuffle
+      </button>
+      <button class="btn btn-secondary btn-small" id="fp-selftest-btn"
+              title="Launch a real browser, probe the actual fingerprint, compare. Takes 5-15 seconds.">
+        🔬 Run self-test
+      </button>
+      <button class="btn btn-secondary btn-small" id="fp-revalidate-btn"
+              title="Re-run coherence checks without changing data.">
+        ✓ Re-validate
+      </button>
+      <button class="btn btn-secondary btn-small" id="fp-mode-toggle-btn"
+              title="Switch this profile's fingerprint between desktop and mobile. Uses an existing history entry if present, else generates a fresh one."
+              style="display:none;">
+        ↔ —
+      </button>
+    </div>
+  </div>
+
+  <!-- Empty state — shown when profile has no fingerprint yet -->
+  <div class="fp-empty-state" id="fp-empty-state" style="display: none;">
+    <div class="fp-empty-icon">🧬</div>
+    <div class="fp-empty-title">No fingerprint yet</div>
+    <div class="fp-empty-hint">
+      This profile hasn't been generated. Pick a template below or just
+      hit Generate — weighted market-share will pick a plausible one.
+    </div>
+    <button class="btn btn-primary" id="fp-create-btn">
+      Generate first fingerprint
+    </button>
+  </div>
+
+  <!-- ═══ 2-column workspace ═════════════════════════════════════ -->
+  <div class="fp-layout" id="fp-layout">
+
+    <!-- ─── LEFT: Template picker ───────────────────────────────── -->
+    <aside class="fp-sidebar">
+      <div class="dense-panel">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">Device templates</div>
+          <span class="dense-panel-hint" id="fp-template-count">0</span>
+        </div>
+        <!-- Category chip filter — All / Desktop / Laptop / Phone.
+             Mobile entries (is_mobile=true) highlight with a green tag. -->
+        <div class="fp-category-filter" id="fp-category-filter">
+          <button class="fp-category-btn active" data-cat="">All</button>
+          <button class="fp-category-btn" data-cat="desktop">🖥 Desktop</button>
+          <button class="fp-category-btn" data-cat="laptop">💻 Laptop</button>
+          <button class="fp-category-btn" data-cat="phone">📱 Phone</button>
+        </div>
+        <div class="fp-template-list" id="fp-template-list">
+          <div class="dense-empty">Loading…</div>
+        </div>
+      </div>
+
+      <div class="dense-panel">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">Apply template</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint" style="margin-bottom: 10px;">
+            Switching template rebuilds the fingerprint around that
+            device. Locked fields (🔒 on the Fields tab) stay pinned.
+          </div>
+          <button class="btn btn-primary btn-small" id="fp-apply-template-btn"
+                  disabled>
+            Switch to selected template
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ─── RIGHT: Tabbed content ───────────────────────────────── -->
+    <div class="fp-main">
+      <!-- Tab bar -->
+      <div class="fp-tabs" id="fp-tabs">
+        <div class="fp-tab active" data-tab="checks">
+          <span class="fp-tab-label">Coherence checks</span>
+          <span class="fp-tab-badge" id="fp-tab-checks-badge">—</span>
+        </div>
+        <div class="fp-tab" data-tab="fields">
+          <span class="fp-tab-label">Fields</span>
+          <span class="fp-tab-badge" id="fp-tab-fields-badge">—</span>
+        </div>
+        <div class="fp-tab" data-tab="history">
+          <span class="fp-tab-label">History</span>
+          <span class="fp-tab-badge" id="fp-tab-history-badge">—</span>
+        </div>
+        <div class="fp-tab" data-tab="selftest">
+          <span class="fp-tab-label">Self-test</span>
+          <span class="fp-tab-badge fp-tab-badge-hidden" id="fp-tab-selftest-badge">—</span>
+        </div>
+      </div>
+
+      <!-- ═══ Tab: Checks ═══════════════════════════════════════ -->
+      <div class="fp-tabpane active" data-tabpane="checks">
+        <div class="dense-panel">
+          <div class="dense-panel-header">
+            <div class="dense-panel-title">
+              Check results
+              <span class="dense-panel-hint" id="fp-checks-summary"></span>
+            </div>
+            <div class="fp-check-legend">
+              <span class="fp-legend-item"><span class="fp-legend-dot fp-legend-pass"></span>pass</span>
+              <span class="fp-legend-item"><span class="fp-legend-dot fp-legend-warn"></span>warn</span>
+              <span class="fp-legend-item"><span class="fp-legend-dot fp-legend-fail"></span>fail</span>
+              <span class="fp-legend-item"><span class="fp-legend-dot fp-legend-skip"></span>skip</span>
+            </div>
+          </div>
+          <div class="fp-check-list" id="fp-check-list">
+            <div class="dense-empty">No validation data yet.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ Tab: Fields ═══════════════════════════════════════ -->
+      <div class="fp-tabpane" data-tabpane="fields">
+        <div class="dense-panel">
+          <div class="dense-panel-header">
+            <div class="dense-panel-title">
+              Field editor
+              <span class="dense-panel-hint">
+                Double-click a value to edit. 🔒 locks the field so regeneration keeps it.
+              </span>
+            </div>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-secondary btn-small" id="fp-fields-reset-btn"
+                      title="Discard unsaved edits">
+                Reset
+              </button>
+              <button class="btn btn-primary btn-small" id="fp-fields-save-btn"
+                      disabled>
+                Save edits
+              </button>
+            </div>
+          </div>
+          <div class="dense-table-wrap">
+            <table class="dense-table fp-field-table">
+              <thead>
+                <tr>
+                  <th class="col-lock" style="width: 36px;"></th>
+                  <th class="col-field">Field</th>
+                  <th class="col-value">Value</th>
+                  <th class="col-meta" style="width: 140px;">Source</th>
+                </tr>
+              </thead>
+              <tbody id="fp-field-tbody">
+                <tr>
+                  <td colspan="4" class="dense-empty-cell">No fingerprint loaded.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ Tab: History ══════════════════════════════════════ -->
+      <div class="fp-tabpane" data-tabpane="history">
+        <div class="dense-panel">
+          <div class="dense-panel-header">
+            <div class="dense-panel-title">
+              Snapshot history
+              <span class="dense-panel-hint">
+                Each regeneration or edit creates a snapshot. Restore any past version here.
+              </span>
+            </div>
+          </div>
+          <div class="dense-table-wrap">
+            <table class="dense-table fp-history-table">
+              <thead>
+                <tr>
+                  <th class="col-when">When</th>
+                  <th class="col-template">Template</th>
+                  <th class="col-score num">Score</th>
+                  <th class="col-source">Source</th>
+                  <th class="col-reason">Reason</th>
+                  <th class="col-actions" style="width: 140px;"></th>
+                </tr>
+              </thead>
+              <tbody id="fp-history-tbody">
+                <tr>
+                  <td colspan="6" class="dense-empty-cell">No history yet.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══ Tab: Self-test ════════════════════════════════════ -->
+      <div class="fp-tabpane" data-tabpane="selftest">
+        <div class="dense-panel">
+          <div class="dense-panel-header">
+            <div class="dense-panel-title">
+              Self-test — configured vs actual
+              <span class="dense-panel-hint" id="fp-selftest-meta"></span>
+            </div>
+          </div>
+          <div class="fp-selftest-body" id="fp-selftest-body">
+            <div class="dense-empty">
+              Hit <strong>Run self-test</strong> above to launch a real
+              browser and compare what Chrome actually reports against
+              the configured fingerprint. This reveals stealth-patch
+              failures (e.g. webdriver flag still leaking, UA not taking
+              effect).
+              <div style="margin-top: 8px; font-size: 11px;">
+                Takes 5–15 seconds. The browser window is headless.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══ Modal: full regenerate — confirm before destructive action ═══ -->
+<div class="profile-modal" id="fp-regen-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="fp-regen-modal"></div>
+  <div class="profile-modal-content" style="width: 520px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">Regenerate fingerprint</div>
+      <button class="profile-modal-close" data-close="fp-regen-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="dense-callout" style="margin-bottom: 14px;">
+        <span class="dense-callout-icon">⚠</span>
+        <div class="dense-callout-body">
+          <strong>The current fingerprint will become history</strong> —
+          you can still restore it from the History tab later. The new
+          one replaces it as the active profile fingerprint.
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Mode</label>
+        <div class="fp-mode-picker">
+          <label class="fp-mode-option">
+            <input type="radio" name="fp-regen-mode" value="full" checked>
+            <div class="fp-mode-body">
+              <div class="fp-mode-title">Full regenerate</div>
+              <div class="fp-mode-desc">Fresh template + fresh values. Locks ignored.</div>
+            </div>
+          </label>
+          <label class="fp-mode-option">
+            <input type="radio" name="fp-regen-mode" value="template_only">
+            <div class="fp-mode-body">
+              <div class="fp-mode-title">Change template, keep locks</div>
+              <div class="fp-mode-desc">Apply the template selected on the left, preserve 🔒 locked fields.</div>
+            </div>
+          </label>
+          <label class="fp-mode-option">
+            <input type="radio" name="fp-regen-mode" value="reshuffle">
+            <div class="fp-mode-body">
+              <div class="fp-mode-title">Reshuffle within template</div>
+              <div class="fp-mode-desc">Same device, different GPU variant / screen / fonts. Locks preserved.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Reason (optional — shows in history)</label>
+        <input type="text" class="input" id="fp-regen-reason"
+               placeholder="e.g. Google started flagging the old FP">
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="fp-regen-modal">Cancel</button>
+      <button class="btn btn-primary" id="fp-regen-confirm-btn">Regenerate</button>
+    </div>
+  </div>
+</div>

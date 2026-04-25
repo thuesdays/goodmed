@@ -1,0 +1,329 @@
+<section class="behavior-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Behavior</div>
+      <div class="page-subtitle">Timing, delays, and realistic-user options.</div>
+    </div>
+    <div class="behavior-header-actions">
+      <button class="btn btn-secondary" id="reset-timings-btn"
+              title="Restore all timing values to defaults">
+        ↺ Reset defaults
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Search loop timings ───────────────────────────────── -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">🔎 Search loop timings</div>
+      <div class="dense-panel-hint">seconds — random between min and max</div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="timing-grid">
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Initial load wait</strong>
+            <div class="muted">After first page load, before looking for ads</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.initial_load_min"
+                     placeholder="2.0" value="2.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.initial_load_max"
+                     placeholder="4.0" value="4.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>SERP settle</strong>
+            <div class="muted">After DOM becomes ready, before reading content</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.serp_settle_min"
+                     placeholder="1.5" value="1.5">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.serp_settle_max"
+                     placeholder="3.0" value="3.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Post-refresh delay</strong>
+            <div class="muted">After <code>driver.refresh()</code> during retry</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_refresh_min"
+                     placeholder="2.0" value="2.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_refresh_max"
+                     placeholder="4.0" value="4.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Gap between queries</strong>
+            <div class="muted">Pause between consecutive searches in one run</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.5" min="0"
+                     data-config="behavior.between_queries_min"
+                     placeholder="6.0" value="6.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.5" min="0"
+                     data-config="behavior.between_queries_max"
+                     placeholder="12.0" value="12.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Session / proxy timings ───────────────────────────── -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">🛰 Session & proxy timings</div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="timing-grid">
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Post-rotate delay</strong>
+            <div class="muted">After IP rotation, before re-checking geo</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_rotate_min"
+                     placeholder="2.0" value="2.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_rotate_max"
+                     placeholder="4.0" value="4.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Fresh Google.com visit</strong>
+            <div class="muted">First visit on a fresh profile (before consent)</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.fresh_google_min"
+                     placeholder="3.0" value="3.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.fresh_google_max"
+                     placeholder="5.0" value="5.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Post-consent delay</strong>
+            <div class="muted">After accepting cookies on google.com</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_consent_min"
+                     placeholder="2.0" value="2.0">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="0.1" min="0"
+                     data-config="behavior.post_consent_max"
+                     placeholder="4.0" value="4.0">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Refresh retry ─────────────────────────────────────── -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">↻ Refresh retry</div>
+      <div class="dense-panel-hint">when no ads are found</div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="dense-hint">
+        When a query returns no ads, we refresh the page. These control
+        how aggressive the retry is. <strong>Max attempts</strong> = how
+        many tries before we give up; <strong>wait between</strong> = how
+        long we pause between refreshes.
+      </div>
+      <div class="timing-grid">
+        <div class="timing-row">
+          <div class="timing-label"><strong>Max refresh attempts</strong></div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <input type="number" class="input" step="1" min="1" max="10"
+                     data-config="search.refresh_max_attempts"
+                     placeholder="4" value="4">
+            </div>
+          </div>
+        </div>
+        <div class="timing-row">
+          <div class="timing-label">
+            <strong>Wait between refreshes</strong>
+            <div class="muted">Pause added on each retry</div>
+          </div>
+          <div class="timing-inputs">
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">min</label>
+              <input type="number" class="input" step="1" min="1"
+                     data-config="search.refresh_min_sec"
+                     placeholder="10" value="10">
+            </div>
+            <span class="timing-dash">–</span>
+            <div class="timing-input-wrap">
+              <label class="timing-minmax-label">max</label>
+              <input type="number" class="input" step="1" min="1"
+                     data-config="search.refresh_max_sec"
+                     placeholder="15" value="15">
+            </div>
+            <span class="unit">s</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Naturalness options ───────────────────────────────── -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">🎭 Naturalness</div>
+      <div class="dense-panel-hint">interaction-level realism on top of C++ stealth</div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="dense-hint">
+        After the Chromium C++ stealth patches
+        (<code>navigator.webdriver</code>, UA-CH, canvas/WebGL/audio noise,
+        sub-ms timing jitter, UA Client Hints, Battery, Permissions) all
+        mask the automation cleanly at the engine level — most JS-based
+        "naturalness" shims are redundant. The options below are still
+        available for <em>interaction-level</em> realism.
+      </div>
+
+      <div class="naturalness-grid">
+        <label class="checkbox-row">
+          <input type="checkbox" id="cfg-idle" data-config="behavior.idle_pauses">
+          <div class="checkbox-text">
+            <strong>Idle pauses</strong>
+            <div class="muted">Occasionally pause 8–20 s between queries, like a distracted human</div>
+          </div>
+        </label>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="cfg-pre-target" data-config="behavior.pre_target_warmup">
+          <div class="checkbox-text">
+            <strong>Pre-target warm-up query</strong>
+            <div class="muted">Issue one neutral search (e.g. weather, news) before the real target query — harder to correlate with intent</div>
+          </div>
+        </label>
+
+        <label class="checkbox-row">
+          <input type="checkbox" id="cfg-bg-tabs" data-config="behavior.open_background_tabs">
+          <div class="checkbox-text">
+            <strong>Open background tabs</strong>
+            <div class="muted">Opens 2–4 noise tabs (news, weather) alongside the monitoring tab. Use only if captcha rates stay elevated despite stealth patches.</div>
+          </div>
+        </label>
+      </div>
+
+      <details class="deprecated-section">
+        <summary>Deprecated (handled by C++ patches)</summary>
+        <div class="dense-hint" style="margin-bottom: 12px;">
+          These options existed before the native Chromium patches landed.
+          They used to inject JS to mask <code>webdriver</code>, spoof
+          plugins, and add canvas noise. All of that is now done at the
+          C++ engine level — turning these back on adds no value and may
+          <em>increase</em> detection risk.
+        </div>
+        <ul class="deprecated-list">
+          <li>✓ <code>navigator.webdriver</code> spoof → C++ patch</li>
+          <li>✓ Canvas / WebGL / Audio fingerprint noise → C++ patches</li>
+          <li>✓ Plugin & MIME-type list injection → C++ patch</li>
+          <li>✓ Timezone / Intl.DateTimeFormat override → C++ patch</li>
+          <li>✓ UA / UA-CH / platform spoof → C++ patch (browser process)</li>
+          <li>✓ <code>performance.now()</code> sub-ms jitter → C++ patch 1.3</li>
+          <li>✓ MouseEvent timestamp jitter → C++ patch 4.3</li>
+          <li>✓ Battery / Permissions / MediaDevices → C++ patches</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+
+  <!-- ── Captcha ───────────────────────────────────────────── -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">🧩 Captcha</div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="form-group" style="margin: 0;">
+        <label class="form-label">2Captcha API key</label>
+        <input type="password" class="input" data-config="captcha.twocaptcha_key"
+               style="max-width: 400px;">
+        <div class="form-hint">
+          Leave empty if you don't want automatic captcha solving.
+          With properly-patched Chromium, captchas should rarely appear.
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,0 +1,172 @@
+<!--
+  Overview — operator-focused at-a-glance status.
+
+  Design principle: this page is the first thing a user sees when they
+  open the dashboard. It must answer four questions in two seconds:
+
+    1. Is anything running RIGHT NOW?
+    2. Are my profiles healthy / banned / blocked?
+    3. Is my vault unlocked / scheduler armed / proxies online?
+    4. What just happened? (recent events feed)
+
+  Competitor / ad-volume metrics moved to the Competitors page where
+  they belong — duplicating them here was clutter.
+-->
+<section class="overview-workspace">
+
+  <div class="page-header">
+    <div>
+      <div class="page-title">Overview</div>
+      <div class="page-subtitle" id="ov-hero-sub">
+        At-a-glance operational status — vault, scheduler, proxies, profiles, recent activity.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ Operational status hero (5 colour-coded tiles) ══════ -->
+  <div class="ov-hero">
+    <a href="#" data-nav="accounts" class="ov-tile ov-tile-vault">
+      <div class="ov-tile-label"><span class="dot"></span>Vault</div>
+      <div class="ov-tile-value tile-color" id="ov-vault-state">—</div>
+      <div class="ov-tile-sub" id="ov-vault-sub">checking…</div>
+      <span class="ov-tile-action">Open →</span>
+    </a>
+
+    <a href="#" data-nav="scheduler" class="ov-tile ov-tile-scheduler">
+      <div class="ov-tile-label"><span class="dot"></span>Scheduler</div>
+      <div class="ov-tile-value tile-color" id="ov-sched-state">—</div>
+      <div class="ov-tile-sub" id="ov-sched-sub">—</div>
+      <span class="ov-tile-action">Open →</span>
+    </a>
+
+    <a href="#" data-nav="runs" class="ov-tile ov-tile-runs">
+      <div class="ov-tile-label"><span class="dot"></span>Active runs</div>
+      <div class="ov-tile-value tile-color" id="ov-active-count">—</div>
+      <div class="ov-tile-sub" id="ov-active-sub">runs in progress</div>
+      <span class="ov-tile-action">Open →</span>
+    </a>
+
+    <a href="#" data-nav="proxy" class="ov-tile ov-tile-proxy">
+      <div class="ov-tile-label"><span class="dot"></span>Proxies</div>
+      <div class="ov-tile-value tile-color" id="ov-proxy-count">—</div>
+      <div class="ov-tile-sub" id="ov-proxy-sub">—</div>
+      <span class="ov-tile-action">Open →</span>
+    </a>
+
+    <a href="#" data-nav="runs" class="ov-tile ov-tile-captcha">
+      <div class="ov-tile-label"><span class="dot"></span>Captchas · 24h</div>
+      <div class="ov-tile-value tile-color" id="ov-captcha-count">—</div>
+      <div class="ov-tile-sub" id="ov-captcha-sub">—</div>
+      <span class="ov-tile-action">Open →</span>
+    </a>
+  </div>
+
+  <!-- ═══ Quick actions ════════════════════════════════════ -->
+  <div class="ov-actions">
+    <span class="ov-actions-label">Quick actions</span>
+    <a href="#" data-nav="profiles" class="ov-action-btn">▶ Run a profile</a>
+    <a href="#" data-nav="session" class="ov-action-btn">🔥 Warmup robot</a>
+    <a href="#" data-nav="fingerprint" class="ov-action-btn">🧬 Fingerprint editor</a>
+    <a href="#" data-nav="accounts" class="ov-action-btn">🔐 Vault</a>
+    <a href="#" data-nav="scheduler" class="ov-action-btn">🕰 Scheduler</a>
+    <a href="#" data-nav="logs" class="ov-action-btn">📜 Logs</a>
+  </div>
+
+  <!-- ═══ Active runs strip (only when something is running) ═ -->
+  <div class="dense-panel" id="ov-active-panel" style="display: none;">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">⚡ Live runs
+        <span class="dense-panel-hint">— what's running right now</span>
+      </div>
+    </div>
+    <div class="ov-active-runs" id="ov-active-runs"></div>
+  </div>
+
+  <!-- ═══ Two-col: profiles (left) + activity feed (right) ═══ -->
+  <div class="ov-cols">
+
+    <!-- Left: profile health table -->
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">👤 Profile health
+          <span class="dense-panel-hint">— click a row to open profile</span>
+        </div>
+        <a href="#" data-nav="profiles" class="btn btn-secondary btn-small">
+          All profiles →
+        </a>
+      </div>
+      <div class="dense-table-wrap">
+        <table class="dense-table ov-profiles-table">
+          <thead>
+            <tr>
+              <th class="col-profile">Profile</th>
+              <th class="col-status" style="width: 90px;">Status</th>
+              <th class="col-fp" style="width: 90px;">FP score</th>
+              <th class="col-num num" style="width: 90px;">Runs 24h</th>
+              <th class="col-num num" style="width: 110px;">Captcha rate</th>
+              <th class="col-when" style="width: 130px;">Last run</th>
+            </tr>
+          </thead>
+          <tbody id="profile-health-tbody">
+            <tr><td colspan="6" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Right: activity feed -->
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">⏳ Recent activity</div>
+      </div>
+      <div class="ov-feed" id="ov-activity"></div>
+    </div>
+  </div>
+
+  <!-- ═══ Fingerprint health rollup ════════════════════════ -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">
+        🧬 Fingerprint health
+        <span class="dense-panel-hint">
+          — coherence scores; warnings = profiles that need regeneration
+        </span>
+      </div>
+      <a href="#" data-nav="fingerprint" class="btn btn-secondary btn-small">
+        Open editor →
+      </a>
+    </div>
+
+    <div class="overview-fp-grid">
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-avg">
+        <div class="overview-fp-summary-tile-label">Average score</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-avg-score">—</div>
+      </div>
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-warn">
+        <div class="overview-fp-summary-tile-label">Warnings (&lt; 75)</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-warn-count">—</div>
+      </div>
+      <div class="overview-fp-summary-tile" id="ov-fp-tile-missing">
+        <div class="overview-fp-summary-tile-label">Missing fingerprint</div>
+        <div class="overview-fp-summary-tile-value" id="ov-fp-missing-count">—</div>
+      </div>
+    </div>
+
+    <div class="dense-table-wrap">
+      <table class="dense-table overview-fp-table">
+        <thead>
+          <tr>
+            <th class="col-profile">Profile</th>
+            <th class="col-template">Template</th>
+            <th class="col-score num">Score</th>
+            <th class="col-snaps num">Snapshots</th>
+            <th class="col-when">Last regen</th>
+          </tr>
+        </thead>
+        <tbody id="overview-fp-tbody">
+          <tr><td colspan="5" class="dense-empty-cell">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>

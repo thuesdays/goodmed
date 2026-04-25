@@ -1,0 +1,302 @@
+<section class="proxy-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Proxies</div>
+      <div class="page-subtitle">
+        Proxy library. Each profile picks one — runtime routes through
+        the assigned proxy. Click a row to test or edit.
+      </div>
+    </div>
+    <div class="proxy-header-actions">
+      <button class="btn btn-secondary" id="proxy-bulk-import-btn"
+              title="Paste many URLs at once">📋 Bulk import</button>
+      <button class="btn btn-secondary" id="proxy-test-all-btn"
+              title="Probe every proxy and refresh statuses">🔬 Test all</button>
+      <button class="btn btn-primary" id="proxy-add-btn">+ Add proxy</button>
+    </div>
+  </div>
+
+  <!-- ── Search + counter toolbar ────────────────────────────── -->
+  <div class="proxy-toolbar">
+    <input type="text" id="proxy-search" class="input proxy-search"
+           placeholder="Search name, host, country, ISP…">
+    <div class="proxy-toolbar-stats" id="proxy-toolbar-stats">
+      <span><strong id="stat-total">0</strong> total</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-active" class="stat-active">0</strong> active</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-error" class="stat-error">0</strong> errors</span>
+      <span class="stat-sep">·</span>
+      <span><strong id="stat-untested" class="stat-untested">0</strong> untested</span>
+    </div>
+  </div>
+
+  <!-- ── Main grid ───────────────────────────────────────────── -->
+  <div class="proxy-table-wrap">
+    <table class="proxy-table" id="proxy-table">
+      <thead>
+        <tr>
+          <th class="col-name">Name</th>
+          <th class="col-status">Status</th>
+          <th class="col-type">Type</th>
+          <th class="col-host">Host</th>
+          <th class="col-port">Port</th>
+          <th class="col-login">Login</th>
+          <th class="col-geo">Geo</th>
+          <th class="col-iptype">IP type</th>
+          <th class="col-latency">Latency</th>
+          <th class="col-profiles">Profiles</th>
+          <th class="col-checked">Checked</th>
+          <th class="col-actions"></th>
+        </tr>
+      </thead>
+      <tbody id="proxy-tbody">
+        <tr><td colspan="12" class="proxy-empty-cell">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── Global options (collapsible) ────────────────────────── -->
+  <!-- Settings that apply to the whole run regardless of which
+       proxy is assigned: auto-rotate at start-of-run, geo-lock
+       expectations, rotation throttle. Keeps the page compact —
+       bulk of screen is the table above. -->
+  <details class="proxy-global-options" id="proxy-global-options">
+    <summary class="proxy-global-summary">
+      <span class="summary-icon">▸</span>
+      Global options
+      <span class="summary-hint">— apply to all runs regardless of assigned proxy</span>
+    </summary>
+
+    <div class="proxy-global-body">
+      <div class="proxy-global-grid">
+
+        <!-- Auto-rotate -->
+        <div class="option-card">
+          <div class="option-card-title">🔄 Auto-rotate at run start</div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="opt-auto-rotate"
+                   data-config="proxy.rotate_on_start">
+            <span>Rotate before each run</span>
+          </label>
+          <div class="option-card-hint">
+            Forces a fresh exit IP at the start of every run. Requires
+            a rotation API on the assigned proxy.
+          </div>
+
+          <div class="form-group" style="margin-top: 10px;">
+            <label class="form-label">Rotate every N runs</label>
+            <input type="number" class="input" min="1" max="1000"
+                   data-config="proxy.rotate_every_n_runs"
+                   style="max-width: 100px;">
+          </div>
+        </div>
+
+        <!-- Geo lock -->
+        <div class="option-card">
+          <div class="option-card-title">🌍 Geo lock</div>
+          <div class="option-card-hint" style="margin-bottom: 10px;">
+            If the actual exit IP's geo doesn't match these values,
+            the run aborts before opening Chrome.
+          </div>
+          <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+            <div class="form-group" style="margin: 0;">
+              <label class="form-label">Expected country</label>
+              <input type="text" class="input"
+                     data-config="browser.expected_country"
+                     placeholder="Ukraine">
+            </div>
+            <div class="form-group" style="margin: 0;">
+              <label class="form-label">Expected timezone</label>
+              <input type="text" class="input"
+                     data-config="browser.expected_timezone"
+                     placeholder="Europe/Kyiv">
+            </div>
+          </div>
+        </div>
+
+        <!-- Self-check cadence -->
+        <div class="option-card">
+          <div class="option-card-title">🔬 Self-check cadence</div>
+          <div class="form-group">
+            <label class="form-label">Run self-check every N runs</label>
+            <input type="number" class="input" min="1" max="1000"
+                   data-config="browser.selfcheck_every_n_runs"
+                   style="max-width: 100px;">
+          </div>
+          <div class="option-card-hint">
+            Self-check verifies exit IP, country, timezone, WebRTC leak
+            every N runs (always on run #1). Lower = safer but slower.
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </details>
+</section>
+
+<!-- ── Add/Edit proxy modal ──────────────────────────────────── -->
+<div class="profile-modal" id="proxy-edit-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="proxy-edit-modal"></div>
+  <div class="profile-modal-content" style="width: 560px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title" id="proxy-edit-title">Add proxy</div>
+      <button class="profile-modal-close" data-close="proxy-edit-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Name (optional)</label>
+        <input type="text" id="edit-proxy-name" class="input"
+               placeholder="e.g. Residential UA-1">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Proxy URL *</label>
+        <input type="text" id="edit-proxy-url" class="input"
+               placeholder="http://user:pass@host:port or socks5://…"
+               style="font-family: ui-monospace, monospace;">
+        <div class="form-hint">
+          Accepts bare <code>host:port</code>, <code>user:pass@host:port</code>,
+          or full URL with scheme (<code>http://</code>, <code>socks5://</code>).
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-is-rotating">
+          <span>This proxy supports rotation (rotation API)</span>
+        </label>
+      </div>
+      <div id="edit-rotation-fields" style="display: none;">
+        <div class="form-group">
+          <label class="form-label">Rotation API URL</label>
+          <input type="text" id="edit-rotation-url" class="input"
+                 placeholder="https://api.asocks.com/v2/proxy/refresh/…"
+                 style="font-family: ui-monospace, monospace;">
+        </div>
+        <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="form-group">
+            <label class="form-label">Provider</label>
+            <select id="edit-rotation-provider" class="select">
+              <option value="none">generic (no auth)</option>
+              <option value="asocks">asocks</option>
+              <option value="brightdata">brightdata</option>
+              <option value="generic">generic with key</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">API key (optional)</label>
+            <input type="text" id="edit-rotation-key" class="input">
+          </div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-is-default">
+          <span>Make this the default proxy
+            <span class="form-hint" style="display: block;">
+              Profiles without an explicit assignment will use this.
+            </span>
+          </span>
+        </label>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Notes (optional)</label>
+        <textarea id="edit-proxy-notes" class="input" rows="2"
+                  placeholder="Why this proxy exists, expiry date…"></textarea>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="edit-proxy-auto-test" checked>
+          <span>Test connection after saving</span>
+        </label>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="proxy-edit-modal">Cancel</button>
+      <button class="btn btn-primary" id="proxy-edit-save-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Bulk import modal (multi-format + live preview) ──────── -->
+<!-- Accepts any of these per-line shapes:
+       host:port
+       host:port:user:pass       (IPRoyal / Webshare export)
+       user:pass@host:port
+       user:pass:host:port       (reversed colon)
+       http://u:p@host:port      (full URL)
+       socks5://u:p@host:port
+       [2001:db8::1]:8080        (IPv6)
+     Comments after `#` are stripped. Parser runs live as the user
+     types so they see what will actually be imported before Save. -->
+<div class="profile-modal" id="proxy-bulk-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="proxy-bulk-modal"></div>
+  <div class="profile-modal-content" style="width: 820px; max-height: 90vh;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">📋 Bulk import proxies</div>
+      <button class="profile-modal-close" data-close="proxy-bulk-modal">×</button>
+    </div>
+    <div class="profile-modal-body bulk-body">
+
+      <!-- Left: paste area + options -->
+      <div class="bulk-input-pane">
+        <label class="form-label">Paste proxy list</label>
+        <textarea id="bulk-proxy-text" class="input bulk-textarea"
+                  rows="14"
+                  placeholder="Paste any format, one per line:
+
+1.2.3.4:8080
+1.2.3.4:8080:user:pass
+user:pass@1.2.3.4:8080
+http://user:pass@1.2.3.4:8080
+socks5://user:pass@1.2.3.4:1080
+[2001:db8::1]:8080
+
+# Comments are skipped"
+                  spellcheck="false"
+                  style="font-family: ui-monospace, monospace;"></textarea>
+
+        <div class="bulk-options">
+          <div class="form-group" style="margin-bottom: 8px;">
+            <label class="form-label">Default scheme</label>
+            <select id="bulk-default-scheme" class="select"
+                    style="width: 130px;">
+              <option value="http" selected>HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks5">SOCKS5</option>
+              <option value="socks4">SOCKS4</option>
+            </select>
+            <div class="form-hint">
+              Applied to lines without an explicit scheme.
+            </div>
+          </div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="bulk-auto-test" checked>
+            <span>Test each proxy after import</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Right: live preview -->
+      <div class="bulk-preview-pane">
+        <div class="bulk-preview-header">
+          <div class="bulk-preview-title">Preview</div>
+          <div class="bulk-preview-stats" id="bulk-preview-stats">
+            Paste lines to see preview
+          </div>
+        </div>
+        <div class="bulk-preview-list" id="bulk-preview-list">
+          <div class="bulk-preview-empty">
+            Start typing on the left — the parser detects the format
+            automatically.
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="proxy-bulk-modal">Cancel</button>
+      <button class="btn btn-primary" id="proxy-bulk-save-btn" disabled>
+        Import
+      </button>
+    </div>
+  </div>
+</div>

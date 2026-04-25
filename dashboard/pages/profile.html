@@ -1,0 +1,396 @@
+<section>
+  <div class="page-header">
+    <div class="page-header-left">
+      <a href="#profiles" class="btn-icon-back" data-nav="profiles"
+         title="Back to all profiles" aria-label="Back to all profiles">←</a>
+      <div>
+        <div class="page-title">
+          Edit profile<span class="page-title-sep" id="profile-name-sep"></span><span
+            class="page-title-name" id="profile-name-display"></span>
+        </div>
+        <div class="page-subtitle">
+          Fingerprint, health, session quality — everything about
+          this profile.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── IDENTITY: tags, notes, language, session toggle ──────
+       Per-profile metadata. Keep this near the top so the human-readable
+       labels are the first thing the user sees on the edit page. -->
+  <div class="card profile-identity-card">
+    <div class="card-title">
+      🪪 Identity
+      <span class="muted">— tags, notes, language &amp; session</span>
+    </div>
+
+    <div class="input-row" style="margin-bottom: 14px;">
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Preferred language</label>
+        <input type="text" class="input" data-config="browser.preferred_language"
+               placeholder="uk-UA">
+        <div class="form-hint">Used for <code>navigator.language</code>
+          and <code>Accept-Language</code>. BCP-47 format.</div>
+      </div>
+      <div class="form-group" style="margin-bottom: 0;">
+        <label class="form-label">Session behaviour</label>
+        <div class="checkbox-row">
+          <input type="checkbox" id="cfg-auto-session"
+                 data-config="browser.auto_session">
+          <label for="cfg-auto-session">Auto-save / restore cookies between runs</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="profile-tags-row">
+      <label class="form-label">Tags</label>
+      <div class="form-hint" style="margin-bottom: 8px;">
+        Free-form labels — used to filter the Profiles page and bulk-select
+        for actions (e.g. <code>us-accounts</code>, <code>warmup</code>).
+      </div>
+      <div class="tag-editor-chips" id="pp-tags-chips">
+        <span class="muted" style="font-size: 12px;">Loading…</span>
+      </div>
+      <div style="display: flex; gap: 8px; margin-top: 10px; align-items: stretch;">
+        <input type="text" class="input" id="pp-tag-input"
+               placeholder="add a tag and press Enter"
+               style="flex: 1;">
+        <button class="btn btn-primary btn-add-tag" id="pp-tag-add-btn">
+          <span style="font-weight: 600;">+</span>
+          <span>Add</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
+      <label class="form-label">Notes</label>
+      <textarea class="input" id="pp-notes" rows="2"
+                placeholder="e.g. 'main Facebook for US account, do not warm up before Tuesday'"></textarea>
+    </div>
+
+    <div style="display: flex; gap: 10px; margin-top: 16px; align-items: center;">
+      <button class="btn btn-primary" id="pp-save-btn">💾 Save identity</button>
+      <span class="muted" style="font-size: 12px;" id="pp-save-status"></span>
+    </div>
+  </div>
+
+  <!-- ─── ACTIVE SCRIPT ──────────────────────────────────────── -->
+  <!-- Which saved script (from /Scripts page) does this profile run?
+       Null = fall back to default. UI only shows when we've loaded the
+       profile name, since the API is per-profile. -->
+  <div class="card">
+    <div class="card-title">
+      🎬 Active script
+      <span class="muted">— the flow this profile executes per run</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Script</label>
+      <select class="select" id="profile-script-select" style="min-width: 320px;">
+        <option value="">— loading —</option>
+      </select>
+      <div class="form-hint" id="profile-script-hint"
+           style="margin-top: 8px;">
+        Pick from scripts in the
+        <a href="#" data-nav="scripts" class="inline-link">Scripts library</a>.
+        Leave empty to use whichever script is marked Default.
+      </div>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+      <button class="btn btn-primary btn-small" id="profile-script-save-btn">
+        Save assignment
+      </button>
+      <a href="#" data-nav="scripts" class="btn btn-secondary btn-small">
+        Open Scripts →
+      </a>
+    </div>
+  </div>
+
+  <!-- ─── ACTIVE PROXY ───────────────────────────────────────── -->
+  <!-- Mirrors Active script above — picks one proxy from the library
+       for this profile. Shows live-cached status inline so users see
+       what proxy the profile will actually route through. -->
+  <div class="card">
+    <div class="card-title">
+      🛰 Active proxy
+      <span class="muted">— which proxy this profile routes through</span>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Proxy</label>
+      <select class="select" id="profile-proxy-select" style="min-width: 360px;">
+        <option value="">— loading —</option>
+      </select>
+      <div class="form-hint" id="profile-proxy-hint"
+           style="margin-top: 8px;">
+        Pick from the
+        <a href="#" data-nav="proxy" class="inline-link">Proxy library</a>.
+        Leave empty to use whichever proxy is marked Default.
+      </div>
+    </div>
+    <div id="profile-proxy-status" class="profile-proxy-status-row"
+         style="display: none;">
+      <span class="status-badge" id="profile-proxy-status-badge">—</span>
+      <span id="profile-proxy-status-meta" class="form-hint"
+            style="margin: 0;"></span>
+    </div>
+    <div style="display: flex; gap: 8px; margin-top: 10px;">
+      <button class="btn btn-primary btn-small" id="profile-proxy-save-btn">
+        Save assignment
+      </button>
+      <button class="btn btn-secondary btn-small" id="profile-proxy-test-btn"
+              title="Test the assigned proxy">🔬 Test</button>
+      <a href="#" data-nav="proxy" class="btn btn-secondary btn-small">
+        Open Proxies →
+      </a>
+    </div>
+  </div>
+
+  <!-- ─── ACTIVE FINGERPRINT ─────────────────────────────────── -->
+  <!-- Mirror card to Active script / Active proxy above. Shows the
+       current fingerprint's coherence score + template, with direct
+       links into the full editor. The mini-badge colours follow the
+       same excellent/good/warning/critical mapping as the editor. -->
+  <div class="card">
+    <div class="card-title">
+      🧬 Active fingerprint
+      <span class="muted">— identity this profile reports to websites</span>
+    </div>
+
+    <div class="profile-fp-card-row" id="profile-fp-row">
+      <!-- Score badge populated by profile-detail.js -->
+      <div class="profile-fp-mini-badge fp-score-unknown" id="profile-fp-badge">
+        <div class="fp-mini-score" id="profile-fp-score">—</div>
+        <div class="fp-mini-grade" id="profile-fp-grade">no data</div>
+      </div>
+      <div>
+        <div class="profile-fp-summary-line" id="profile-fp-summary">
+          Loading fingerprint…
+        </div>
+        <div class="profile-fp-summary-meta" id="profile-fp-meta"></div>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <a href="#" data-nav="fingerprint" class="btn btn-primary btn-small"
+           id="profile-fp-open-btn">
+          Open fingerprint editor →
+        </a>
+        <button class="btn btn-secondary btn-small" id="profile-fp-regen-btn"
+                title="Re-roll the fingerprint for this profile (keeps none of the current values)">
+          ↻ Quick regenerate
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── PROXY / NETWORK ─────────────────────────────────────
+       Per-profile network override. Empty proxy URL = inherit the
+       global setting from the Proxy page. The "rotating" toggle
+       reveals the rotation API config block — keeping it collapsed
+       by default avoids overwhelming users who just want a static
+       proxy. -->
+  <div class="card profile-proxy-card">
+    <div class="card-title">
+      🌐 Proxy &amp; network override
+      <span class="muted">— exit IP for this profile</span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 14px;">
+      Leave the URL blank to use the global <code>proxy.url</code>.
+      Useful when each profile needs a different exit (e.g. one
+      profile per country, multi-account on the same site).
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">Proxy URL</label>
+      <input type="text" class="input" id="pp-proxy-url"
+             placeholder="http://user:pass@host:port"
+             autocomplete="off" spellcheck="false">
+      <div class="form-hint">
+        Supports <code>http://</code>, <code>https://</code>,
+        <code>socks5://</code>. User and password are URL-encoded
+        in-band.
+      </div>
+    </div>
+
+    <div class="checkbox-row" style="margin-top: 14px;">
+      <input type="checkbox" id="pp-proxy-rotating">
+      <label for="pp-proxy-rotating">
+        This is a <strong>rotating</strong> proxy — call a rotate API between runs
+      </label>
+    </div>
+
+    <div class="profile-rotation-block" id="pp-rotation-block" style="display: none;">
+      <div class="form-hint" style="margin-bottom: 10px;">
+        Custom rotation endpoint just for this profile. Leave both
+        fields blank to inherit the global rotation config from the
+        Proxy page.
+      </div>
+      <div class="input-row">
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Rotation API URL</label>
+          <input type="text" class="input" id="pp-rotation-url"
+                 placeholder="empty = inherit global"
+                 autocomplete="off" spellcheck="false">
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Rotation provider</label>
+          <select class="select" id="pp-rotation-provider">
+            <option value="">— inherit global —</option>
+            <option value="none">None</option>
+            <option value="asocks">asocks</option>
+            <option value="brightdata">Bright Data</option>
+            <option value="generic">Generic</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group" style="margin-top: 12px; margin-bottom: 0;">
+        <label class="form-label">Provider API key <span class="form-label-optional">(if required)</span></label>
+        <input type="password" class="input" id="pp-rotation-api-key"
+               placeholder="leave empty if the URL contains the token"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">
+          Bright Data / asocks: stored encrypted in the vault. Generic
+          providers usually pass auth in the URL itself.
+        </div>
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 10px; margin-top: 16px; align-items: center;">
+      <button class="btn btn-primary" id="pp-proxy-save-btn-new">💾 Save proxy</button>
+      <button class="btn btn-secondary btn-small" id="pp-proxy-test-btn-new"
+              title="Test the URL above against ipinfo">🔬 Test</button>
+      <span class="muted" style="font-size: 12px;" id="pp-proxy-save-status"></span>
+    </div>
+  </div>
+
+  <!-- ─── SESSION & COOKIES (summary card) ───────────────────── -->
+  <!-- Everything that used to be on this page (Chrome import, live
+       cookies table, cookie import modal) moved to the dedicated
+       Session & cookies page. This card is a compact rollup + entry
+       point, same pattern as Active script / Active proxy / Active
+       fingerprint above. -->
+  <div class="card">
+    <div class="card-title">
+      🍪 Session & cookies
+      <span class="muted">— warmup robot, cookie pool, Chrome import</span>
+    </div>
+    <div class="profile-fp-card-row" id="profile-session-row">
+      <!-- Mini stats populated by profile-detail.js loadSessionSummary -->
+      <div class="profile-fp-mini-badge" id="profile-session-badge">
+        <div class="fp-mini-score" id="profile-session-count">—</div>
+        <div class="fp-mini-grade">snapshots</div>
+      </div>
+      <div>
+        <div class="profile-fp-summary-line" id="profile-session-summary">
+          Loading session status…
+        </div>
+        <div class="profile-fp-summary-meta" id="profile-session-meta"></div>
+      </div>
+      <div style="display: flex; gap: 6px;">
+        <a href="#" data-nav="session" class="btn btn-primary btn-small"
+           id="profile-session-open-btn">
+          Open session manager →
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── RUNTIME NETWORK SELF-CHECK ─────────────────────────────
+       Distinct from the Fingerprint coherence validator on the
+       Fingerprint page — this card shows results of the per-run
+       network probes: exit IP, country, timezone, WebRTC leak.
+       Fingerprint-side validation (config coherence + live stealth
+       probe) now lives under the Fingerprint editor. -->
+  <div class="card">
+    <div class="card-title">
+      🛰 Runtime self-check
+      <span class="muted">— network probes per run: exit IP, geo, WebRTC, timezone</span>
+      <span class="badge" id="selfcheck-badge">—</span>
+    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Checks that run against the <strong>network layer</strong> on every Nth run
+      (configurable in <a href="#" data-nav="proxy" class="inline-link">Proxy</a>
+      → self-check cadence). These verify that the proxy actually routes
+      traffic through the expected country and doesn't leak WebRTC.
+      For <strong>fingerprint</strong> coherence checks (UA, fonts, GPU, timezone
+      plausibility) and a live stealth probe, see the
+      <a href="#" data-nav="fingerprint" class="inline-link">Fingerprint editor</a>.
+    </div>
+    <div id="selfcheck-time" class="muted" style="margin-bottom: 12px;"></div>
+    <div class="selfcheck-grid" id="selfcheck-grid"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      Current fingerprint
+      <span class="muted">— raw payload applied to Chromium at launch</span>
+      <div style="margin-left: auto;">
+        <button class="btn btn-primary btn-small" id="regen-fp-btn">
+          🎲 Regenerate fingerprint
+        </button>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom: 12px;">
+      Debug view of the JSON payload Chromium consumes. For a proper editor
+      with coherence scoring, locks, history, and a live browser probe use the
+      <a href="#" data-nav="fingerprint" class="inline-link">Fingerprint page</a>.
+      The button above is a shortcut to the legacy hash-seeded regeneration.
+    </div>
+    <pre class="json-view" id="fingerprint-view">Loading...</pre>
+  </div>
+
+  <!-- ═══ DANGER ZONE ═══
+       Destructive profile-level operations. Pulled out of the
+       self-check header where they used to crowd an already-busy
+       title bar. Ordered by destructiveness so Delete is last.
+       IDs (#reset-health-btn, #clear-history-btn, #delete-profile-btn)
+       kept identical so profile-detail.js binds without changes. -->
+  <div class="card card-danger profile-danger-zone">
+    <div class="card-title">
+      ⚠ Danger zone
+      <span class="muted">— destructive operations scoped to this profile</span>
+    </div>
+    <div class="danger-banner">
+      These operations affect only the currently-selected profile. They do
+      not touch the proxy library, scripts, or global config. Delete cannot
+      be undone — the user-data-dir is wiped from disk.
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Reset consecutive-blocks counter</div>
+        <div class="danger-op-desc">
+          Clears the "N runs in a row hit a captcha/block" counter. Use after
+          you've rotated the proxy or edited the fingerprint and want a clean
+          slate — the health-based pause-on-block logic will stop flagging this
+          profile. No historical data is lost.
+        </div>
+      </div>
+      <button class="btn btn-secondary" id="reset-health-btn">Reset blocks</button>
+    </div>
+
+    <div class="danger-op-row">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Clear session-quality history</div>
+        <div class="danger-op-desc">
+          Wipes the per-run quality log (ad counts, captcha hits, durations) for
+          this profile. Run records themselves stay in the
+          <a href="#" data-nav="runs" class="inline-link">Runs</a> page — only
+          the session-quality rollup is cleared. Cannot be undone.
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-danger" id="clear-history-btn">Clear history</button>
+    </div>
+
+    <div class="danger-op-row danger-op-row-critical">
+      <div class="danger-op-body">
+        <div class="danger-op-title">Delete profile</div>
+        <div class="danger-op-desc">
+          Removes the profile from the database and deletes its entire
+          user-data-dir from disk — cookies, session, history, fingerprints,
+          all gone. Proxy assignments to this profile are released. Cannot be
+          undone. Any running job for this profile is stopped first.
+        </div>
+      </div>
+      <button class="btn btn-danger" id="delete-profile-btn">Delete profile</button>
+    </div>
+  </div>
+</section>

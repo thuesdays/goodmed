@@ -1,0 +1,138 @@
+<section class="traffic-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">📈 Traffic</div>
+      <div class="page-subtitle">
+        Bytes per profile × domain × hour. Measured via Chrome's
+        PerformanceObserver — includes TLS, headers, and compressed
+        response bodies (the same bytes your proxy provider bills you for).
+      </div>
+    </div>
+    <div class="traffic-header-actions">
+      <select class="select" id="traffic-range" style="min-width: 140px;">
+        <option value="1">Last 1 hour</option>
+        <option value="6">Last 6 hours</option>
+        <option value="24" selected>Last 24 hours</option>
+        <option value="168">Last 7 days</option>
+        <option value="720">Last 30 days</option>
+        <option value="2160">Last 90 days</option>
+      </select>
+      <button class="btn btn-secondary" id="traffic-refresh-btn">↻ Refresh</button>
+    </div>
+  </div>
+
+  <!-- Summary statbar -->
+  <div class="dense-statbar">
+    <div class="dense-stat">
+      <div class="dense-stat-label">Total bytes</div>
+      <div class="dense-stat-value" id="tr-total-bytes">—</div>
+      <div class="dense-stat-sub" id="tr-total-bytes-sub">in selected range</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Requests</div>
+      <div class="dense-stat-value" id="tr-total-requests">—</div>
+      <div class="dense-stat-sub" id="tr-avg-per-req">avg —/req</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Active profiles</div>
+      <div class="dense-stat-value" id="tr-profile-count">—</div>
+      <div class="dense-stat-sub">contributed traffic</div>
+    </div>
+    <div class="dense-stat">
+      <div class="dense-stat-label">Unique domains</div>
+      <div class="dense-stat-value" id="tr-domain-count">—</div>
+      <div class="dense-stat-sub">hit across all profiles</div>
+    </div>
+  </div>
+
+  <!-- Time series chart — compact, full-width, modest height -->
+  <div class="dense-panel">
+    <div class="dense-panel-header">
+      <div class="dense-panel-title">Traffic over time</div>
+      <div class="dense-panel-hint" id="tr-chart-bucket-hint">
+        hour buckets
+      </div>
+    </div>
+    <div class="dense-panel-body">
+      <div class="traffic-chart-wrap">
+        <canvas id="tr-chart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- Two-column: by profile + top domains side-by-side on wide
+       screens, stacked on narrow. -->
+  <div class="traffic-grid">
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title">By profile</div>
+        <div class="dense-panel-hint">who's using your bandwidth</div>
+      </div>
+      <div class="dense-table-wrap">
+        <table class="dense-table traffic-table" id="tr-profile-table">
+          <thead>
+            <tr>
+              <th class="col-profile">Profile</th>
+              <th class="col-bytes">Bytes</th>
+              <th class="col-num">Requests</th>
+              <th class="col-num">Domains</th>
+              <th class="col-actions"></th>
+            </tr>
+          </thead>
+          <tbody id="tr-profile-tbody">
+            <tr><td colspan="5" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="dense-panel">
+      <div class="dense-panel-header">
+        <div class="dense-panel-title" id="tr-domain-card-title">Top domains</div>
+        <div class="dense-panel-hint" style="display: flex; align-items: center; gap: 6px;">
+          Filter:
+          <select class="select" id="tr-domain-profile-filter"
+                  style="min-width: 150px; font-size: 11px; padding: 3px 8px;">
+            <option value="">All profiles</option>
+          </select>
+        </div>
+      </div>
+      <div class="dense-table-wrap">
+        <table class="dense-table traffic-table" id="tr-domain-table">
+          <thead>
+            <tr>
+              <th class="col-domain">Domain</th>
+              <th class="col-bytes">Bytes</th>
+              <th class="col-num">Requests</th>
+              <th class="col-num" id="tr-domain-profiles-col">Profiles</th>
+            </tr>
+          </thead>
+          <tbody id="tr-domain-tbody">
+            <tr><td colspan="4" class="dense-empty-cell">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Explanation — a callout, not a full card -->
+  <div class="dense-callout">
+    <div class="dense-callout-icon">ℹ</div>
+    <div class="dense-callout-body">
+      <strong>How traffic is counted.</strong>
+      Every Chrome instance installs a <code>PerformanceObserver</code>
+      that emits one entry per completed resource load (HTML, CSS, JS,
+      images, XHR, fetch, media, fonts). Each entry carries
+      <code>transferSize</code> — exact bytes over the wire including
+      TLS headers.
+      We aggregate by <strong>domain + hour bucket</strong> in memory,
+      flushing totals to SQLite every 30 seconds. We never store the full
+      URL — only the hostname — so this feature is safe on accounts where
+      URL paths would leak sensitive IDs or query params.
+      Cached requests appear as 0-byte entries and still contribute to the
+      request count, useful to spot cache-efficient vs cache-hostile sites.
+    </div>
+  </div>
+</section>

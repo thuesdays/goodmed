@@ -1,0 +1,165 @@
+<section class="scripts-workspace">
+  <!-- ── Library mode (default) ────────────────────────────── -->
+  <div id="scripts-library-view">
+    <div class="page-header">
+      <div>
+        <div class="page-title">Scripts</div>
+        <div class="page-subtitle">
+          Saved flow definitions. Assign a script to a profile on the
+          profile page — the runtime fetches the profile's script at
+          the start of each run.
+        </div>
+      </div>
+      <div class="scripts-header-actions">
+        <button class="btn btn-secondary" id="library-import-btn"
+                title="Create a new script from a JSON file">📥 Import</button>
+        <button class="btn btn-primary" id="library-new-btn">
+          + New script
+        </button>
+      </div>
+      <input type="file" id="library-import-file"
+             accept=".json,application/json" style="display: none;">
+    </div>
+
+    <div class="scripts-library-grid" id="scripts-library-grid">
+      <div class="library-empty">Loading…</div>
+    </div>
+  </div>
+
+  <!-- ── Editor mode ───────────────────────────────────────── -->
+  <div id="scripts-editor-view" style="display: none;">
+    <div class="page-header">
+      <div>
+        <div class="editor-breadcrumbs">
+          <a href="#" id="editor-back-btn" class="editor-back-link">
+            ← All scripts
+          </a>
+        </div>
+        <div class="editor-name-wrap">
+          <input type="text" id="editor-name-input" class="editor-name-input"
+                 placeholder="Untitled script">
+          <span class="editor-default-badge" id="editor-default-badge"
+                title="This is the default script"
+                style="display: none;">DEFAULT</span>
+        </div>
+        <input type="text" id="editor-desc-input" class="editor-desc-input"
+               placeholder="Description (optional)">
+      </div>
+      <div class="scripts-header-actions">
+        <button class="btn btn-secondary" id="editor-export-btn"
+                title="Download this script as JSON">📤 Export</button>
+        <button class="btn btn-secondary" id="editor-default-btn"
+                title="Make this the default script for profiles without assignment">★ Make default</button>
+        <button class="btn btn-secondary btn-danger" id="editor-delete-btn"
+                title="Delete this script">🗑 Delete</button>
+        <button class="btn btn-secondary" id="editor-reload-btn"
+                title="Discard changes and reload from server">↻ Reload</button>
+        <button class="btn btn-primary" id="editor-save-btn">
+          💾 Save
+        </button>
+      </div>
+    </div>
+
+    <div class="scripts-panes">
+
+      <!-- Palette -->
+      <aside class="scripts-palette" id="scripts-palette">
+        <div class="palette-header">
+          <div class="palette-title">Actions</div>
+          <input type="text" class="palette-search input"
+                 id="palette-search" placeholder="Search actions…">
+        </div>
+        <div class="palette-scroll" id="palette-body">
+          <div class="palette-empty">Loading…</div>
+        </div>
+        <div class="palette-hint">
+          Drag onto canvas, or click to append to the flow.
+        </div>
+      </aside>
+
+      <!-- Canvas -->
+      <main class="scripts-canvas" id="scripts-canvas">
+        <div class="canvas-toolbar">
+          <div class="canvas-toolbar-info">
+            <span class="canvas-chip"><span class="chip-dot dot-flow"></span>flow</span>
+            <span class="canvas-chip"><span class="chip-dot dot-nav"></span>navigation</span>
+            <span class="canvas-chip"><span class="chip-dot dot-int"></span>interaction</span>
+            <span class="canvas-chip"><span class="chip-dot dot-data"></span>data</span>
+            <span class="canvas-chip"><span class="chip-dot dot-tim"></span>timing</span>
+          </div>
+          <div class="canvas-stats" id="canvas-stats">
+            <span><strong id="stat-total-count">0</strong> steps</span>
+          </div>
+        </div>
+
+        <div class="canvas-flow-wrap">
+          <svg class="flow-arrows" id="flow-arrows" aria-hidden="true"></svg>
+          <div class="canvas-flow" id="canvas-flow"
+               data-container-path="root"></div>
+        </div>
+      </main>
+
+      <!-- Inspector -->
+      <aside class="scripts-inspector" id="scripts-inspector" style="display: none;">
+        <div class="inspector-header">
+          <div class="inspector-title" id="inspector-title">Inspector</div>
+          <button class="inspector-close btn-icon" id="inspector-close-btn"
+                  title="Deselect step">✕</button>
+        </div>
+        <div class="inspector-body" id="inspector-body"></div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<!-- Variable autocomplete popup -->
+<div class="var-picker" id="var-picker" style="display: none;">
+  <div class="var-picker-header">Available variables</div>
+  <div class="var-picker-body" id="var-picker-body"></div>
+</div>
+
+<!-- Type-picker modal -->
+<div class="profile-modal" id="type-picker-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="type-picker-modal"></div>
+  <div class="profile-modal-content" style="width: 560px; max-height: 80vh;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">➕ Add action</div>
+      <button class="profile-modal-close" data-close="type-picker-modal">×</button>
+    </div>
+    <div class="profile-modal-body" style="padding: 0;">
+      <div style="padding: 16px 20px 10px;">
+        <input type="text" class="input" id="type-picker-search"
+               placeholder="Search actions…" style="width: 100%;">
+      </div>
+      <div id="type-picker-list"
+           style="max-height: 55vh; overflow-y: auto; padding: 0 14px 16px;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- New-script modal -->
+<div class="profile-modal" id="new-script-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="new-script-modal"></div>
+  <div class="profile-modal-content" style="width: 480px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title">New script</div>
+      <button class="profile-modal-close" data-close="new-script-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Name</label>
+        <input type="text" id="new-script-name" class="input"
+               placeholder="e.g. Aggressive competitor clicks">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description (optional)</label>
+        <textarea id="new-script-desc" class="input" rows="3"
+                  placeholder="What does this script do?"></textarea>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="new-script-modal">Cancel</button>
+      <button class="btn btn-primary" id="new-script-create-btn">Create</button>
+    </div>
+  </div>
+</div>

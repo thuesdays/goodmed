@@ -1,0 +1,67 @@
+<section class="groups-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Profile groups</div>
+      <div class="page-subtitle">
+        Batch-run many profiles at once. Each member runs in its own
+        isolated Chrome with its own proxy.
+      </div>
+    </div>
+    <div class="groups-header-actions">
+      <button class="btn btn-secondary" id="btn-reload-groups">↻ Reload</button>
+      <button class="btn btn-primary" id="btn-create-group">+ Create group</button>
+    </div>
+  </div>
+
+  <!-- Groups list — JS populates with .group-card nodes -->
+  <div class="groups-panel">
+    <div id="groups-list" class="groups-list"></div>
+  </div>
+</section>
+
+<!-- ─── GROUP EDIT MODAL ─────────────────────────────────────── -->
+<div class="profile-modal" id="group-edit-modal" style="display: none;">
+  <div class="profile-modal-backdrop" data-close="group-edit-modal"></div>
+  <div class="profile-modal-content" style="max-width: 640px;">
+    <div class="profile-modal-header">
+      <div class="profile-modal-title" id="group-modal-title">
+        ✨ Create new group
+      </div>
+      <button class="profile-modal-close" data-close="group-edit-modal">×</button>
+    </div>
+    <div class="profile-modal-body">
+      <div class="form-group">
+        <label class="form-label">Name <span class="label-required">*</span></label>
+        <input type="text" class="input" id="group-name-input"
+               placeholder="e.g. Facebook — US East, Twitter — launch">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Description</label>
+        <input type="text" class="input" id="group-desc-input"
+               placeholder="Optional short note for yourself">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Max parallel</label>
+        <input type="number" class="input" id="group-maxp-input"
+               placeholder="inherit global (runner.max_parallel)" min="1" max="100">
+        <div class="form-hint">
+          How many of this group's profiles can run simultaneously.
+          Leave empty to inherit the global setting. Overflow profiles
+          stay queued — click <strong>Start group</strong> again later to launch them.
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Members</label>
+        <div id="group-members-picker" class="group-members-picker"></div>
+        <div class="form-hint">
+          Tick profiles to include in this group. Same profile can be in
+          many groups (e.g. "All Facebook" + "US East").
+        </div>
+      </div>
+    </div>
+    <div class="profile-modal-footer">
+      <button class="btn btn-secondary" data-close="group-edit-modal">Cancel</button>
+      <button class="btn btn-primary" id="btn-save-group">Save</button>
+    </div>
+  </div>
+</div>

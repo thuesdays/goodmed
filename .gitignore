@@ -1,0 +1,32 @@
+# Runtime / state
+profiles/
+reports/
+scheduler.log
+scheduler_state.json
+.scheduler.pid
+query_rate.json
+ghost_shell.db
+ghost_shell.db-shm
+ghost_shell.db-wal
+competitor_urls.txt
+chrome-test-profile/
+
+# Per-session / wiki landing
+Home.md
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+
+# Chromium binary — too big for git, fetched via scripts/download_chromium.ps1
+chrome_win64*/
+
+# Build artifacts produced by package_chromium.ps1
+dist/
+
+# installer/ — maintainer-only build pipeline. End users
+# download GhostShellAntySetup.exe from GitHub Releases.
+installer/

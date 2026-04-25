@@ -1,0 +1,538 @@
+<section class="settings-workspace">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Settings</div>
+      <div class="page-subtitle">
+        Build info, UA spoof, performance, backup & restore.
+      </div>
+    </div>
+  </div>
+
+  <!-- VSCode-style sidebar tabs + content area -->
+  <div class="settings-layout">
+    <!-- Left: section nav. Clicking scrolls the right pane to the anchor. -->
+    <aside class="settings-sidebar">
+      <a href="#sec-build"    class="settings-nav-link is-active"
+         data-section="sec-build">🧬 Build info</a>
+      <a href="#sec-install"  class="settings-nav-link"
+         data-section="sec-install">🔧 Install paths</a>
+      <a href="#sec-uaspoof"  class="settings-nav-link"
+         data-section="sec-uaspoof">🎭 UA spoof range</a>
+      <a href="#sec-serp"     class="settings-nav-link"
+         data-section="sec-serp">🧑 SERP engagement</a>
+      <a href="#sec-perf"     class="settings-nav-link"
+         data-section="sec-perf">⚡ Performance</a>
+      <a href="#sec-enrich"   class="settings-nav-link settings-nav-danger"
+         data-section="sec-enrich">🔴 Auto-enrich</a>
+      <div class="settings-nav-sep"></div>
+      <a href="#sec-export"   class="settings-nav-link"
+         data-section="sec-export">📦 Export config</a>
+      <a href="#sec-import"   class="settings-nav-link"
+         data-section="sec-import">📥 Import config</a>
+      <div class="settings-nav-sep"></div>
+      <a href="#sec-danger"   class="settings-nav-link settings-nav-danger"
+         data-section="sec-danger">⚠ Danger zone</a>
+    </aside>
+
+    <!-- Right: content, each section is a dense-panel.
+         Sidebar scrolls this pane via anchor IDs. -->
+    <div class="settings-content">
+
+      <div class="dense-panel" id="sec-build">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">🧬 Build info</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Versions baked into the custom Chromium binary. The
+            <strong>engine</strong> is whatever Chromium source you compiled —
+            that's what the browser actually runs. The <strong>UA spoof</strong>
+            is what Ghost Shell claims it is to the outside world (user-agent
+            string, Sec-CH-UA headers, <code>navigator.userAgentData</code>).
+          </div>
+          <div class="build-info-line">
+            <span class="build-info-chip build-info-chip-engine">
+              <span class="build-info-chip-label">Chromium engine</span>
+              <span class="build-info-chip-value" id="bi-engine">—</span>
+            </span>
+            <span class="build-info-sep">·</span>
+            <span class="build-info-chip build-info-chip-spoof">
+              <span class="build-info-chip-label">Spoofed as Chrome</span>
+              <span class="build-info-chip-value" id="bi-spoof">—</span>
+            </span>
+            <span class="build-info-note" id="bi-spoof-note">
+              weighted random from range
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-install">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">🔧 Install paths</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            One Chromium install serves every profile. Change only if you
+            moved the binary or built a new tree.
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label">Chromium binary path</label>
+            <input type="text" class="input" data-config="browser.binary_path"
+                   placeholder="chrome-win64/chrome.exe">
+            <div class="form-hint">
+              Relative (to project folder) or absolute. Examples:
+              <code>chrome-win64/chrome.exe</code> on Windows,
+              <code>chrome-linux64/chrome</code> on Linux,
+              <code>chrome-mac/Chromium.app/Contents/MacOS/Chromium</code> on macOS.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-uaspoof">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">🎭 UA spoof range</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            When Ghost Shell generates a fingerprint, it picks a Chrome version
+            from this major-version range. Newer stable versions are picked
+            more often — mimicking the actual distribution on the web. Keep
+            this <strong>close to the current Chrome stable</strong>
+            (too old = suspicious, too new = ahead of actual rollout).
+          </div>
+          <div class="input-row-3">
+            <div class="form-group">
+              <label class="form-label">Minimum major version</label>
+              <input type="number" class="input"
+                     data-config="browser.spoof_chrome_min"
+                     min="100" max="200" step="1" placeholder="143">
+              <div class="form-hint">
+                Bottom of the range. Rarely picked — models enterprise stragglers.
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Maximum major version</label>
+              <input type="number" class="input"
+                     data-config="browser.spoof_chrome_max"
+                     min="100" max="200" step="1" placeholder="147">
+              <div class="form-hint">
+                Top of the range. Most picks land here — should match the
+                current Chrome stable channel.
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Current pool (preview)</label>
+              <div class="input-readonly" id="spoof-pool-preview">—</div>
+              <div class="form-hint">
+                Versions that will actually be used, filtered by the bounds.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-serp">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">🧑 SERP engagement behavior</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            After ads are found on the SERP, Ghost Shell can simulate
+            realistic user behavior (scroll, dwell, click an organic result)
+            before moving on. This is the biggest lever for raising your
+            <strong>ads/search hit rate</strong> — raw scraping triggers
+            Google's anti-bot heuristics and cuts ad load on following
+            queries.
+          </div>
+
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfg-serp-scroll"
+                   data-config="behavior.serp_scroll_enabled">
+            <label for="cfg-serp-scroll">
+              Scroll the SERP — 3-6 steps with reading pauses
+            </label>
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfg-serp-dwell"
+                   data-config="behavior.serp_dwell_enabled">
+            <label for="cfg-serp-dwell">
+              Dwell on SERP (3-9s with micro-scrolls)
+            </label>
+          </div>
+          <div class="checkbox-row">
+            <input type="checkbox" id="cfg-organic-click"
+                   data-config="behavior.organic_click_enabled">
+            <label for="cfg-organic-click">
+              Occasionally click an organic result and read it
+            </label>
+          </div>
+
+          <div class="input-row" style="margin-top: 12px;">
+            <div class="form-group">
+              <label class="form-label">Click probability</label>
+              <input type="number" class="input" step="0.05" min="0" max="1"
+                     data-config="behavior.organic_click_probability">
+              <div class="form-hint">
+                0.0 = never, 1.0 = after every query. 0.20–0.40 is realistic
+                for commercial queries.
+              </div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Organic dwell min (sec)</label>
+              <input type="number" class="input" min="1"
+                     data-config="behavior.organic_dwell_min_sec">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Organic dwell max (sec)</label>
+              <input type="number" class="input" min="1"
+                     data-config="behavior.organic_dwell_max_sec">
+            </div>
+          </div>
+          <div class="form-hint" style="margin-top: 8px;">
+            Organic dwell is how long we stay on the opened result. 8–25s
+            matches p10–p75 of real click-through dwell times.
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-perf">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">⚡ Performance — resource blocking</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Ghost Shell uses Chrome DevTools Protocol to block heavyweight
+            URL patterns at the network layer. Ad detection works from the
+            initial HTML, so images, fonts, video, and third-party trackers
+            can be safely dropped — this cuts page-load time significantly
+            on slow proxies.
+            <strong>Safety:</strong> none of these patterns touch
+            <code>google.com</code> SERP HTML, core JS, or anything the ad
+            parser needs.
+          </div>
+
+          <div class="block-list">
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_youtube_video">
+              <div class="block-item-body">
+                <div class="block-item-title">🎬 YouTube video &amp; thumbnails</div>
+                <div class="block-item-desc">
+                  Drops <code>*.ytimg.com</code>, <code>*.googlevideo.com</code>,
+                  and MP4/WebM from youtube.com. Video cards show a placeholder —
+                  text/title still parses.
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_google_images">
+              <div class="block-item-body">
+                <div class="block-item-title">🖼 Google image thumbnails</div>
+                <div class="block-item-desc">
+                  <code>encrypted-tbn*.gstatic.com</code>,
+                  <code>lh3.googleusercontent.com</code>. Ads/text unaffected.
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_google_maps_tiles">
+              <div class="block-item-body">
+                <div class="block-item-title">🗺 Google Maps tiles</div>
+                <div class="block-item-desc">
+                  <code>mt0-3.google.com/vt/*</code>, staticmap API. Local-pack
+                  results won't show the map thumbnail.
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_fonts">
+              <div class="block-item-body">
+                <div class="block-item-title">🔤 Web fonts</div>
+                <div class="block-item-desc">
+                  <code>fonts.gstatic.com</code> and all <code>.woff / .woff2</code>
+                  files. Page renders in the system font — saves ~200 KB per load.
+                  <strong>Caveat:</strong> fingerprint-detection sites check for
+                  font loading; may be a minor signal on heavily-profiled visits.
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_analytics">
+              <div class="block-item-body">
+                <div class="block-item-title">📊 Analytics &amp; tracking beacons</div>
+                <div class="block-item-desc">
+                  Google Analytics, GTM, DoubleClick beacons, conversion pixels.
+                  <strong>Recommended.</strong>
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_social_widgets">
+              <div class="block-item-body">
+                <div class="block-item-title">💬 Social widgets</div>
+                <div class="block-item-desc">
+                  Facebook SDK, Twitter/X embeds, LinkedIn widgets. Only
+                  relevant on advertiser landing pages.
+                </div>
+              </div>
+            </label>
+
+            <label class="block-item">
+              <input type="checkbox" data-config="browser.block_video_everywhere">
+              <div class="block-item-body">
+                <div class="block-item-title">⏹ All video files (any site)</div>
+                <div class="block-item-desc">
+                  Universal <code>*.mp4</code>, <code>*.webm</code>,
+                  <code>*.m3u8</code>, <code>*.ts</code> blocking.
+                </div>
+              </div>
+            </label>
+          </div>
+
+          <div class="form-group" style="margin-top: 16px;">
+            <label class="form-label">Custom patterns (advanced)</label>
+            <textarea class="input dense-textarea" rows="4"
+                      data-config="browser.block_custom_patterns"
+                      data-config-list="true"
+                      placeholder="*://annoying-tracker.example.com/*
+*://slow-widget.example.org/script.js
+*.ico"></textarea>
+            <div class="form-hint">
+              One pattern per line. Uses CDP wildcard syntax: <code>*</code>
+              matches any characters, prefix with scheme for host match
+              (e.g. <code>*://*.example.com/*</code>).
+            </div>
+          </div>
+
+          <div class="block-footer">
+            <span id="block-status" class="block-status">—</span>
+            <button id="btn-save-blocking" class="btn btn-primary">
+              💾 Save &amp; apply
+            </button>
+          </div>
+          <div class="form-hint" style="margin-top: 8px;">
+            Changes apply to the <strong>next browser launch</strong> —
+            the already-running session keeps its current rules.
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel dense-panel-danger" id="sec-enrich">
+        <div class="dense-panel-header dense-panel-header-danger">
+          <div class="dense-panel-title">🔴 Auto-enrich from host Chrome</div>
+          <div class="dense-panel-hint">uses your personal browser data</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="danger-banner">
+            <strong>⚠ DANGER ZONE — reads your personal browsing data.</strong><br>
+            When a fresh Ghost Shell profile starts for the first time, we
+            automatically copy a random slice (30 days, ~500 URLs) of your
+            <strong>real Chrome history + bookmarks</strong> into that
+            profile. This makes the profile look like a real user to Google,
+            but it also means your own browsing history ends up in the Ghost
+            Shell profile folder.
+            <br><br>
+            Sensitive domains (banking, health, signed-in social) are
+            always filtered out. Each Ghost Shell profile gets a different
+            random slice. Runs only once per profile.
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-row">
+              <input type="checkbox" data-config="browser.auto_enrich_from_host_chrome">
+              <span>Enable auto-enrich for fresh profiles</span>
+            </label>
+            <div class="form-hint">
+              Disable this to start every new profile with a completely
+              empty history. Nothing personal will leave your browser.
+            </div>
+          </div>
+
+          <div class="input-row">
+            <div class="form-group">
+              <label class="form-label">Max days to import</label>
+              <input type="number" class="input" min="1" max="365"
+                     data-config="browser.auto_enrich_max_days"
+                     placeholder="30">
+              <div class="form-hint">Actual dose randomized between
+                half this value and the full value.</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Max URLs to import</label>
+              <input type="number" class="input" min="10" max="10000"
+                     data-config="browser.auto_enrich_max_urls"
+                     placeholder="500">
+              <div class="form-hint">Actual dose randomized between
+                60% and the full value.</div>
+            </div>
+          </div>
+
+          <div class="form-group" style="margin-bottom: 0;">
+            <label class="form-label">Source Chrome profile path</label>
+            <input type="text" class="input"
+                   data-config="browser.auto_enrich_source_path"
+                   placeholder="Leave empty to auto-detect your default Chrome">
+            <div class="form-hint">
+              If empty, auto-discovers the default Chrome install.
+              Set explicitly to import from a different profile.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-export">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">📦 Export configuration</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Download a single JSON with every dashboard setting, all
+            profile definitions, and both action pipelines.
+            <strong>History is NOT included</strong> — runs, events, logs,
+            captured ads stay behind.
+          </div>
+
+          <div class="settings-export-box">
+            <div>
+              <div class="settings-export-title">What's inside the bundle</div>
+              <ul class="settings-export-list">
+                <li>✓ Dashboard config — queries, domains, timings, proxies, scripts</li>
+                <li>✓ Profile metadata (names, templates, languages)</li>
+                <li>✓ Scripts &amp; flow definitions</li>
+                <li class="muted">✗ Run history · events · logs · IP history · selfchecks</li>
+                <li class="muted">✗ Rotation counters · last-rotation timestamp</li>
+              </ul>
+            </div>
+            <button id="btn-export-config" class="btn btn-primary">
+              ⬇ Download bundle
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="dense-panel" id="sec-import">
+        <div class="dense-panel-header">
+          <div class="dense-panel-title">📥 Import configuration</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Load a previously exported Ghost Shell bundle. Choose
+            <strong>Merge</strong> (default, safe) to overlay on top of
+            current settings. Choose <strong>Replace</strong> to nuke all
+            current config first.
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Bundle file</label>
+            <input type="file" id="import-file-input" accept=".json,application/json"
+                   class="settings-file-input">
+            <div class="form-hint" id="import-file-info">
+              No file selected
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Mode</label>
+            <div class="settings-mode-picker">
+              <label class="settings-mode-option">
+                <input type="radio" name="import-mode" value="merge" checked>
+                <div>
+                  <strong>Merge</strong>
+                  <div class="muted">Overlay bundle values on current config. Safe default.</div>
+                </div>
+              </label>
+              <label class="settings-mode-option settings-mode-danger">
+                <input type="radio" name="import-mode" value="replace">
+                <div>
+                  <strong>Replace</strong>
+                  <div class="muted">Wipe current config first. All existing settings will be lost.</div>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <button id="btn-import-config" class="btn btn-primary" disabled>
+            ⬆ Import bundle
+          </button>
+
+          <div id="import-result" class="settings-import-result" style="display:none;"></div>
+        </div>
+      </div>
+
+      <!-- Danger zone — destructive global operations.
+           Lives at the bottom so users have to scroll past everything
+           else to get here. Operations cannot be undone. -->
+      <div class="dense-panel dense-panel-danger profile-danger-zone" id="sec-danger">
+        <div class="dense-panel-header dense-panel-header-danger">
+          <div class="dense-panel-title">⚠ Danger zone</div>
+          <div class="dense-panel-hint">destructive — cannot be undone</div>
+        </div>
+        <div class="dense-panel-body">
+          <div class="dense-hint">
+            Global destructive operations. Configuration (profiles, scripts,
+            scheduler, vault, proxies) is <strong>preserved</strong> — only
+            historical counters and logs are wiped.
+          </div>
+
+          <div class="danger-op-row">
+            <div class="danger-op-body">
+              <div class="danger-op-title">Reset stats counters</div>
+              <div class="danger-op-desc">
+                Wipes <code>events</code>, <code>runs</code>,
+                <code>traffic_stats</code>, <code>action_events</code>,
+                <code>logs</code>, and <code>warmup_runs</code>. Profiles,
+                scripts, proxies, vault, and all settings remain. The
+                Overview page tiles will reset to zero.
+              </div>
+            </div>
+            <button class="btn btn-secondary btn-danger" id="btn-reset-stats">
+              ↻ Reset stats
+            </button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- Sidebar nav scroll-spy — вешаем тут чтобы не тащить весь settings.js -->
+<script>
+(function () {
+  // Click → scroll + mark active. IntersectionObserver marks active
+  // when user scrolls the content pane.
+  const links = document.querySelectorAll('.settings-nav-link');
+  const content = document.querySelector('.settings-content');
+  if (!content) return;
+
+  links.forEach(a => a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const id = a.dataset.section;
+    const target = document.getElementById(id);
+    if (target) {
+      content.scrollTo({ top: target.offsetTop - 10, behavior: 'smooth' });
+    }
+    links.forEach(x => x.classList.remove('is-active'));
+    a.classList.add('is-active');
+  }));
+
+  // Scroll-spy
+  const sections = [...document.querySelectorAll('.dense-panel[id^="sec-"]')];
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(en => {
+      if (en.isIntersecting) {
+        const id = en.target.id;
+        links.forEach(a => a.classList.toggle('is-active',
+                                               a.dataset.section === id));
+      }
+    });
+  }, { root: content, rootMargin: '-20% 0px -60% 0px' });
+  sections.forEach(s => io.observe(s));
+})();
+</script>
