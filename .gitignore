@@ -12,3 +12,4 @@ ghost_shell.db-shm
 ghost_shell.db-wal
 .scheduler.pid
 competitor_urls.txt
+chrome_win64/

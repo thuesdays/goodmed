@@ -71,10 +71,13 @@ if not defined PYBOX (
 )
 echo [*] Bundling: %PYBOX%
 
-REM Compile (Inno picks up the #define from the .iss file directly;
-REM if the version pattern doesn't match what's in the .iss, edit the
-REM PyInstaller line at the top of ghost_shell_installer.iss)
-"%ISCC%" /Q "ghost_shell_installer.iss" /D"PyInstaller=deps\%PYBOX%"
+REM Compile. ISCC syntax for #define overrides is /DName=Value
+REM (one argv token, no inner quotes). The full token is wrapped in
+REM outer quotes so cmd treats it as one arg even if the path ever
+REM contains spaces. The whole iss-file path is also quoted.
+set "DEFINE=/DPyInstaller=deps\%PYBOX%"
+echo [*] Command: "%ISCC%" /Q "%DEFINE%" "ghost_shell_installer.iss"
+"%ISCC%" /Q "%DEFINE%" "ghost_shell_installer.iss"
 if errorlevel 1 (
     echo [x] Compile failed.
     pause
