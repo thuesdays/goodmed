@@ -1,0 +1,6 @@
+# Bundled installers (large, frequently re-downloaded)
+deps/
+# Compiled installer output
+output/
+# IDE
+*.iss.bak
