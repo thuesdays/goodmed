@@ -56,7 +56,8 @@ const Scheduler = (() => {
   // ─────────────────────────────────────────────────────────────
   function bindEvents() {
     $("#sched-start-btn").addEventListener("click", start);
-    $("#sched-stop-btn").addEventListener("click", stop);
+    $("#sched-stop-btn").addEventListener("click", () => stop());
+    _wireForceKillModifier();   // Shift+Click stop -> force kill
     $("#sched-refresh-btn").addEventListener("click", refresh);
     $("#sched-reap-btn")?.addEventListener("click", reapZombies);
 
@@ -435,8 +436,27 @@ const Scheduler = (() => {
   function renderStatus(s) {
     const running = s.is_running;
     const health  = s.health || (running ? "ok" : "stopped");
-    $("#sched-start-btn").style.display = running ? "none" : "inline-flex";
-    $("#sched-stop-btn").style.display  = running ? "inline-flex" : "none";
+    // Show Stop whenever there is *any* live process — including a wedged
+    // ("stale": pid alive, no heartbeat) scheduler. Otherwise the user
+    // sees only Start while a zombie scheduler eats CPU and has no way
+    // to kill it from the UI. Falls back to is_running when pid field
+    // is absent (older server build).
+    const hasProc = !!(s.pid && s.pid > 0) || running;
+    const startBtn = $("#sched-start-btn");
+    const stopBtn  = $("#sched-stop-btn");
+    if (startBtn) startBtn.style.display = hasProc ? "none" : "inline-flex";
+    if (stopBtn)  stopBtn.style.display  = hasProc ? "inline-flex" : "none";
+
+    // If we just transitioned IN to running state, restore the Stop
+    // button label/disabled in case a previous click left it stuck.
+    if (hasProc && stopBtn && stopBtn.dataset._busy !== "1") {
+      stopBtn.disabled = false;
+      stopBtn.innerHTML = "■ Stop scheduler";
+    }
+    if (!hasProc && startBtn && startBtn.dataset._busy !== "1") {
+      startBtn.disabled = false;
+      startBtn.innerHTML = "▶ Start scheduler";
+    }
 
     const labelByHealth = {
       ok: "Running", stale: "Wedged — no heartbeat",
@@ -514,37 +534,107 @@ const Scheduler = (() => {
 
   async function start() {
     const btn = $("#sched-start-btn");
+    btn.dataset._busy = "1";
     btn.disabled = true; btn.textContent = "Starting...";
+    // Optimistic flip: hide Start, show Stop immediately so the user
+    // sees the action register without waiting for the next status poll.
+    btn.style.display = "none";
+    const stopBtn = $("#sched-stop-btn");
+    if (stopBtn) {
+      stopBtn.style.display = "inline-flex";
+      stopBtn.disabled = false;
+      stopBtn.innerHTML = "■ Stop scheduler";
+    }
     try {
       await api("/api/scheduler/start", { method: "POST" });
       toast("✓ Scheduler started");
       await refresh();
-    } catch (e) { toast("Error: " + e.message, true); }
+    } catch (e) {
+      toast("Error: " + e.message, true);
+      // Roll back the optimistic flip on failure.
+      btn.style.display = "inline-flex";
+      if (stopBtn) stopBtn.style.display = "none";
+    }
     finally {
+      btn.dataset._busy = "0";
       btn.disabled = false;
       btn.innerHTML = "▶ Start scheduler";
     }
   }
 
-  async function stop() {
-    const ok = await confirmDialog({
-      title: "Stop scheduler",
-      message: "The scheduler will stop after the current iteration completes. Running browser instances will not be killed.",
-      confirmText: "Stop scheduler",
-      confirmStyle: "warning",
-    });
-    if (!ok) return;
+  async function stop(opts = {}) {
+    const force = !!opts.force;
     const btn = $("#sched-stop-btn");
-    btn.disabled = true; btn.textContent = "Stopping...";
+    if (!btn) return;
+
+    // Confirm only on the soft path. Force-kill is an explicit choice
+    // and shouldn't double-prompt.
+    if (!force) {
+      const ok = await confirmDialog({
+        title: "Stop scheduler",
+        message: "The scheduler will stop now. If a tick is mid-flight, " +
+                 "any running browser instances will be terminated with it.",
+        confirmText: "Stop scheduler",
+        confirmStyle: "warning",
+      });
+      if (!ok) return;
+    }
+
+    btn.dataset._busy = "1";
+    btn.disabled = true; btn.textContent = force ? "Force killing..." : "Stopping...";
+    // Optimistic flip: swap to Start *before* the server call returns.
+    btn.style.display = "none";
+    const startBtn = $("#sched-start-btn");
+    if (startBtn) {
+      startBtn.style.display = "inline-flex";
+      startBtn.disabled = true;
+      startBtn.innerHTML = force ? "Force killing..." : "Stopping...";
+    }
+
+    const url = force
+      ? "/api/scheduler/stop?force=1"
+      : "/api/scheduler/stop";
     try {
-      await api("/api/scheduler/stop", { method: "POST" });
-      toast("✓ Scheduler stopped");
+      const r = await api(url, { method: "POST" });
+      if (r && r.warning) {
+        toast(`Stopped (with warning): ${r.warning}`, true);
+      } else if (r && r.already_stopped) {
+        toast("Scheduler was already stopped — UI synced");
+      } else {
+        toast(force ? "✓ Scheduler force-killed" : "✓ Scheduler stopped");
+      }
       await refresh();
-    } catch (e) { toast("Error: " + e.message, true); }
-    finally {
+    } catch (e) {
+      toast("Error: " + e.message, true);
+      // Don't roll back the flip — the user clicked Stop, they
+      // expect the UI to show Start now. Refresh will reconcile.
+      await refresh();
+    } finally {
+      btn.dataset._busy = "0";
       btn.disabled = false;
       btn.innerHTML = "■ Stop scheduler";
+      if (startBtn) {
+        startBtn.disabled = false;
+        startBtn.innerHTML = "▶ Start scheduler";
+      }
     }
+  }
+
+  // Shift-click on Stop = force-kill (skip terminate(), straight to kill())
+  // Useful when the scheduler is wedged inside a 1800s sleep loop and
+  // ignores SIGTERM. Wired in init() below.
+  function _wireForceKillModifier() {
+    const btn = document.getElementById("sched-stop-btn");
+    if (!btn || btn.dataset._wiredForce === "1") return;
+    btn.dataset._wiredForce = "1";
+    btn.addEventListener("click", (e) => {
+      if (e.shiftKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        stop({ force: true });
+      }
+    }, true);  // capture phase so we beat the regular click handler
+    btn.title = "Click: stop · Shift+Click: force-kill";
   }
 
   return { init, teardown };

@@ -752,9 +752,64 @@ def parse_ads(driver, query: str) -> list[dict]:
         logging.warning(f"  JS parse error: {e}")
         return []
 
+    # ── DIAGNOSTIC: per-scan summary ──────────────────────────
+    # Why this matters: the previous behaviour was a silent black box —
+    # the retry loop logs "no ads after 4 attempts" without saying
+    # whether (a) the JS scan returned zero candidates, (b) candidates
+    # were found but all dropped as own-domain, or (c) something between.
+    # Users could not tell whether they were being soft-blocked, whether
+    # the parser was broken, or whether their queries genuinely had no
+    # competitors. Now we show the funnel: raw -> rejected -> kept.
+    fmt_counts = {"text": 0, "shopping_carousel": 0, "pla_grid": 0, "other": 0}
+    for r in raw_ads:
+        f = r.get("format", "other")
+        fmt_counts[f] = fmt_counts.get(f, 0) + 1
+    if raw_ads:
+        # Compact one-liner -- if the parser is finding stuff, this is
+        # a green check; if not, the per-format counts hint at which
+        # parser arm broke.
+        bits = []
+        for f in ("text", "shopping_carousel", "pla_grid"):
+            if fmt_counts.get(f):
+                bits.append(f"{fmt_counts[f]} {f}")
+        logging.info(f"  parser: {len(raw_ads)} raw candidate(s) — " + ", ".join(bits or ["no breakdown"]))
+    else:
+        # Zero raw candidates is the most ambiguous outcome -- could be
+        # genuine no-ads, could be a soft-block. Show diagnostics so the
+        # user can tell which: SERP heading count, "did you mean" banner,
+        # captcha-iframe presence, page title.
+        try:
+            diag = driver.execute_script(r"""
+                const out = {};
+                out.url        = location.href;
+                out.title      = (document.title || '').slice(0, 80);
+                out.organic    = document.querySelectorAll('div.g, div.MjjYud').length;
+                out.knowledge  = !!document.querySelector('[data-attrid="kc:/common/topic"]');
+                out.didyoumean = !!document.querySelector('a.gL9Hy, .o5rIVb');
+                out.recaptcha  = !!document.querySelector('iframe[src*="recaptcha"], #captcha-form, div.g-recaptcha');
+                out.results0   = (document.body.innerText || '').includes('did not match any documents') ||
+                                 (document.body.innerText || '').includes('не дав збіги') ||
+                                 (document.body.innerText || '').includes('по этому запросу ничего');
+                out.spons_text = ['Sponsored','Реклама','Спонсоване'].filter(m =>
+                    (document.body.innerText || '').includes(m)).join(',') || 'none';
+                return out;
+            """) or {}
+            logging.info(
+                f"  parser: 0 candidates — organic={diag.get('organic')} "
+                f"didyoumean={diag.get('didyoumean')} no_results={diag.get('results0')} "
+                f"recaptcha={diag.get('recaptcha')} sponsored_text={diag.get('spons_text')}"
+            )
+            if diag.get('recaptcha'):
+                logging.warning("  parser: ⚠ recaptcha iframe present on SERP — IP likely flagged")
+        except Exception as e:
+            logging.debug(f"  parser: SERP diagnostic JS failed: {e}")
+
     ads = []
     seen_domains = set()
     own_filtered_count = 0
+    google_internal_count = 0
+    no_domain_count = 0
+    dup_count = 0
 
     for raw in raw_ads:
         try:
@@ -798,12 +853,17 @@ def parse_ads(driver, query: str) -> list[dict]:
 
             domain = extract_domain(clean_url) or extract_domain(display_url)
             if not domain:
+                no_domain_count += 1
+                logging.debug(f"  parser: candidate dropped — no domain extractable "
+                              f"(format={ad_format}, click_url={(google_click_url or '')[:80]!r})")
                 continue
 
             # Filter Google internal domains
             if any(g in domain for g in ("google.com", "google.ua",
                                          "googleusercontent.com",
                                          "googlesyndication.com")):
+                google_internal_count += 1
+                logging.debug(f"  parser: candidate dropped — google internal domain {domain}")
                 continue
 
             # ── OWN-DOMAIN FILTER — hard gate ──────────────────────
@@ -821,6 +881,8 @@ def parse_ads(driver, query: str) -> list[dict]:
             # one record). Keep the first occurrence — usually that's
             # the highest-position text ad.
             if domain in seen_domains:
+                dup_count += 1
+                logging.debug(f"  parser: candidate dropped — duplicate domain {domain}")
                 continue
             seen_domains.add(domain)
 
@@ -843,8 +905,19 @@ def parse_ads(driver, query: str) -> list[dict]:
         except Exception as e:
             logging.debug(f"  block processing error: {e}")
 
-    if own_filtered_count > 0:
-        logging.debug(f"  parser: filtered {own_filtered_count} own-domain ad(s) across all formats")
+    # ── Funnel summary ────────────────────────────────────────
+    # Always emit when parser dropped at least one candidate -- the
+    # most informative line in the whole ad-detection pipeline. Lets
+    # the user see at a glance whether "0 ads kept" means "Google
+    # showed nothing" vs "everything was ours" vs "something
+    # unparseable".
+    drops = own_filtered_count + google_internal_count + no_domain_count + dup_count
+    if raw_ads or drops:
+        logging.info(
+            f"  parser: kept {len(ads)} of {len(raw_ads)} candidates "
+            f"(dropped: own={own_filtered_count} google_internal={google_internal_count} "
+            f"no_domain={no_domain_count} dup={dup_count})"
+        )
 
     return ads
 
@@ -1048,9 +1121,71 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                     f"Enable rotation in Dashboard → Proxy to auto-retry on captchas."
                 )
             else:
+                # ── Last-resort escalation: full session restart ─────
+                # The 3 in-tick rotations may have all returned the same
+                # IP because asocks (and similar pools) often pin a TCP
+                # connection to one exit; rotation API only swaps the
+                # exit for *new* connections. By tearing the browser
+                # down and bringing it back up, we force a brand-new
+                # TCP connection through the local proxy forwarder, and
+                # the rotation API call after that lands on a fresh
+                # exit. This is the user-visible "captcha → close
+                # browser → auto-rotate-IP → relaunch" flow.
+                #
+                # Gate behind config so users with budget proxies (where
+                # restart spends a real $$ rotation) can disable.
+                auto_restart = bool(CFG.get("captcha.auto_restart_session", True))
+                if auto_restart and captcha_rotations_used >= CAPTCHA_ROTATE_MAX:
+                    logging.warning(
+                        f"  ⚠ CAPTCHA — {captcha_rotations_used} in-tick "
+                        f"rotations didn't help. Escalating to FULL "
+                        f"SESSION RESTART (close browser → rotate IP → "
+                        f"reopen). Disable via captcha.auto_restart_session=false."
+                    )
+                    try:
+                        # Stop traffic collector + flush sessions before
+                        # the close so post-mortem state is consistent.
+                        browser.restart()
+                        # After restart, the local proxy forwarder is
+                        # holding a fresh TCP connection. Fire the
+                        # rotation API one more time -- this should land
+                        # on a different exit IP from the new connection.
+                        post_restart_ip = browser.force_rotate_ip()
+                        if post_restart_ip and post_restart_ip != current_ip:
+                            logging.info(
+                                f"  ✓ session-restart rotated "
+                                f"{current_ip} → {post_restart_ip}, "
+                                f"reloading SERP"
+                            )
+                            current_ip = post_restart_ip
+                            try:
+                                browser.driver.get(search_url)
+                                time.sleep(random.uniform(2.0, 4.0))
+                                # Loop back -- the next iteration of the
+                                # outer for-loop will re-check captcha
+                                # state and continue the funnel cleanly.
+                                continue
+                            except Exception as e:
+                                logging.warning(
+                                    f"  session-restart: SERP reload "
+                                    f"failed: {e} -- falling through to "
+                                    f"give-up"
+                                )
+                        else:
+                            logging.warning(
+                                f"  session-restart: same IP "
+                                f"({post_restart_ip}) -- pool genuinely "
+                                f"sticky, giving up"
+                            )
+                    except Exception as e:
+                        logging.error(
+                            f"  session-restart failed: {e} -- giving up"
+                        )
+
                 logging.error(
-                    f"  ✗ CAPTCHA — tried {captcha_rotations_used} rotations, "
-                    f"Google still flags us. Burning this IP."
+                    f"  ✗ CAPTCHA — tried {captcha_rotations_used} rotations"
+                    + (" + 1 session restart" if auto_restart else "") +
+                    f", Google still flags us. Burning this IP."
                 )
             sqm.record("captcha", query=query, url=driver.current_url)
             RUN_COUNTERS["total_captchas"] += 1
@@ -1125,7 +1260,20 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             return ads
 
         if attempt >= REFRESH_MAX_ATTEMPTS:
-            logging.info(f"  ✗ no ads after {attempt} attempts")
+            # More informative tail than the old "no ads after N
+            # attempts" — say which interpretation we lean toward so
+            # the user knows what to investigate next. parse_ads
+            # already emitted per-scan funnel logs above; this is the
+            # summary verdict for the query overall.
+            logging.info(
+                f"  ✗ no ads after {attempt} attempts — likely "
+                f"genuine 0 ads or soft-block. Check parser funnel "
+                f"lines above; if every scan said '0 candidates' the "
+                f"query has no ads from this IP. If candidates were "
+                f"found but all dropped as 'own', that means Google "
+                f"only showed the user's own ads — also a 0-result "
+                f"outcome but a different cause."
+            )
             return []
 
         wait_sec = random.uniform(REFRESH_MIN_SEC, REFRESH_MAX_SEC)
@@ -1595,6 +1743,105 @@ def run_monitor():
         else:
             logging.info("✓ existing session — skipping cookie seed")
 
+        # ─── 5b. Profile Quality Manager — auto-warmup gate ─────────
+        # Two triggers:
+        #   1. A row in warmup_runs with status='requested' was queued
+        #      from the dashboard ("Run warmup now" on the quality
+        #      badge) -- always honoured.
+        #   2. The Quality Manager assesses the profile and recommends
+        #      warmup (yellow status) AND quality.auto_warmup is true.
+        #
+        # When triggered, we run hybrid_warmup with the existing driver
+        # BEFORE the first real Google query. This is the user-asked-for
+        # "control manager that programmatically tops up profile health"
+        # piece -- no manual browser-opening, the runtime decides on
+        # behalf of the user.
+        try:
+            requested_warmup = False
+            warmup_id        = None
+            try:
+                row = DB._get_conn().execute(
+                    "SELECT id FROM warmup_runs WHERE profile_name = ? "
+                    "AND status = 'requested' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (PROFILE_NAME,),
+                ).fetchone()
+                if row:
+                    requested_warmup = True
+                    warmup_id        = row["id"]
+            except Exception:
+                pass
+
+            quality_says_warmup = False
+            quality_reason      = ""
+            if not requested_warmup and bool(CFG.get("quality.auto_warmup", True)):
+                try:
+                    from ghost_shell.profile.quality_manager import should_auto_warmup
+                    quality_says_warmup, quality_reason = should_auto_warmup(PROFILE_NAME)
+                except Exception as e:
+                    logging.debug(f"  quality assessment skipped: {e}")
+
+            if requested_warmup or quality_says_warmup:
+                trigger = "manual_request" if requested_warmup else "auto_quality"
+                why     = ("user-requested via dashboard"
+                           if requested_warmup else quality_reason)
+                logging.info(
+                    f"🔥 Auto-warmup triggered — {trigger} ({why})"
+                )
+                try:
+                    from ghost_shell.session.cookie_warmer import CookieWarmer
+                    started = datetime.now().isoformat(timespec="seconds")
+                    res = CookieWarmer(driver).hybrid_warmup() or {}
+                    finished = datetime.now().isoformat(timespec="seconds")
+                    if requested_warmup and warmup_id:
+                        # Update the existing requested row to ok
+                        try:
+                            DB._get_conn().execute(
+                                "UPDATE warmup_runs SET finished_at = ?, "
+                                "status = 'ok', sites_planned = ?, "
+                                "sites_visited = ? WHERE id = ?",
+                                (finished, res.get("sites_planned", 0),
+                                 res.get("sites_visited", 0), warmup_id),
+                            )
+                            DB._get_conn().commit()
+                        except Exception as e:
+                            logging.debug(f"  warmup_runs update: {e}")
+                    else:
+                        # Auto-trigger -- insert a new fresh row
+                        try:
+                            DB._get_conn().execute(
+                                "INSERT INTO warmup_runs ("
+                                "profile_name, started_at, finished_at, "
+                                "preset, sites_planned, sites_visited, "
+                                "status, trigger) VALUES "
+                                "(?, ?, ?, 'default', ?, ?, 'ok', ?)",
+                                (PROFILE_NAME, started, finished,
+                                 res.get("sites_planned", 0),
+                                 res.get("sites_visited", 0), trigger),
+                            )
+                            DB._get_conn().commit()
+                        except Exception as e:
+                            logging.debug(f"  warmup_runs insert: {e}")
+                    logging.info(
+                        f"  ✓ warmup completed: visited "
+                        f"{res.get('sites_visited', 0)} sites"
+                    )
+                except Exception as e:
+                    logging.warning(f"  ✗ warmup failed: {e}")
+                    if warmup_id:
+                        try:
+                            DB._get_conn().execute(
+                                "UPDATE warmup_runs SET finished_at = ?, "
+                                "status = 'failed' WHERE id = ?",
+                                (datetime.now().isoformat(timespec="seconds"),
+                                 warmup_id),
+                            )
+                            DB._get_conn().commit()
+                        except Exception:
+                            pass
+        except Exception as e:
+            logging.debug(f"  quality-warmup gate: {e}")
+
         # (Rotation moved to step 0, before selfcheck, so the diagnostics
         # report reflects the IP we'll actually be using.)
 
@@ -1689,7 +1936,7 @@ def run_monitor():
             except Exception as e:
                 logging.warning(f"[main] script_resolve failed: {e}")
                 unified_flow = CFG.get("actions.flow", []) or []
-            main_script  = CFG.get("actions.main_script", []) or []
+            main_script = CFG.get("actions.main_script", []) or []
 
             def _cb_search(q: str):
                 """Callback for search_query step — returns the ads list.

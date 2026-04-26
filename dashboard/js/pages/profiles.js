@@ -18,6 +18,7 @@ const Profiles = {
     { key: "searches24h", label: "Searches 24h", default: true  },
     { key: "captchas24h", label: "Captchas 24h", default: true  },
     { key: "selfcheck",   label: "Self-check", default: true  },
+    { key: "quality",     label: "Quality",    default: true  },
     { key: "fingerprint", label: "Fingerprint", default: false },
     { key: "languages",   label: "Languages",  default: false },
     { key: "lastRun",     label: "Last run",   default: true  },
@@ -127,6 +128,12 @@ const Profiles = {
     try {
       this.allProfiles = await api("/api/profiles");
       $("#profiles-count").textContent = this.allProfiles.length;
+      // Load quality verdicts in parallel -- the table renders even
+      // if this fails (cells fall back to "..." then "—" state).
+      api("/api/profiles/quality-batch").then(q => {
+        this._qualityByName = q || {};
+        this.renderTable();
+      }).catch(() => { /* non-fatal */ });
       this.renderTable();
     } catch (e) {
       toast("Failed to load profiles: " + e.message, true);
@@ -309,6 +316,38 @@ const Profiles = {
         return p.selfcheck
           ? `<span class="muted">${p.selfcheck.passed}/${p.selfcheck.total}</span>`
           : `<span class="muted">—</span>`;
+      case "quality": {
+        // Quality verdict from /api/profiles/quality-batch (loaded
+        // once when the page mounts). Three states with distinct
+        // visual cues so the user can scan a 50-profile list and
+        // immediately spot the burned ones. Click for the full
+        // assessment + recommendation.
+        const q = (this._qualityByName || {})[p.name];
+        if (!q) return `<span class="muted">…</span>`;
+        const colors = {
+          ready:  "var(--healthy, #22c55e)",
+          warmup: "var(--warning, #f59e0b)",
+          burned: "var(--critical, #ef4444)",
+        };
+        const labels = {
+          ready:  "✓ ready",
+          warmup: "↻ warmup",
+          burned: "✗ burned",
+        };
+        const c = colors[q.status] || "var(--text-muted)";
+        const l = labels[q.status] || q.status || "—";
+        const tip = (q.reasons && q.reasons.length)
+          ? q.reasons.join("\n")
+          : (q.recommendation || "");
+        return `<span class="quality-pill"
+                      title="${escapeHtml(tip)}"
+                      style="display:inline-flex;align-items:center;gap:4px;
+                             padding:2px 8px;border-radius:10px;
+                             border:1px solid ${c};color:${c};
+                             font-size:11px;font-weight:500;cursor:help;">
+                  ${l}<span style="opacity:.6">${q.score ?? "—"}</span>
+                </span>`;
+      }
       case "fingerprint":
         return `<span class="muted" style="font-size:11px;">${
           escapeHtml(p.fingerprint?.timestamp || "—")}</span>`;

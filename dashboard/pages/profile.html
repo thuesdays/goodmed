@@ -243,9 +243,22 @@
       <div class="input-row">
         <div class="form-group" style="margin-bottom: 0;">
           <label class="form-label">Rotation API URL</label>
-          <input type="text" class="input" id="pp-rotation-url"
-                 placeholder="empty = inherit global"
-                 autocomplete="off" spellcheck="false">
+          <div style="display:flex; gap:6px; align-items:stretch;">
+            <input type="text" class="input" id="pp-rotation-url"
+                   placeholder="empty = inherit global"
+                   autocomplete="off" spellcheck="false"
+                   style="flex:1;">
+            <!-- Auto-discover button. Visible only when provider=asocks
+                 to keep the UI quiet for other providers. Clicking it
+                 fetches the user's asocks port list, matches the proxy
+                 URL's host:port to one of the entries, and fills this
+                 field with that port's pre-signed refresh_link. Saves
+                 a copy/paste round-trip from the asocks dashboard. -->
+            <button type="button" class="btn btn-secondary btn-small"
+                    id="pp-asocks-discover-btn"
+                    title="Match the Proxy URL to your asocks port list and auto-fill rotation URL"
+                    style="display:none; white-space:nowrap;">🔍 Auto-fill</button>
+          </div>
         </div>
         <div class="form-group" style="margin-bottom: 0;">
           <label class="form-label">Rotation provider</label>
@@ -333,6 +346,86 @@
     </div>
     <div id="selfcheck-time" class="muted" style="margin-bottom: 12px;"></div>
     <div class="selfcheck-grid" id="selfcheck-grid"></div>
+
+    <!-- External fingerprint testers — proactive verification.
+         Self-check above is internal-only (network probes via Selenium
+         JS). To verify fingerprint quality against the same engines
+         that bot-detect services use, the user can hit these well-
+         known testers. Each link opens in a new tab; if the user has
+         the profile running they should paste these URLs into THAT
+         Chrome window's address bar (the dashboard browser would
+         test itself, not the profile). The "Probe in profile" button
+         spawns a probe-only run that visits these sites in the
+         profile's actual browser and captures their on-page scores. -->
+    <div class="fp-testers-block" style="margin-top: 18px;
+         border-top: 1px solid var(--border, #2a3142); padding-top: 14px;">
+      <div class="card-title" style="font-size: 13px; margin-bottom: 8px;">
+        🧪 External fingerprint testers
+        <span class="muted" style="font-weight: normal;">— proactive checks against real bot-detection engines</span>
+      </div>
+      <div class="form-hint" style="margin-bottom: 10px;">
+        These public testers grade the same signals (canvas, audio, fonts,
+        UA-CH, WebGL, WebRTC) that bot-detect services use commercially.
+        To test <strong>this profile</strong>: launch it and paste a URL
+        into the Chrome address bar — or click <strong>Probe in profile</strong>
+        below to do that automatically.
+      </div>
+
+      <div class="fp-tester-grid"
+           style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                  gap: 8px; margin-bottom: 14px;">
+        <a class="fp-tester-card" href="https://abrahamjuliot.github.io/creepjs/"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit; transition: border-color .15s;">
+          <div style="font-weight:600;">🕵 CreepJS</div>
+          <div class="muted" style="font-size:11px;">Trust score 0–100, exposes lies in UA/canvas/font fingerprints. The strictest grader.</div>
+        </a>
+        <a class="fp-tester-card" href="https://bot.sannysoft.com/"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit;">
+          <div style="font-weight:600;">🤖 Sannysoft Bot Test</div>
+          <div class="muted" style="font-size:11px;">Webdriver, plugins, languages, iframe — the classic Selenium leak panel.</div>
+        </a>
+        <a class="fp-tester-card" href="https://pixelscan.net/"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit;">
+          <div style="font-weight:600;">🎨 Pixelscan</div>
+          <div class="muted" style="font-size:11px;">Canvas/WebGL hash uniqueness, geo/IP correlation, timezone match.</div>
+        </a>
+        <a class="fp-tester-card" href="https://amiunique.org/fingerprint"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit;">
+          <div style="font-weight:600;">🔍 AmIUnique</div>
+          <div class="muted" style="font-size:11px;">Compares your fingerprint to a public DB — flags rare combinations.</div>
+        </a>
+        <a class="fp-tester-card" href="https://browserleaks.com/"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit;">
+          <div style="font-weight:600;">💧 BrowserLeaks</div>
+          <div class="muted" style="font-size:11px;">Per-API breakdown: WebRTC, fonts, canvas, geo, audio context. Gold standard for leak hunting.</div>
+        </a>
+        <a class="fp-tester-card" href="https://fingerprint.com/products/bot-detection/"
+           target="_blank" rel="noopener noreferrer"
+           style="display:block; padding: 10px 12px; border:1px solid var(--border,#2a3142);
+                  border-radius: 8px; text-decoration: none; color: inherit;">
+          <div style="font-weight:600;">🛡 Fingerprint.com BotD</div>
+          <div class="muted" style="font-size:11px;">Commercial bot-detect demo — same engine many sites license. The realest test.</div>
+        </a>
+      </div>
+
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap: wrap;">
+        <button class="btn btn-primary btn-small" id="fp-probe-btn"
+                title="Spawn a probe-only run that visits each tester in this profile's browser and stores the results">
+          🚀 Probe in profile
+        </button>
+        <span class="muted" style="font-size: 12px;" id="fp-probe-status"></span>
+      </div>
+    </div>
   </div>
 
   <div class="card">

@@ -124,8 +124,44 @@ class WarmupEngine:
         if get_preset(self.preset_id) is None:
             raise ValueError(f"unknown preset: {self.preset_id}")
 
+        # Geo-leak prevention: drop sites tagged with foreign locales
+        # before we visit them. Reads the global expected_country
+        # config (set on the Proxy page); if the user pasted "Ukraine"
+        # we filter US-only sites out, keeping universal + UA-tagged
+        # ones. Without this filter, a UA profile running the medical
+        # preset would visit webmd.com / mayoclinic.org and Google's
+        # locale-guess would flip to en-US / nl-NL, returning foreign
+        # SERPs after the warmup -- a real bug a user reported.
+        target_country = None
+        try:
+            target_country = self.db.config_get("browser.expected_country")
+        except Exception:
+            pass
+        all_sites = list(get_preset(self.preset_id)["sites"])
+        before = len(all_sites)
         sites = pick_sites(self.preset_id, self.site_count,
-                           seed=f"{self.profile_name}:{int(time.time())}")
+                           seed=f"{self.profile_name}:{int(time.time())}",
+                           target_country=target_country)
+        # If the filter is too aggressive (preset was 100% foreign for
+        # this country), fall back to unfiltered selection but warn --
+        # the user should curate the preset, but a half-warmed profile
+        # is still better than a no-op.
+        if not sites and target_country:
+            logging.warning(
+                f"[warmup] preset={self.preset_id!r} has 0 sites tagged "
+                f"for country={target_country!r} -- falling back to "
+                f"unfiltered selection. Consider editing site_presets.py "
+                f"to add locally-appropriate destinations."
+            )
+            sites = pick_sites(self.preset_id, self.site_count,
+                               seed=f"{self.profile_name}:{int(time.time())}")
+        elif target_country:
+            kept = len(sites)
+            logging.info(
+                f"[warmup] geo-filter: country={target_country!r} -> "
+                f"kept {kept} of {before} sites in preset "
+                f"{self.preset_id!r} (filtered out foreign-locale sites)"
+            )
         planned = len(sites)
 
         self._warmup_id = self.db.warmup_start(

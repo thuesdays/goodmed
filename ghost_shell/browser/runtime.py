@@ -359,10 +359,31 @@ class GhostShellBrowser:
         with open(os.path.join(self.user_data_path, "payload_debug.json"), "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=4)
 
-        # Сохраняем also in DB for dashboard
+        # Save also in DB for dashboard. Score via the validator before
+        # save so the score=None / grade=? black-hole goes away. The
+        # validator is fast (<10ms) and pure-Python -- no I/O -- so
+        # there's no reason to skip it on every runtime launch.
         try:
             from ghost_shell.db.database import get_db
-            get_db().fingerprint_save(self.profile_name, payload)
+            score = None
+            report = None
+            try:
+                from ghost_shell.fingerprint.validator import validate
+                # The validator wants the template too -- we pass through
+                # the same dict the builder used. Errors here are
+                # non-fatal: a degraded log line is better than an
+                # aborted launch.
+                template_for_score = self.last_payload or payload
+                v = validate(payload, template_for_score) or {}
+                score  = v.get("score")
+                report = v
+            except Exception as ve:
+                logging.debug(f"[GhostShellBrowser] FP validator skipped: {ve}")
+            get_db().fingerprint_save(
+                self.profile_name, payload,
+                coherence_score  = score,
+                coherence_report = report,
+            )
         except Exception as e:
             logging.debug(f"[GhostShellBrowser] DB fingerprint save: {e}")
 

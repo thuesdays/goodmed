@@ -171,6 +171,10 @@
           <input type="text" id="edit-rotation-url" class="input"
                  placeholder="https://api.asocks.com/v2/proxy/refresh/…"
                  style="font-family: ui-monospace, monospace;">
+          <div class="form-hint">
+            For asocks: paste your account API key in the field below
+            then click 🔍 to auto-fill this URL from your port list.
+          </div>
         </div>
         <div class="form-row" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
           <div class="form-group">
@@ -184,8 +188,24 @@
           </div>
           <div class="form-group">
             <label class="form-label">API key (optional)</label>
-            <input type="text" id="edit-rotation-key" class="input">
+            <div style="display: flex; gap: 6px; align-items: stretch;">
+              <input type="text" id="edit-rotation-key" class="input"
+                     style="flex: 1;">
+              <button type="button" class="btn btn-secondary"
+                      id="asocks-discover-btn"
+                      title="Fetch ports from asocks API and auto-fill"
+                      style="white-space: nowrap;">🔍 Discover</button>
+            </div>
           </div>
+        </div>
+
+        <!-- asocks port picker - hidden until Discover succeeds -->
+        <div class="asocks-port-picker" id="asocks-port-picker" style="display:none;">
+          <div class="asocks-port-title" id="asocks-port-title">
+            Select a port from your asocks account
+          </div>
+          <div id="asocks-port-status" class="asocks-port-loading"></div>
+          <div class="asocks-port-list" id="asocks-port-list"></div>
         </div>
       </div>
       <div class="form-group">

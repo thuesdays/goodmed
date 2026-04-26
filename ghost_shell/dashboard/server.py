@@ -839,6 +839,216 @@ def api_profile_meta_set(name: str):
     return jsonify(get_db().profile_meta_get(name))
 
 
+@app.route("/api/profiles/quality-batch", methods=["GET"])
+def api_profiles_quality_batch():
+    """Return a verdict for every profile in one request.
+
+    The Profiles page calls this once on load so we don't fan out N
+    serial requests for the badges. Output shape:
+        {
+          "<profile_name>": {"status": str, "score": int, "reasons": [str]},
+          ...
+        }
+    """
+    try:
+        from ghost_shell.profile.quality_manager import assess_profile
+        db = get_db()
+        out = {}
+        for p in db.profiles_list():
+            name = p.get("name") if isinstance(p, dict) else None
+            if not name:
+                continue
+            try:
+                v = assess_profile(name)
+                out[name] = {
+                    "status":         v.get("status"),
+                    "score":          v.get("score"),
+                    "reasons":        v.get("reasons", []),
+                    "recommendation": v.get("recommendation"),
+                }
+            except Exception:
+                out[name] = {"status": "ready", "score": 100, "reasons": []}
+        return jsonify(out)
+    except Exception as e:
+        logging.exception("[quality] batch failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/fingerprint/probe", methods=["POST"])
+def api_profile_fp_probe(name: str):
+    """Spawn a probe-only run that visits external fingerprint testers
+    in THIS profile's actual Chrome session and records what it sees.
+
+    Why this exists: the in-process self-check (browser.health_check)
+    only runs internal JS probes -- it never visits external testers
+    like CreepJS / BrowserLeaks. Users who want to know how their
+    profile scores against the same engines bot-detect services use
+    have had to manually paste those URLs into the address bar of a
+    running profile. This endpoint automates that.
+
+    The run is a regular monitor run with a probe-specific flow
+    overriding the profile's normal script. The flow visits each
+    tester URL with a long dwell so the page's JS finishes computing
+    its score before we move on. After the run, the user sees the
+    visit log and can check each tester's results in their browser
+    history (or paste the URL again -- cookies persist).
+    """
+    db = get_db()
+    if not db.profile_get(name) if hasattr(db, "profile_get") else None:
+        # Best-effort existence check; missing helper -> skip and let
+        # _spawn_run raise the canonical error.
+        pass
+
+    # Build the probe flow inline. Each step is a step the unified
+    # runtime understands (open_url + pause). 30s dwell because some
+    # testers (CreepJS, AmIUnique) compute scores asynchronously and
+    # the score isn't visible for ~10-20s after page load.
+    PROBE_TESTERS = [
+        ("CreepJS",       "https://abrahamjuliot.github.io/creepjs/"),
+        ("Sannysoft",     "https://bot.sannysoft.com/"),
+        ("Pixelscan",     "https://pixelscan.net/"),
+        ("AmIUnique",     "https://amiunique.org/fingerprint"),
+        ("BrowserLeaks",  "https://browserleaks.com/canvas"),
+        ("FP-com BotD",   "https://fingerprint.com/products/bot-detection/"),
+    ]
+    probe_flow = []
+    for label, url in PROBE_TESTERS:
+        probe_flow.append({
+            "type":        "open_url",
+            "url":         url,
+            "dwell_min":   25,
+            "dwell_max":   40,
+            "scroll":      True,
+            "_label":      f"FP-tester: {label}",
+        })
+    # Final pause so the user has time to see the results before the
+    # browser auto-closes (matches the natural feel of "I'm reviewing
+    # the score for a moment").
+    probe_flow.append({"type": "pause", "min_sec": 4, "max_sec": 7})
+
+    # Persist the inline flow as a one-shot script so _spawn_run can
+    # reference it via script_id_override -- the existing one-shot
+    # script-override path is the cleanest way to inject a custom
+    # flow without permanently binding it to the profile.
+    #
+    # We use a deterministic per-profile name so re-clicking the
+    # button doesn't pile up dozens of "__probe_fp_X" rows. On
+    # UNIQUE collision we update the existing row's flow instead
+    # of inserting a new one. (script_create raises on duplicate.)
+    probe_name = f"__probe_fp_{name}"
+    script_id  = None
+    try:
+        script_id = db.script_create(
+            name=probe_name,
+            flow=probe_flow,
+            description="Auto-generated FP probe pass (visits external testers)",
+            tags=["__internal", "fp-probe"],
+        )
+    except Exception:
+        # Likely UNIQUE collision -- find the existing row and update.
+        try:
+            row = db._get_conn().execute(
+                "SELECT id FROM scripts WHERE name = ?",
+                (probe_name,),
+            ).fetchone()
+            if row:
+                script_id = row["id"]
+                db.script_update(script_id, flow=probe_flow,
+                                 description="Auto-generated FP probe pass (refreshed)",
+                                 tags=["__internal", "fp-probe"])
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "error": f"could not upsert probe script: {e}"}), 500
+    if not script_id:
+        return jsonify({"ok": False,
+                        "error": "probe script id resolution failed"}), 500
+
+    try:
+        result = _spawn_run(name, script_id_override=script_id)
+        return jsonify({
+            "ok":         True,
+            "run_id":     result.get("run_id"),
+            "script_id":  script_id,
+            "tester_count": len(PROBE_TESTERS),
+            "message":    (
+                "Probe run started. Watch the Logs page for visit "
+                "events; results live in the profile browser's history "
+                "and on each tester's page."
+            ),
+        })
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 409
+    except Exception as e:
+        logging.exception("[fp-probe] spawn failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/profiles/<name>/quality", methods=["GET"])
+def api_profile_quality(name: str):
+    """Return the Profile Quality Manager verdict for this profile.
+
+    Combines: fingerprint coherence_score, captcha rate (24h),
+    consecutive blocks, IP burn state, warmup freshness. Output:
+        {
+            "status":         "ready" | "warmup" | "burned",
+            "score":          int,
+            "fingerprint":    {"score": int|None, "grade": str|None},
+            "session":        {captcha_rate_24h: ..., ...} | None,
+            "warmup":         {"hours_since_last": float|None, "stale": bool},
+            "ip":             {"burned": bool, "last_ip": str|None},
+            "reasons":        [str, ...],
+            "recommendation": str,
+            "checked_at":     ISO timestamp
+        }
+    """
+    try:
+        from ghost_shell.profile.quality_manager import assess_profile
+        return jsonify(assess_profile(name))
+    except Exception as e:
+        logging.exception("[quality] assess failed")
+        return jsonify({"error": str(e), "status": "ready"}), 500
+
+
+@app.route("/api/profiles/<name>/quality/warmup", methods=["POST"])
+def api_profile_quality_warmup(name: str):
+    """Enqueue a warmup pass for this profile.
+
+    CookieWarmer needs a live Chrome driver, so we can't run a warmup
+    inside this HTTP handler -- spawning a browser per-request would
+    be ugly (multi-minute response, holds an HTTP worker, blocks
+    other dashboard ops). Instead we mark the profile as needing a
+    warmup; the next time main.py launches this profile (manually or
+    via scheduler), the runtime gate sees the pending row and runs
+    hybrid_warmup before the first real search.
+
+    The actual warmup gate lives in main.py and reads
+    warmup_runs WHERE status='requested'.
+    """
+    try:
+        db = get_db()
+        db._get_conn().execute("""
+            INSERT INTO warmup_runs (
+                profile_name, started_at, finished_at, preset,
+                sites_planned, sites_visited, status, trigger
+            ) VALUES (?, ?, NULL, ?, 0, 0, 'requested', 'manual_quality')
+        """, (
+            name,
+            datetime.now().isoformat(timespec="seconds"),
+            "default",
+        ))
+        db._get_conn().commit()
+        return jsonify({
+            "ok":      True,
+            "message": (
+                "Warmup queued. It will run automatically on the next "
+                "launch of this profile (manual run or scheduler tick)."
+            ),
+        })
+    except Exception as e:
+        logging.exception("[quality] warmup enqueue failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/profiles/<name>/tags", methods=["POST"])
 def api_profile_set_tags(name: str):
     """Convenience endpoint for the tag editor — replaces the whole
@@ -2061,10 +2271,27 @@ def _scheduler_pid_alive() -> int:
             p = psutil.Process(pid)
             name = (p.name() or "").lower()
             cmd  = " ".join(p.cmdline() or []).lower()
-            # Require BOTH a Python name AND scheduler.py in cmdline.
-            # This prevents a recycled PID (e.g. 12345 is now notepad.exe
-            # or a child of dashboard_server) from blocking Start.
-            if "python" in name and "scheduler.py" in cmd:
+            # Require a Python name AND the scheduler entry in cmdline.
+            # The scheduler is launched via `python -m ghost_shell scheduler`
+            # (not `python scheduler.py`), so the previous check for
+            # "scheduler.py" in cmd never matched and the PID was always
+            # rejected as "recycled" -- which made /status report
+            # health='crashed' (no PID + recent heartbeat) and hid the
+            # Stop button entirely. The user could start the scheduler
+            # but never stop it from the UI.
+            #
+            # Match either form so we cover both the module entrypoint
+            # (`-m ghost_shell scheduler`) and any legacy direct script
+            # path (`scheduler.py`). Require "ghost_shell" alongside
+            # the "scheduler" token so an unrelated python program with
+            # "scheduler" in its argv (cron jobs, task schedulers, etc.)
+            # doesn't get mistaken for ours.
+            is_module_form = (
+                "ghost_shell" in cmd and
+                ("scheduler" in cmd or "scheduler.py" in cmd)
+            )
+            is_script_form = "scheduler.py" in cmd
+            if "python" in name and (is_module_form or is_script_form):
                 return pid
             # PID is live but NOT ours — stale file from a crashed scheduler
             # whose PID got reused by another program.
@@ -2095,9 +2322,24 @@ def _clear_scheduler_pid_file(reason: str):
 
 @app.route("/api/scheduler/start", methods=["POST"])
 def api_scheduler_start():
+    """Spawn the scheduler subprocess.
+
+    Bumps `scheduler.started_at` to NOW *before* spawn so the new
+    session sees a clean failure-counter -- otherwise stale failures
+    from a previous run would immediately push us into the
+    'consecutive failures, pausing 1800s' branch and the user could
+    never get out without a manual DB poke.
+    """
     if _scheduler_pid_alive():
         return jsonify({"error": "Scheduler is already running"}), 409
     try:
+        # Reset session marker BEFORE spawn. consecutive_failures()
+        # reads runs.started_at >= scheduler.started_at, so by setting
+        # this to "now" we guarantee zero historical failures count
+        # against this fresh session.
+        get_db().config_set(
+            "scheduler.started_at",
+            datetime.now().isoformat(timespec="seconds"))
         proc = subprocess.Popen(
             [sys.executable, "-u", "-m", "ghost_shell", "scheduler"],
             cwd=PROJECT_ROOT,
@@ -2109,32 +2351,210 @@ def api_scheduler_start():
             f.write(str(proc.pid))
         return jsonify({"ok": True, "pid": proc.pid})
     except Exception as e:
+        logging.exception("[scheduler] start failed")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scheduler/logs", methods=["GET"])
+def api_scheduler_logs():
+    """Return the tail of scheduler.log so the dashboard can show
+    scheduler activity even when no per-profile run is active.
+
+    The Logs page falls back to this stream when its in-memory
+    LOG_BUFFER is empty AND no profile is selected -- otherwise the
+    page would just say "No log entries" while the scheduler is
+    quietly cycling 14h sleeps in the background, making the user
+    think nothing is happening.
+
+    Query: ?lines=N (default 200, max 5000)
+    """
+    try:
+        n = max(1, min(5000, int(request.args.get("lines", 200))))
+    except Exception:
+        n = 200
+
+    log_path = os.path.join(PROJECT_ROOT, "scheduler.log")
+    if not os.path.exists(log_path):
+        return jsonify({"entries": [], "exists": False})
+
+    # Read the tail without loading the whole file into memory. Tail
+    # via line-based seek-from-end: starts at EOF, walks back chunk
+    # by chunk until we have N newlines.
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = 8192
+            data = b""
+            while size > 0 and data.count(b"\n") <= n:
+                read_size = min(chunk, size)
+                size -= read_size
+                f.seek(size)
+                data = f.read(read_size) + data
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()[-n:]
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Parse each line into entries. scheduler.log format is
+    # "%(asctime)s [%(levelname)s] %(message)s"; if a line doesn't
+    # match (ad-hoc traceback, banner, etc) we keep it as-is.
+    entries = []
+    for raw in lines:
+        ts, lvl, msg = "", "info", raw
+        # "2026-04-26 09:34:23,669 [INFO] message"
+        if len(raw) > 30 and raw[4] == "-" and raw[7] == "-":
+            try:
+                ts = raw[:23]              # "2026-04-26 09:34:23,669"
+                rest = raw[24:].lstrip()
+                if rest.startswith("[") and "]" in rest:
+                    end = rest.index("]")
+                    lvl_raw = rest[1:end].strip().lower()
+                    if lvl_raw in ("error", "warning", "info", "debug"):
+                        lvl = "warning" if lvl_raw == "warning" else lvl_raw
+                    msg = rest[end + 1:].lstrip()
+                else:
+                    msg = rest
+            except Exception:
+                pass
+        entries.append({
+            "ts":           ts,
+            "level":        lvl,
+            "message":      msg,
+            "profile_name": "scheduler",
+            "run_id":       None,
+        })
+    return jsonify({"entries": entries, "exists": True, "count": len(entries)})
+
+
+@app.route("/api/scheduler/reset-fails", methods=["POST"])
+def api_scheduler_reset_fails():
+    """Manually reset the consecutive-failure counter by bumping
+    scheduler.started_at to NOW. The next iteration's tick will see
+    zero failures-in-row regardless of what's in the runs table."""
+    try:
+        get_db().config_set(
+            "scheduler.started_at",
+            datetime.now().isoformat(timespec="seconds"))
+        return jsonify({"ok": True})
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/scheduler/stop", methods=["POST"])
 def api_scheduler_stop():
+    """Reliably stop the scheduler subprocess.
+
+    Sequence:
+      1. Try to read PID via pidfile-aware check, but ALSO fall back to
+         raw pidfile read so we can stop a "wedged" scheduler whose
+         heartbeat is dead but process is alive.
+      2. terminate() with 8s wait -- gives the scheduler a chance to
+         exit its sleep loop cleanly.
+      3. kill() any children first (so we don't leak a chrome.exe), then
+         kill() the scheduler itself with another 4s wait.
+      4. Always clean up pidfile + heartbeat regardless of outcome --
+         the user clicked Stop, the UI must show "stopped" afterwards.
+
+    Query/body flags:
+      ?force=1 -- skip terminate(), go straight to kill(). For the
+                  Force-kill UI button when terminate hangs.
+    """
+    # Resolve PID from BOTH cmdline-validated check and raw pidfile.
+    # Wedged scheduler with stale heartbeat: _scheduler_pid_alive()
+    # still returns the PID, so we're fine. But if cmdline validation
+    # fails (e.g. python.exe symlinked weirdly), fall back to the raw
+    # file content as a last resort.
     pid = _scheduler_pid_alive()
+    if not pid and os.path.exists(SCHEDULER_PID_FILE):
+        try:
+            pid = int(open(SCHEDULER_PID_FILE).read().strip())
+        except Exception:
+            pid = 0
+
     if not pid:
-        return jsonify({"error": "Scheduler is not running"}), 409
+        # Already stopped — return success so the UI can resync the
+        # status without showing an error toast.
+        try:
+            get_db().config_set("scheduler.heartbeat_at", None)
+        except Exception:
+            pass
+        return jsonify({"ok": True, "already_stopped": True})
+
+    force = (request.args.get("force") in ("1", "true", "yes")) or \
+            (request.is_json and bool((request.get_json(silent=True) or {}).get("force")))
+
+    err: str | None = None
     try:
         import psutil
-        p = psutil.Process(pid)
-        p.terminate()
         try:
-            p.wait(timeout=10)
-        except psutil.TimeoutExpired:
-            p.kill()
+            p = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            p = None
+
+        if p:
+            # Kill children FIRST -- if scheduler spawned a runner that
+            # spawned a chrome.exe, we don't want chrome left orphaned
+            # holding the user-data-dir locked.
+            try:
+                children = p.children(recursive=True)
+            except Exception:
+                children = []
+
+            if not force:
+                logging.info(f"[scheduler] terminate PID {pid}")
+                try: p.terminate()
+                except Exception: pass
+                try:
+                    p.wait(timeout=8)
+                except psutil.TimeoutExpired:
+                    logging.warning(f"[scheduler] PID {pid} ignored terminate, escalating to kill")
+                    force = True
+
+            if force or psutil.pid_exists(pid):
+                logging.info(f"[scheduler] kill PID {pid} (force={force})")
+                # Children first.
+                for c in children:
+                    try: c.kill()
+                    except Exception: pass
+                try: p.kill()
+                except Exception: pass
+                try: p.wait(timeout=4)
+                except Exception: pass
+
+            # Last-ditch: Windows taskkill /F if psutil somehow still
+            # reports it alive. Belt-and-suspenders.
+            if psutil.pid_exists(pid):
+                logging.warning(f"[scheduler] PID {pid} survived kill -- taskkill /F")
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        timeout=4,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        **_popen_no_console_flags(),
+                    )
+                except Exception as e:
+                    err = f"taskkill failed: {e}"
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logging.exception("[scheduler] stop sequence failed")
+        err = str(e)
+
+    # ALWAYS clean up state -- the user clicked Stop, they want it gone.
     try:
-        os.remove(SCHEDULER_PID_FILE)
+        if os.path.exists(SCHEDULER_PID_FILE):
+            os.remove(SCHEDULER_PID_FILE)
     except OSError:
         pass
     try:
         get_db().config_set("scheduler.heartbeat_at", None)
     except Exception:
         pass
+
+    if err:
+        # Even on partial failure we cleaned the pidfile, so /status
+        # will report "stopped" and the UI will resync.
+        return jsonify({"ok": True, "warning": err})
     return jsonify({"ok": True})
 
 
@@ -3825,14 +4245,36 @@ def api_proxies_create():
     url = (data.get("url") or "").strip()
     if not url:
         return jsonify({"error": "url is required"}), 400
+
+    # Auto-heal: if user pasted a rotation URL but left the provider
+    # at "none" or blank, infer the provider from the URL host so the
+    # row is saved with a valid combination. Otherwise the runtime
+    # would have to keep auto-fixing the same misconfiguration on
+    # every launch, and the user would keep seeing surprise asocks
+    # detection messages in the logs.
+    rotation_url      = data.get("rotation_api_url") or None
+    rotation_provider = data.get("rotation_provider") or None
+    if rotation_url and (not rotation_provider or rotation_provider == "none"):
+        try:
+            from ghost_shell.proxy.rotating import infer_provider_from_url
+            inferred = infer_provider_from_url(rotation_url)
+            if inferred != "none":
+                logging.info(
+                    f"[proxy_create] auto-set provider={inferred!r} "
+                    f"from URL pattern (was {rotation_provider!r})"
+                )
+                rotation_provider = inferred
+        except Exception:
+            pass
+
     db = get_db()
     try:
         pid = db.proxy_create(
             url=url,
             name=data.get("name") or None,
             is_rotating=bool(data.get("is_rotating")),
-            rotation_api_url=data.get("rotation_api_url") or None,
-            rotation_provider=data.get("rotation_provider") or None,
+            rotation_api_url=rotation_url,
+            rotation_provider=rotation_provider,
             rotation_api_key=data.get("rotation_api_key") or None,
             is_default=bool(data.get("is_default")),
             notes=data.get("notes") or None,
@@ -3868,6 +4310,24 @@ def api_proxies_get(proxy_id):
 @app.route("/api/proxies/<int:proxy_id>", methods=["PUT", "PATCH"])
 def api_proxies_update(proxy_id):
     data = request.get_json(silent=True) or {}
+    # Same auto-heal as on create: if a rotation URL is set but the
+    # provider isn't, infer from URL pattern. Done before passing to
+    # the DB layer so PATCH-style partial updates also benefit.
+    if data.get("rotation_api_url") and (
+        not data.get("rotation_provider") or
+        data.get("rotation_provider") == "none"
+    ):
+        try:
+            from ghost_shell.proxy.rotating import infer_provider_from_url
+            inferred = infer_provider_from_url(data["rotation_api_url"])
+            if inferred != "none":
+                logging.info(
+                    f"[proxy_update id={proxy_id}] auto-set provider="
+                    f"{inferred!r} from URL pattern"
+                )
+                data["rotation_provider"] = inferred
+        except Exception:
+            pass
     db = get_db()
     try:
         ok = db.proxy_update(proxy_id, **data)
@@ -3925,6 +4385,98 @@ def api_proxies_test(proxy_id):
             "ok": False,
             "diag": {"ok": False, "error": str(e)},
         }), 500
+
+
+@app.route("/api/proxies/<int:proxy_id>/rotate", methods=["POST"])
+def api_proxies_rotate(proxy_id):
+    """Force-rotate the exit IP of a specific proxy in the library.
+
+    Per-row companion to the global /api/proxy/rotate endpoint. Reads
+    rotation config from THIS proxy's columns (not the global config),
+    fires the rotation API, then re-tests to surface the new IP.
+
+    Returns the diagnostic dict so the UI can update the row badge
+    inline without a full reload.
+    """
+    db = get_db()
+    proxy = db.proxy_get(proxy_id)
+    if not proxy:
+        return jsonify({"error": "not found"}), 404
+
+    if not proxy.get("is_rotating"):
+        return jsonify({
+            "ok": False,
+            "error": "this proxy is not marked as rotating "
+                     "(toggle 'supports rotation' in edit dialog)",
+        }), 400
+
+    # Pull per-proxy rotation config — fall back to global config so
+    # the dashboard can rotate even if rotation_provider/key live on
+    # the global config (legacy single-proxy installs).
+    api_url  = proxy.get("rotation_api_url")  or db.config_get("proxy.rotation_api_url")
+    provider = proxy.get("rotation_provider") or db.config_get("proxy.rotation_provider") or "none"
+    api_key  = proxy.get("rotation_api_key")  or db.config_get("proxy.rotation_api_key")
+
+    # Auto-heal: same logic as RotatingProxyTracker.__init__
+    if (provider == "none" or not provider) and api_url:
+        try:
+            from ghost_shell.proxy.rotating import infer_provider_from_url
+            inferred = infer_provider_from_url(api_url)
+            if inferred != "none":
+                provider = inferred
+                logging.info(
+                    f"[rotate-row] auto-detected provider={provider!r} "
+                    f"from URL pattern for proxy_id={proxy_id}"
+                )
+        except Exception:
+            pass
+
+    if provider == "none" or not api_url:
+        return jsonify({
+            "ok": False,
+            "error": "rotation API URL or provider missing — edit "
+                     "this proxy and paste the rotation URL.",
+        }), 400
+
+    rotation_called = False
+    rotation_http   = None
+    rotation_error  = None
+    try:
+        import requests
+        headers = _build_rotation_headers(provider, api_key)
+        method  = (db.config_get("proxy.rotation_method") or "GET").upper()
+        if method == "POST":
+            r = requests.post(api_url, headers=headers, timeout=10)
+        else:
+            r = requests.get(api_url, headers=headers, timeout=10)
+        rotation_http   = r.status_code
+        rotation_called = r.ok
+        if not r.ok:
+            rotation_error = f"HTTP {r.status_code}: {r.text[:200]}"
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"rotation API call failed: {e}"}), 500
+
+    # Wait for the provider to actually swap the exit (~2-5s typical)
+    import time as _t
+    _t.sleep(3)
+
+    # Re-test to confirm the new IP. Persists the diagnostic so the
+    # row badge refreshes immediately.
+    try:
+        from ghost_shell.proxy.diagnostics import test_proxy
+        diag = test_proxy(proxy["url"], timeout=15)
+        db.proxy_record_diagnostics(proxy_id, diag)
+    except Exception as e:
+        diag = {"ok": False, "error": str(e)}
+
+    return jsonify({
+        "ok":              rotation_called,
+        "rotation_http":   rotation_http,
+        "rotation_error":  rotation_error,
+        "provider":        provider,
+        "diag":            diag,
+    })
 
 
 @app.route("/api/proxies/test-all", methods=["POST"])

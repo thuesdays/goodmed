@@ -143,16 +143,42 @@ def runs_today() -> int:
 
 
 def consecutive_failures() -> int:
-    rows = get_db()._get_conn().execute(
-        "SELECT exit_code FROM runs WHERE finished_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT 20"
+    """Count consecutive failed runs since the CURRENT scheduler session
+    started. Failures from prior sessions (e.g. before the user fixed
+    a proxy) no longer count -- otherwise we used to deadlock: counter
+    >= max_fails_in_row -> immediate pause -> can't get to a success
+    that resets it.
+
+    A run "counts" if started_at >= scheduler.started_at AND finished
+    with non-zero exit_code. Counting walks backward from the most
+    recent run, stopping at the first success (or session boundary).
+    """
+    db = get_db()
+    started_at = db.config_get("scheduler.started_at") or ""
+    rows = db._get_conn().execute(
+        "SELECT id, profile_name, exit_code, error, started_at, finished_at "
+        "FROM runs WHERE finished_at IS NOT NULL "
+        "AND started_at >= ? "
+        "ORDER BY id DESC LIMIT 20",
+        (started_at,),
     ).fetchall()
     count = 0
+    failed_rows = []
     for r in rows:
         if r["exit_code"] not in (0, None):
             count += 1
+            failed_rows.append(dict(r))
         else:
             break
+    # Verbose logging on first call per tick that finds failures, so
+    # the user knows WHICH runs are blocking.
+    if failed_rows:
+        for fr in failed_rows[:5]:
+            logging.warning(
+                f"   - failed run id={fr['id']} profile={fr['profile_name']} "
+                f"exit={fr['exit_code']} at={fr['finished_at']} "
+                f"error={(fr.get('error') or '')[:120]}"
+            )
     return count
 
 
@@ -559,17 +585,34 @@ def main():
     logging.info("═" * 60)
 
     try:
+        _iter_no = 0
         while not _shutdown:
+            _iter_no += 1
             cfg = load_cfg()
             heartbeat()
+            # Verbose tick header so the user can grep "tick #" in
+            # logs and see exactly when each iteration starts + what
+            # the gates evaluate to.
+            logging.info(
+                f"-- tick #{_iter_no} at "
+                f"{datetime.now().strftime('%H:%M:%S')} "
+                f"target={cfg['target_runs']} "
+                f"hours={cfg['active_hours']}"
+            )
 
             if not is_active_day(cfg["active_days"]):
                 sleep_sec = time_until_next_active_day(cfg["active_days"])
                 wake_at = datetime.now() + timedelta(seconds=sleep_sec)
+                # Two-line log so the next-run-time stands out -- the
+                # user reported the sleeping line was easy to miss
+                # mixed in with the rest of stdout.
                 logging.info(
-                    f"💤 Outside active-days — sleeping until "
-                    f"{wake_at.strftime('%Y-%m-%d %H:%M')} "
-                    f"({sleep_sec/3600:.1f}h)"
+                    f"💤 Outside active-days — sleeping {sleep_sec/3600:.1f}h"
+                )
+                logging.info(
+                    f"⏰ Next run at "
+                    f"{wake_at.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(in {sleep_sec/3600:.1f}h)"
                 )
                 heartbeat({"next_run_at": wake_at.isoformat(timespec="seconds")})
                 sleep_interruptible(sleep_sec)
@@ -579,9 +622,12 @@ def main():
                 sleep_sec = time_until_next_window(cfg["active_hours"])
                 wake_at = datetime.now() + timedelta(seconds=sleep_sec)
                 logging.info(
-                    f"💤 Outside window — sleeping until "
-                    f"{wake_at.strftime('%Y-%m-%d %H:%M')} "
-                    f"({sleep_sec/3600:.1f}h)"
+                    f"💤 Outside window — sleeping {sleep_sec/3600:.1f}h"
+                )
+                logging.info(
+                    f"⏰ Next run at "
+                    f"{wake_at.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(in {sleep_sec/3600:.1f}h)"
                 )
                 heartbeat({"next_run_at": wake_at.isoformat(timespec="seconds")})
                 sleep_interruptible(sleep_sec)
@@ -590,18 +636,34 @@ def main():
             done_today = runs_today()
             if done_today >= cfg["target_runs"]:
                 sleep_sec = time_until_next_window(cfg["active_hours"])
+                wake_at = datetime.now() + timedelta(seconds=sleep_sec)
                 logging.info(
                     f"✅ Quota met ({done_today}/{cfg['target_runs']}) — "
                     f"sleeping until tomorrow"
                 )
+                logging.info(
+                    f"⏰ Next run at "
+                    f"{wake_at.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"(in {sleep_sec/3600:.1f}h)"
+                )
+                heartbeat({"next_run_at": wake_at.isoformat(timespec="seconds")})
                 sleep_interruptible(sleep_sec)
                 continue
 
             fails = consecutive_failures()
             if fails >= cfg["max_fails_in_row"]:
                 pause = cfg["fail_pause_sec"]
+                resume = (datetime.now() + timedelta(seconds=pause)
+                          ).strftime("%H:%M:%S")
                 logging.error(
-                    f"🚨 {fails} consecutive failures — pausing for {pause}s"
+                    f"🚨 {fails} consecutive failures (threshold "
+                    f"{cfg['max_fails_in_row']}) -- pausing {pause}s, "
+                    f"resume at {resume}"
+                )
+                logging.error(
+                    f"   tip: open Settings -> reset 'failure counter' "
+                    f"to clear, or fix proxy/profile and let one good run "
+                    f"reset the counter"
                 )
                 sleep_interruptible(pause)
                 continue

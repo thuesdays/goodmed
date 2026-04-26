@@ -254,6 +254,17 @@ const Logs = {
 
     const visible = LOG_BUFFER.filter(l => this._passesFilter(l));
 
+    // No live run logs AND no filter active → show scheduler.log as
+    // the default content. Without this fallback the page is blank
+    // most of the time (since runs only happen for a few minutes per
+    // tick and the rest of the day the buffer is empty), which made
+    // users think the page was broken. Scheduler logs are the most
+    // useful fallback because the scheduler itself is what's running
+    // 24/7 between profile launches.
+    if (!LOG_BUFFER.length && !this._filterProfile && !this._filterText) {
+      this._renderSchedulerFallback(box);
+      return;
+    }
     if (!LOG_BUFFER.length) {
       box.innerHTML = '<div class="muted">No log entries</div>';
       return;
@@ -277,6 +288,49 @@ const Logs = {
       return `<div class="log-line ${l.level || 'info'}">` +
              `<span class="ts">${escapeHtml(l.ts || '')}</span>` +
              chip +
+             `<span class="msg">${escapeHtml(l.message || '')}</span>` +
+             `</div>`;
+    }).join("");
+    box.scrollTop = box.scrollHeight;
+  },
+
+  // Pull scheduler.log tail and render it -- used when there are no
+  // live profile-run logs to show. Cached for ~10 seconds so rapid
+  // re-renders don't hammer the API.
+  async _renderSchedulerFallback(box) {
+    const now = Date.now();
+    if (!this._schedCache ||
+        (now - (this._schedCachedAt || 0)) > 10_000) {
+      box.innerHTML =
+        '<div class="muted">Loading scheduler logs…</div>';
+      try {
+        const r = await api("/api/scheduler/logs?lines=300");
+        this._schedCache    = r;
+        this._schedCachedAt = now;
+      } catch (e) {
+        box.innerHTML =
+          `<div class="muted">No log entries (scheduler logs unavailable: ${escapeHtml(e.message || e)})</div>`;
+        return;
+      }
+    }
+    const r = this._schedCache;
+    if (!r || !r.entries || !r.entries.length) {
+      box.innerHTML =
+        '<div class="muted">No log entries — scheduler not yet started, ' +
+        'or scheduler.log is empty. Start a profile run or the ' +
+        'scheduler to populate logs.</div>';
+      return;
+    }
+    const banner = `<div class="log-line info" style="opacity:.7;
+        border-bottom:1px solid var(--border);padding-bottom:6px;
+        margin-bottom:6px;">
+        <span class="msg">📋 Showing scheduler logs (no active profile runs).
+        Switch to a profile run from the Runs page to see its live output.</span>
+      </div>`;
+    box.innerHTML = banner + r.entries.map(l => {
+      return `<div class="log-line ${l.level || 'info'}">` +
+             `<span class="ts">${escapeHtml(l.ts || '')}</span>` +
+             `<span class="log-profile-chip">scheduler</span>` +
              `<span class="msg">${escapeHtml(l.message || '')}</span>` +
              `</div>`;
     }).join("");

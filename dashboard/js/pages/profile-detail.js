@@ -190,6 +190,68 @@ const ProfileDetail = {
       $("#selfcheck-badge").textContent = "—";
       $("#selfcheck-grid").innerHTML = `<div class="empty-state">${escapeHtml(e.message)}</div>`;
     }
+    // Wire Probe button on first selfcheck load (idempotent).
+    this._wireFpProbeButton();
+  },
+
+  // ── Fingerprint probe button ───────────────────────────────────
+  // POSTs to /api/profiles/<name>/fingerprint/probe which spawns a
+  // browser run that visits the canonical external testers
+  // (CreepJS, BotD, Pixelscan, AmIUnique, BrowserLeaks, FP-com BotD)
+  // in the profile's actual Chrome session. The profile picks up
+  // each tester's cookies + the user can review the on-page scores.
+  _wireFpProbeButton() {
+    const btn = document.getElementById("fp-probe-btn");
+    if (!btn || btn.dataset._wired === "1") return;
+    btn.dataset._wired = "1";
+    btn.addEventListener("click", () => this._runFpProbe());
+  },
+
+  async _runFpProbe() {
+    const btn    = document.getElementById("fp-probe-btn");
+    const status = document.getElementById("fp-probe-status");
+    if (!this.currentProfile) {
+      toast("No profile selected", true);
+      return;
+    }
+    const ok = await confirmDialog({
+      title:        "Run fingerprint probe pass?",
+      message:      `This will launch ${this.currentProfile} and visit 6 ` +
+                    `external fingerprint testers (CreepJS, BotD, etc.). ` +
+                    `Takes ~3-4 minutes. Watch the Logs page for progress; ` +
+                    `tester scores will be visible in the Chrome window ` +
+                    `that opens.`,
+      confirmText:  "Start probe",
+      confirmStyle: "primary",
+    });
+    if (!ok) return;
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "⏳ Spawning…";
+    if (status) status.textContent = "";
+    try {
+      const r = await api(
+        `/api/profiles/${encodeURIComponent(this.currentProfile)}/fingerprint/probe`,
+        { method: "POST" },
+      );
+      if (r.ok === false) {
+        toast(`Probe failed: ${r.error || "unknown"}`, true);
+        if (status) status.textContent = `✗ ${r.error || "failed"}`;
+      } else {
+        toast(`✓ Probe run #${r.run_id} started — open Logs to watch`);
+        if (status) {
+          status.textContent =
+            `Run #${r.run_id} started — visiting ${r.tester_count} testers`;
+          status.style.color = "#6ee7b7";
+        }
+      }
+    } catch (e) {
+      toast(`Probe failed: ${e.message || e}`, true);
+      if (status) status.textContent = `✗ ${e.message || e}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = orig || "🚀 Probe in profile";
+    }
   },
 
   async loadFingerprint(name) {
@@ -620,10 +682,171 @@ const ProfileDetail = {
       if (byId("pp-notes"))             byId("pp-notes").value             = meta.notes             || "";
       const status = byId("pp-save-status");
       if (status) status.textContent = "";
+      // Wire the asocks Auto-fill button. Idempotent -- safe to call
+      // every time meta loads (we tag the element after first wire).
+      this._wireAsocksAutofill();
+      this._refreshAsocksDiscoverVisibility();
     } catch (e) {
       // 404 is OK — just means no custom metadata yet
       this._workingTags = [];
       this._renderTagChips();
+    }
+  },
+
+  // ── asocks rotation URL auto-discovery (per-profile) ─────────
+  // Surfaces the same /api/proxy/asocks-port-list endpoint the
+  // global Proxy edit modal already uses, but here we ALSO match
+  // the profile's proxy URL host:port to a port and auto-pick that
+  // port's refresh_link. Saves the user from having to copy a URL
+  // they could already infer from the proxy URL they pasted above.
+  _wireAsocksAutofill() {
+    const btn   = document.getElementById("pp-asocks-discover-btn");
+    const sel   = document.getElementById("pp-rotation-provider");
+    const url   = document.getElementById("pp-proxy-url");
+    if (!btn || btn.dataset._wired === "1") {
+      // Still need to refresh visibility on every meta-load even if
+      // already wired (provider may have changed across profiles).
+      this._refreshAsocksDiscoverVisibility();
+      return;
+    }
+    btn.dataset._wired = "1";
+    btn.addEventListener("click", () => this._asocksAutofill());
+    sel?.addEventListener("change", () => this._refreshAsocksDiscoverVisibility());
+    url?.addEventListener("input",  () => this._refreshAsocksDiscoverVisibility());
+
+    // Auto-trigger heuristic: when the user PICKS asocks from the
+    // dropdown AND the proxy URL is filled AND the rotation URL is
+    // empty -- silently kick off discovery so the field fills before
+    // the user reaches for the manual button. Throttled with the
+    // _autoTriedFor marker so we don't spam asocks's API on every
+    // keystroke.
+    sel?.addEventListener("change", () => {
+      const provider = sel.value;
+      const proxy    = (url?.value || "").trim();
+      const rotUrl   = document.getElementById("pp-rotation-url")?.value?.trim();
+      if (provider === "asocks" && proxy && !rotUrl &&
+          this._autoTriedFor !== proxy) {
+        this._autoTriedFor = proxy;
+        this._asocksAutofill({silentIfNoKey: true});
+      }
+    });
+  },
+
+  _refreshAsocksDiscoverVisibility() {
+    const btn = document.getElementById("pp-asocks-discover-btn");
+    const sel = document.getElementById("pp-rotation-provider");
+    if (!btn || !sel) return;
+    btn.style.display = (sel.value === "asocks") ? "" : "none";
+  },
+
+  async _asocksAutofill(opts = {}) {
+    const url   = (document.getElementById("pp-proxy-url")?.value || "").trim();
+    const rotUrl = document.getElementById("pp-rotation-url");
+    const keyEl  = document.getElementById("pp-rotation-api-key");
+    const btn    = document.getElementById("pp-asocks-discover-btn");
+
+    if (!url) {
+      if (!opts.silentIfNoKey) {
+        toast("Fill in the Proxy URL first — Auto-fill matches it to your asocks ports", true);
+      }
+      return;
+    }
+    // Parse host:port out of the proxy URL. Accept both with and
+    // without scheme; with or without user:pass@.
+    let host = "", port = "";
+    try {
+      let s = url.replace(/^[a-z0-9+]+:\/\//i, "");
+      if (s.includes("@")) s = s.split("@").pop();
+      // Could be host:port or [v6]:port -- handle simple v4 only here.
+      const parts = s.split(":");
+      if (parts.length >= 2) {
+        host = parts[0];
+        port = (parts[1] || "").split(/[/?#]/)[0];
+      }
+    } catch {}
+
+    if (!host || !port) {
+      if (!opts.silentIfNoKey) {
+        toast("Could not parse host:port from Proxy URL", true);
+      }
+      return;
+    }
+
+    // Resolve the API key. Priority order:
+    //   1. The per-profile API key field on this page (if filled)
+    //   2. The global proxy.rotation_api_key from /api/config
+    //   3. Prompt the user inline (only on explicit click)
+    let apiKey = (keyEl?.value || "").trim();
+    if (!apiKey) {
+      try {
+        const cfg = await api("/api/config");
+        apiKey = (cfg && (cfg["proxy.rotation_api_key"] || cfg.proxy_rotation_api_key)) || "";
+      } catch {}
+    }
+    if (!apiKey) {
+      if (opts.silentIfNoKey) {
+        // Auto-trigger path: don't pop a prompt on a UX surface the
+        // user didn't explicitly engage. The button is visible -- they
+        // can click it manually.
+        return;
+      }
+      apiKey = (window.prompt(
+        "Paste your asocks API key (one-time; we won't persist it unless you fill the Provider API key field).",
+        ""
+      ) || "").trim();
+      if (!apiKey) return;
+    }
+
+    if (btn) {
+      btn.disabled = true;
+      btn.dataset._origText = btn.textContent;
+      btn.textContent = "⏳ Searching…";
+    }
+    try {
+      const resp = await api("/api/proxy/asocks-port-list", {
+        method: "POST",
+        body: JSON.stringify({ api_key: apiKey }),
+      });
+      if (!resp.ok) {
+        toast(`asocks API error: ${resp.error || "unknown"}`, true);
+        return;
+      }
+      const ports = resp.ports || [];
+      if (!ports.length) {
+        toast("No ports found on this asocks account", true);
+        return;
+      }
+      // Match by both host AND port. The proxy URL's host:port
+      // uniquely identifies one asocks port.
+      const matches = ports.filter(p =>
+        String(p.host || "") === host &&
+        String(p.port || "") === String(port)
+      );
+      if (!matches.length) {
+        toast(
+          `No asocks port matches ${host}:${port}. Check that this proxy is in your asocks account.`,
+          true
+        );
+        return;
+      }
+      const m = matches[0];
+      if (m.refresh_link && rotUrl) {
+        rotUrl.value = m.refresh_link;
+        toast(`✓ Filled rotation URL from asocks port #${m.id || "?"} (${m.country || "?"})`);
+      } else {
+        toast(
+          `Found port #${m.id || "?"} but it has no refresh_link. ` +
+          `Check the rotation settings on the asocks dashboard.`,
+          true
+        );
+      }
+    } catch (e) {
+      toast(`Auto-fill failed: ${e.message || e}`, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = btn.dataset._origText || "🔍 Auto-fill";
+      }
     }
   },
 

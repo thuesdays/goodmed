@@ -147,6 +147,10 @@ const ProxyPage = {
           <div class="row-actions">
             <button class="btn-icon row-test-btn" title="Test this proxy"
                     data-action="test">🔬</button>
+            ${p.is_rotating ? `
+            <button class="btn-icon row-rotate-btn"
+                    title="Rotate exit IP via this proxy's rotation API"
+                    data-action="rotate">🔄</button>` : ""}
             <button class="btn-icon row-edit-btn" title="Edit"
                     data-action="edit">✎</button>
             <button class="btn-icon row-delete-btn" title="Delete"
@@ -174,6 +178,7 @@ const ProxyPage = {
         const id = Number(row.dataset.proxyId);
         const action = btn.dataset.action;
         if (action === "test") this.testOne(id, btn);
+        else if (action === "rotate") this.rotateOne(id, btn);
         else if (action === "edit") this.openEditModal(id);
         else if (action === "delete") this.deleteProxy(id);
       });
@@ -224,6 +229,40 @@ const ProxyPage = {
     }
   },
 
+  // ── Rotate IP for one row ───────────────────────────────────
+  // Calls the per-proxy rotation API and shows the new IP inline.
+  // Useful for quickly cycling stuck IPs without restarting a run,
+  // and for verifying that a freshly-pasted rotation URL actually
+  // works before committing it as the run's automatic on-captcha
+  // path.
+  async rotateOne(id, btn) {
+    if (btn) {
+      btn.disabled = true;
+      btn.classList.add("is-testing");
+      btn.innerHTML = `<span class="spinner">⟳</span>`;
+    }
+    try {
+      const resp = await api(`/api/proxies/${id}/rotate`, { method: "POST" });
+      if (resp.ok === false && resp.error) {
+        toast(`✗ Rotate failed: ${resp.error}`, true);
+      } else {
+        const diag = resp.diag || {};
+        const newIp = diag.exit_ip || diag.ip || "?";
+        const where = diag.country ? ` · ${diag.country}` : "";
+        toast(`✓ Rotated → ${newIp}${where}`);
+      }
+      await this.loadProxies();
+    } catch (e) {
+      toast(`Rotate failed: ${e.message}`, true);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.classList.remove("is-testing");
+        btn.innerHTML = "🔄";
+      }
+    }
+  },
+
   // ── Test all ─────────────────────────────────────────────────
 
   async testAll() {
@@ -259,6 +298,120 @@ const ProxyPage = {
       $("#edit-rotation-fields").style.display = e.target.checked ? "" : "none";
     });
     $("#proxy-edit-save-btn").addEventListener("click", () => this.saveProxy());
+    // Discover button -- only meaningful when provider is asocks
+    const discoverBtn = $("#asocks-discover-btn");
+    if (discoverBtn) {
+      discoverBtn.addEventListener("click", () => this.asocksDiscover());
+    }
+  },
+
+  // ── asocks auto-discovery ────────────────────────────────────
+  // Calls /api/proxy/asocks-port-list with the user's API key, then
+  // renders the port list inline so they can one-click pick the
+  // exact port -- this auto-fills both the proxy URL (host:port)
+  // AND the rotation URL (asocks's pre-signed refresh_link). Saves
+  // the user from having to dig through the asocks dashboard, copy
+  // 4 different fields, and risk a typo.
+  async asocksDiscover() {
+    const key = ($("#edit-rotation-key").value || "").trim();
+    const picker = $("#asocks-port-picker");
+    const status = $("#asocks-port-status");
+    const list   = $("#asocks-port-list");
+    if (!key) {
+      toast("Paste your asocks API key first, then click Discover", true);
+      $("#edit-rotation-key").focus();
+      return;
+    }
+    // Make sure provider is set so the form saves correctly later.
+    if (($("#edit-rotation-provider").value || "none") !== "asocks") {
+      $("#edit-rotation-provider").value = "asocks";
+    }
+    picker.style.display = "";
+    status.className = "asocks-port-loading";
+    status.textContent = "⏳ Fetching ports from asocks…";
+    list.innerHTML = "";
+
+    try {
+      const resp = await api("/api/proxy/asocks-port-list", {
+        method: "POST",
+        body: JSON.stringify({ api_key: key }),
+      });
+      if (!resp.ok) {
+        status.className = "asocks-port-err";
+        status.innerHTML = `<strong>asocks API error:</strong> ${resp.error || "unknown"}`
+          + (resp.body ? `<pre>${resp.body}</pre>` : "");
+        return;
+      }
+      if (!resp.ports || resp.ports.length === 0) {
+        status.className = "asocks-port-err";
+        status.textContent = "No ports found on this asocks account.";
+        return;
+      }
+      status.textContent = `${resp.count} port(s) — click to select`;
+      status.className = "asocks-port-loading";
+
+      // Render rows. Each row is a one-click trigger that fills the
+      // form and closes the picker. We also surface country/city so
+      // the user picks the right geo without guessing.
+      list.innerHTML = resp.ports.map(p => `
+        <div class="asocks-port-row" data-port-id="${p.id || ""}"
+             data-host="${p.host || ""}" data-port="${p.port || ""}"
+             data-login="${p.login || ""}"
+             data-refresh="${p.refresh_link || ""}">
+          <div class="asocks-port-row-main">
+            <span class="asocks-port-id-chip">#${p.id || "?"}</span>
+            <span class="asocks-port-name">${p.name || "(no name)"}</span>
+          </div>
+          <div class="asocks-port-meta">
+            <code>${p.host || "?"}:${p.port || "?"}</code>
+            ${p.country ? ` · ${p.country}${p.city ? ", " + p.city : ""}` : ""}
+            ${p.active === false ? ' · <span style="color:var(--critical, #ef4444)">inactive</span>' : ""}
+          </div>
+        </div>
+      `).join("");
+
+      // Wire row clicks -- pick a port, fill the form, close picker.
+      list.querySelectorAll(".asocks-port-row").forEach(row => {
+        row.addEventListener("click", () => this._asocksPickPort(row));
+      });
+    } catch (e) {
+      status.className = "asocks-port-err";
+      status.textContent = `Network error: ${e.message}`;
+    }
+  },
+
+  _asocksPickPort(row) {
+    const host    = row.dataset.host;
+    const port    = row.dataset.port;
+    const login   = row.dataset.login;
+    const refresh = row.dataset.refresh;
+    // Fill the rotation URL with the asocks-supplied pre-signed
+    // refresh_link. Don't overwrite the proxy URL if the user has
+    // already typed something there -- they may be reusing this
+    // discovery just to grab the rotation endpoint.
+    if (refresh) $("#edit-rotation-url").value = refresh;
+    if (host && port) {
+      const cur = ($("#edit-proxy-url").value || "").trim();
+      // Only auto-fill if blank or the user used a placeholder
+      if (!cur || cur.startsWith("http://placeholder")) {
+        // We don't know the password from the API list response --
+        // user pastes it once, we keep the login they have. Show a
+        // hint so they know to add :password if missing.
+        const userPart = login ? `${login}@` : "";
+        $("#edit-proxy-url").value = `http://${userPart}${host}:${port}`;
+        toast(login
+          ? `Form filled — append :password after '${login}' if needed`
+          : `Form filled with host:port — add user:pass@ if your asocks account requires auth`);
+      } else {
+        toast(`Rotation URL filled. Proxy URL left as-is.`);
+      }
+    }
+    // Mark the chosen row visually for clarity, hide the rest.
+    row.parentElement.querySelectorAll(".asocks-port-row").forEach(r => {
+      r.classList.toggle("selected", r === row);
+    });
+    // Force provider to asocks since we're using its API.
+    $("#edit-rotation-provider").value = "asocks";
   },
 
   async openEditModal(id) {

@@ -76,6 +76,44 @@ SUPPORTED_PROVIDERS = {"asocks", "brightdata", "generic", "none"}
 
 
 # ──────────────────────────────────────────────────────────────
+# Provider inference from URL
+# ──────────────────────────────────────────────────────────────
+# We were burning users with the (provider="none", url=<asocks URL>) trap:
+# they pasted a valid rotation URL but the dropdown stayed at "none", so
+# every captcha-rotation attempt failed with "Rotation API is NOT
+# configured" while the URL clearly was. Auto-detect from the URL host.
+#
+# Detection is intentionally permissive — pattern-only — because users
+# also paste partial URLs ("api.asocks.com/v2/proxy/...") without scheme.
+
+_PROVIDER_URL_PATTERNS = (
+    ("asocks",     ("api.asocks.com", "asocks.com/v2/proxy")),
+    ("brightdata", ("brightdata.com", "luminati.io", "lum-superproxy")),
+    # smartproxy / oxylabs / iproyal use generic GET — fall through to
+    # "generic" so authentication via X-API-Key still works.
+)
+
+
+def infer_provider_from_url(url: str) -> str:
+    """Return a best-guess provider name based on the rotation URL.
+
+    Returns "none" if url is empty/whitespace. Returns "generic" if the
+    URL is set but doesn't match any known vendor pattern -- this is
+    safer than "none" because at least the rotation request will fire
+    (a misconfigured "generic" GET still hits the endpoint and the
+    error response tells the user what's wrong, instead of silently
+    refusing to even try).
+    """
+    if not url or not url.strip():
+        return "none"
+    u = url.lower()
+    for name, patterns in _PROVIDER_URL_PATTERNS:
+        if any(p in u for p in patterns):
+            return name
+    return "generic"
+
+
+# ──────────────────────────────────────────────────────────────
 # Class
 # ──────────────────────────────────────────────────────────────
 
@@ -101,6 +139,21 @@ class RotatingProxyTracker:
                 f"falling back to 'none'. Supported: {SUPPORTED_PROVIDERS}"
             )
             rotation_provider = "none"
+
+        # AUTO-HEAL: if provider=='none' but a rotation URL is present,
+        # infer the provider from the URL host. This rescues the very
+        # common (and very confusing) misconfiguration where a user
+        # pastes a real asocks URL but the dropdown stays at "none",
+        # making every captcha-rotation a silent no-op.
+        if rotation_provider == "none" and rotation_api_url:
+            inferred = infer_provider_from_url(rotation_api_url)
+            if inferred != "none":
+                logging.info(
+                    f"[RotatingProxy] auto-detected provider={inferred!r} "
+                    f"from URL pattern (was 'none'). Set provider explicitly "
+                    f"on the Proxy page to silence this notice."
+                )
+                rotation_provider = inferred
 
         self.proxy_url         = proxy_url
         self.rotation_provider = rotation_provider
