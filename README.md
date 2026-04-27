@@ -13,7 +13,7 @@
 | **Engine** | Chromium 149.0.7805 (custom build, stealth patches in C++) |
 | **Stack** | Python 3.11+ · Flask dashboard · SQLite · Selenium 4 + CDP |
 | **Platform** | Windows 10/11 (x64) — Linux/macOS source-buildable |
-| **Latest release** | [`v0.2.0.11`](https://github.com/thuesdays/ghost_shell_browser/releases/tag/0.2.0.11) — Extensions pool, Cookie pool injection, Bulk profile create |
+| **Latest release** | [`v0.2.0.12`](https://github.com/thuesdays/ghost_shell_browser/releases/tag/0.2.0.12) — Extensions pool, Cookie pool injection, Bulk profile create |
 | **Status** | Production-ready · 11 device templates · 8 vault kinds · cron scheduler · MIT |
 
 > ⚠️ **Intended use.** This project is for legitimate workflows where
@@ -27,7 +27,7 @@
 
 ---
 
-## What's new in v0.2.0.11
+## What's new in v0.2.0.12
 
 ### Extensions
 
