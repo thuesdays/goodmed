@@ -207,6 +207,24 @@
           <div id="asocks-port-status" class="asocks-port-loading"></div>
           <div class="asocks-port-list" id="asocks-port-list"></div>
         </div>
+
+        <!-- Manual rotate-now button. Shown only in Edit mode (we need a
+             saved proxy ID for the API call) AND when the rotation URL
+             is filled. Calls the same /api/proxies/<id>/rotate endpoint
+             the per-row rotate button uses. -->
+        <div class="form-group" id="edit-rotate-now-row" style="display: none;">
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <button type="button" class="btn btn-secondary"
+                    id="edit-rotate-now-btn"
+                    title="Fire the rotation API and re-test the new exit IP">
+              🔄 Rotate IP now
+            </button>
+            <span class="form-hint" id="edit-rotate-now-hint" style="margin: 0;">
+              Tests the rotation URL by fetching a new exit IP — handy
+              before you commit a freshly-pasted URL.
+            </span>
+          </div>
+        </div>
       </div>
       <div class="form-group">
         <label class="checkbox-row">

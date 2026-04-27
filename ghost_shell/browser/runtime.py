@@ -38,6 +38,13 @@ except Exception:
 from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
 
 
+# Module-level guard so cleanup_quarantine_dirs runs at most once per
+# Python process. Reset by importing again in a new process. See start()
+# below for the wiring — every fresh dashboard / monitor / scheduler
+# Python process scrubs old *.quarantine-* dirs on its first launch.
+_QUARANTINE_CLEANUP_DONE = False
+
+
 # ─── Extension Preferences pre-accept (Phase 6) ─────────────────────
 #
 # When Chrome launches with --load-extension, the loaded extensions
@@ -349,6 +356,54 @@ class GhostShellBrowser:
         )
         from ghost_shell.profile.validator import ProfileValidator
 
+        # ── PRE-FLIGHT ORPHAN SWEEP ─────────────────────────────
+        # Catch the case where a previous failed run left chrome.exe /
+        # chromedriver.exe alive (Python crashed mid-cleanup, Windows
+        # rebooted, user force-killed the dashboard, …). Without this,
+        # the validator's File I/O fails with WinError 32 because the
+        # orphan still holds Default/History etc., and Chrome refuses
+        # to start because the user-data-dir is locked.
+        #
+        # This is idempotent — if there are no orphans it's a ~5ms
+        # process_iter scan and returns 0.
+        try:
+            from ghost_shell.core.process_reaper import (
+                kill_chrome_for_user_data_dir,
+            )
+            n0 = kill_chrome_for_user_data_dir(
+                self.user_data_path, reason="pre-flight sweep"
+            )
+            if n0:
+                logging.warning(
+                    f"[GhostShellBrowser] pre-flight: killed {n0} orphan "
+                    f"chrome process(es) before launch"
+                )
+        except Exception as _e:
+            logging.debug(f"[GhostShellBrowser] pre-flight orphan sweep: {_e}")
+
+        # ── QUARANTINE-DIR CLEANUP (once per Python process) ────
+        # cleanup_quarantine_dirs walks profiles/ for *.quarantine-*
+        # leftovers from failed launches and removes them robustly:
+        # kill orphans → rmtree retry → on Windows, schedule for
+        # delete-on-next-reboot via MoveFileEx if rmtree still fails.
+        #
+        # Done once per Python process (module-level flag). Scheduler
+        # processes, dashboard, monitor — each scrubs once on first
+        # launch.
+        global _QUARANTINE_CLEANUP_DONE
+        if not _QUARANTINE_CLEANUP_DONE:
+            _QUARANTINE_CLEANUP_DONE = True
+            try:
+                from ghost_shell.core.process_reaper import cleanup_quarantine_dirs as _cqd
+                profiles_parent = os.path.dirname(
+                    os.path.abspath(self.user_data_path)
+                )
+                _cqd(profiles_parent)
+            except Exception as _e:
+                logging.debug(
+                    f"[GhostShellBrowser] quarantine cleanup skipped: {_e}"
+                )
+
         # ── PRE-FLIGHT VALIDATION ───────────────────────────────
         # Cheap to run (< 500ms typical), catches 90% of profile-death
         # causes before Chrome even starts. Repairs what it can, deletes
@@ -370,7 +425,15 @@ class GhostShellBrowser:
         for attempt in (1, 2, 3):
             t0 = time.time()
             try:
-                return self._start_once()
+                # On attempt 3 we strip extensions to disambiguate
+                # "Chrome rejects an extension at runtime" from "profile
+                # is corrupt". Combined with the quarantine done before
+                # this attempt, attempt 3 is "fresh empty profile + no
+                # extensions" — the minimal viable launch. If even THIS
+                # fails, the cause is necessarily the binary, payload,
+                # chromedriver mismatch, or the OS — none of which more
+                # retries can fix.
+                return self._start_once(skip_extensions=(attempt == 3))
             except (InvalidSessionIdException, NoSuchWindowException,
                     WebDriverException) as e:
                 elapsed = time.time() - t0
@@ -448,6 +511,38 @@ class GhostShellBrowser:
                 logging.debug(f"[start-retry] child kill: {e}")
             self.driver = None
 
+        # ── ORPHAN SWEEP (critical safety net) ──────────────────────
+        # When webdriver.Chrome(...) raises in its constructor (most
+        # common cause: SessionNotCreatedException), self.driver is
+        # never assigned and the kill path above is skipped entirely.
+        # The chromedriver.exe and chrome.exe spawned by the failed
+        # ctor are still alive, holding file handles inside our
+        # user-data-dir. The next retry then hits:
+        #   * WinError 32 on Default/History (held by orphan)
+        #   * WinError 5 on rename to .quarantine (dir handle held)
+        #   * SessionNotCreated again because user-data-dir is locked
+        # Each retry adds another set of orphans → "many tabs opened"
+        # symptom (each failed launch = one new Chrome window stuck on
+        # NTP because chromedriver gave up before the page loaded).
+        #
+        # Sweep by command-line: any chrome / chromedriver process
+        # whose cmdline contains our --user-data-dir path is ours and
+        # must die before the next attempt.
+        try:
+            from ghost_shell.core.process_reaper import (
+                kill_chrome_for_user_data_dir,
+            )
+            n = kill_chrome_for_user_data_dir(
+                self.user_data_path, reason="failed-start cleanup"
+            )
+            if n:
+                logging.warning(
+                    f"[GhostShellBrowser] cleanup: killed {n} orphan "
+                    f"chrome/chromedriver process(es) after failed start"
+                )
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] orphan sweep skipped: {e}")
+
         # Stop proxy forwarder — _start_once binds a fresh one on
         # entry. Leaving the old one up means the new Chrome tries to
         # connect to a half-dead local port.
@@ -475,8 +570,23 @@ class GhostShellBrowser:
                 pass
             self._traffic_collector = None
 
-    def _start_once(self) -> webdriver.Chrome:
-        """Launches the C++ native stealth browser."""
+    def _start_once(self, skip_extensions: bool = False) -> webdriver.Chrome:
+        """Launches the C++ native stealth browser.
+
+        Args:
+            skip_extensions: When True, do NOT add --load-extension to the
+                launch flags even if the profile has extensions assigned.
+                Used by start()'s retry loop on attempt 3 — at that point
+                we've already retried once on the same profile and
+                quarantined to a fresh one, both failed; the most likely
+                remaining cause is an extension whose manifest passes our
+                JSON gate but Chrome rejects at runtime (missing
+                background.service_worker file, broken default_locale
+                target, etc.). Stripping extensions makes attempt 3 a
+                "minimal viable launch" so the run can at least proceed
+                without them; the loud warning in logs tells the user
+                their extensions are the culprit and need attention.
+        """
         # 1. Generate Deterministic C++ Payload
         builder = DeviceTemplateBuilder(profile_name=self.profile_name,
                                         preferred_language=self.preferred_language)
@@ -737,11 +847,40 @@ class GhostShellBrowser:
         # silently load any default/component extensions we didn't
         # ask for (component extensions can be a fingerprint signal).
         try:
-            from ghost_shell.db.database import get_db as _getdb
-            _db = _getdb()
-            assigned = _db.profile_extensions_get(
-                self.profile_name, only_enabled=True,
-            ) if hasattr(_db, "profile_extensions_get") else []
+            # ── RECOVERY GUARD ─────────────────────────────────────
+            # On attempt 3 of start()'s retry loop, the caller passes
+            # skip_extensions=True. Two prior attempts have already
+            # failed and quarantine-rotated the profile dir, so the
+            # most likely remaining cause is an extension that our JSON
+            # gate accepted but Chrome rejects at load time (missing
+            # service_worker file, broken icon path, default_locale
+            # pointing at corrupt messages.json, manifest_version=4 we
+            # haven't validated yet, etc.).
+            #
+            # Short-circuit assigned=[] here. The loop below sees an
+            # empty list, ext_paths stays empty, no --load-extension
+            # flag is added. Chrome launches on the binary alone.
+            # User sees a loud WARNING to investigate which extension.
+            if skip_extensions:
+                logging.warning(
+                    "[GhostShellBrowser] extensions DISABLED for this "
+                    "launch (recovery path — 2 prior attempts failed). "
+                    "If this launch succeeds, one of the assigned "
+                    "extensions is rejected by Chrome at runtime even "
+                    "though its manifest is valid JSON. Check the "
+                    "profile's assigned extensions on the Profile "
+                    "detail page; common culprits: missing "
+                    "background.service_worker file, broken icon path, "
+                    "default_locale pointing at empty messages.json."
+                )
+                _db = None
+                assigned = []
+            else:
+                from ghost_shell.db.database import get_db as _getdb
+                _db = _getdb()
+                assigned = _db.profile_extensions_get(
+                    self.profile_name, only_enabled=True,
+                ) if hasattr(_db, "profile_extensions_get") else []
             ext_paths = []
             for row in assigned:
                 pp = row.get("pool_path")
@@ -799,6 +938,51 @@ class GhostShellBrowser:
                             f"[GhostShellBrowser] manifest repair skipped "
                             f"for {pp}: {_e}"
                         )
+
+                    # ── HARD VALIDATION GATE ────────────────────────
+                    # Chrome silently exits at startup if --load-extension
+                    # points at a path with a missing or unparseable
+                    # manifest.json. ONE bad extension in the comma-list
+                    # kills the ENTIRE flag (all extensions fail to load,
+                    # plus the browser crashes 2-3s in with
+                    # SessionNotCreatedException — exactly the symptom
+                    # we hit on profile_01).
+                    #
+                    # So: parse manifest with the proper JSON parser
+                    # AFTER the repair attempt above, and DROP this
+                    # extension from --load-extension if it still won't
+                    # parse. Better to launch with no extensions than
+                    # not launch at all.
+                    mf_path = os.path.join(pp, "manifest.json")
+                    if not os.path.exists(mf_path):
+                        logging.warning(
+                            f"[GhostShellBrowser] extension "
+                            f"{row.get('extension_id')!r} has no "
+                            f"manifest.json — dropping from load list"
+                        )
+                        continue
+                    try:
+                        with open(mf_path, "r", encoding="utf-8-sig") as _mf:
+                            _mfdata = json.load(_mf)
+                        if not isinstance(_mfdata, dict):
+                            raise ValueError("manifest root is not an object")
+                        # Smoke-check required fields. Chrome will reject
+                        # any of these missing.
+                        if not _mfdata.get("name"):
+                            raise ValueError("manifest missing 'name'")
+                        if "manifest_version" not in _mfdata:
+                            raise ValueError("manifest missing 'manifest_version'")
+                    except (json.JSONDecodeError, ValueError,
+                            OSError, UnicodeDecodeError) as _me:
+                        logging.warning(
+                            f"[GhostShellBrowser] extension "
+                            f"{row.get('extension_id')!r} manifest is "
+                            f"unparseable / invalid "
+                            f"({type(_me).__name__}: {str(_me)[:100]}) "
+                            f"— dropping from load list to keep Chrome alive"
+                        )
+                        continue
+
                     ext_paths.append(pp)
                 else:
                     logging.warning(
@@ -1089,9 +1273,58 @@ class GhostShellBrowser:
         service_kwargs = {}
         if chromedriver_path:
             service_kwargs["executable_path"] = chromedriver_path
-        # Log chromedriver output to a file for postmortem debugging
-        log_file = os.path.join(self.user_data_path, "chromedriver.log")
+
+        # ── chromedriver.log rotation (per-run) ──────────────────────
+        # Single chromedriver.log was getting clobbered between runs —
+        # when a run failed, the next run's chromedriver overwrote the
+        # crash log before anyone could read it. Now we keep a per-run
+        # timestamped file under <user_data_dir>/logs/. Last 20 are
+        # retained; older ones pruned.
+        #
+        # Symlink (or copy on Windows) <user_data_dir>/chromedriver.log
+        # always points at the latest, so existing tooling that reads
+        # that path keeps working.
+        chromedriver_log_dir = os.path.join(self.user_data_path, "logs")
+        try:
+            os.makedirs(chromedriver_log_dir, exist_ok=True)
+            existing = sorted([
+                f for f in os.listdir(chromedriver_log_dir)
+                if f.startswith("chromedriver-") and f.endswith(".log")
+            ])
+            # Keep last 20 — drop the rest
+            for old in existing[:-20]:
+                try:
+                    os.remove(os.path.join(chromedriver_log_dir, old))
+                except OSError:
+                    pass
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+            log_file = os.path.join(
+                chromedriver_log_dir, f"chromedriver-{ts}.log"
+            )
+        except OSError as _e:
+            # Fallback to old behaviour if logs/ can't be created
+            logging.debug(f"[GhostShellBrowser] log rotation skipped: {_e}")
+            log_file = os.path.join(self.user_data_path, "chromedriver.log")
+
         service_kwargs["log_output"] = log_file
+
+        # Latest-pointer for backwards compat: anyone reading
+        # <user_data_dir>/chromedriver.log gets the most recent run.
+        latest_link = os.path.join(self.user_data_path, "chromedriver.log")
+        try:
+            if os.path.lexists(latest_link):
+                os.remove(latest_link)
+            # On Windows symlinks need privilege; just copy the path
+            # in a tiny redirect file the user can `type` to find it.
+            with open(latest_link, "w", encoding="utf-8") as _fp:
+                _fp.write(
+                    f"chromedriver log rotated to per-run files. "
+                    f"Latest: {os.path.basename(log_file)} "
+                    f"(under {chromedriver_log_dir}\\)\n"
+                )
+        except OSError:
+            pass
+
         service = ChromeService(**service_kwargs)
 
         # Launch Chrome via plain selenium (like our smoke test)

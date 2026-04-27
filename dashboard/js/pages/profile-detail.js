@@ -1047,7 +1047,20 @@ const ProfileDetail = {
       if (byId("pp-proxy-url"))         byId("pp-proxy-url").value         = meta.proxy_url         || "";
       if (byId("pp-rotation-url"))      byId("pp-rotation-url").value      = meta.rotation_api_url  || "";
       if (byId("pp-rotation-provider")) byId("pp-rotation-provider").value = meta.rotation_provider || "";
+      if (byId("pp-rotation-api-key"))  byId("pp-rotation-api-key").value  = meta.rotation_api_key  || "";
       if (byId("pp-notes"))             byId("pp-notes").value             = meta.notes             || "";
+
+      // Restore the "rotating proxy" checkbox state — was missing entirely,
+      // so the toggle visually reset to OFF after every reload regardless
+      // of saved value. Toggling the checkbox programmatically does NOT
+      // fire the 'change' event, so we also manually expand/collapse the
+      // rotation block so the UI matches the persisted state.
+      const rotChk = byId("pp-proxy-rotating");
+      if (rotChk) {
+        rotChk.checked = !!meta.proxy_is_rotating;
+        const block = byId("pp-rotation-block");
+        if (block) block.style.display = rotChk.checked ? "" : "none";
+      }
       const status = byId("pp-save-status");
       if (status) status.textContent = "";
       // Wire the asocks Auto-fill button. Idempotent -- safe to call
@@ -1225,10 +1238,18 @@ const ProfileDetail = {
     }
     const byId = (id) => document.getElementById(id);
     const provider = byId("pp-rotation-provider")?.value || "";
+    // proxy_is_rotating + rotation_api_key were silently dropped before —
+    // the checkbox and the API-key input were rendered but their values
+    // never made it into the POST payload. Result: ticking "rotating
+    // proxy" had no effect, and the saved key was wiped to NULL on every
+    // Save. Both are now first-class fields. Backend whitelist already
+    // accepts them (see api_profile_meta_set in dashboard/server.py).
     const payload = {
       tags:              this._workingTags,
       proxy_url:         (byId("pp-proxy-url")?.value    || "").trim() || null,
+      proxy_is_rotating: byId("pp-proxy-rotating")?.checked ? 1 : 0,
       rotation_api_url:  (byId("pp-rotation-url")?.value || "").trim() || null,
+      rotation_api_key:  (byId("pp-rotation-api-key")?.value || "").trim() || null,
       // Empty string in the <select> means "inherit global", so send null.
       rotation_provider: provider || null,
       notes:             (byId("pp-notes")?.value || "").trim() || null,
@@ -1566,7 +1587,12 @@ const ProfileDetail = {
       // place from before the column existed).
       try {
         const meta = await api(`/api/profiles/${encodeURIComponent(name)}/meta`);
-        const useScript = !!meta.meta?.use_script_on_launch;
+        // /api/profiles/<name>/meta returns a flat dict (see
+        // api_profile_meta_get in dashboard/server.py — `return jsonify(meta)`),
+        // not {meta: {...}}. The `meta.meta?.X` form was a leftover from
+        // an older response shape and quietly evaluated to undefined →
+        // the toggle always rendered OFF regardless of saved state.
+        const useScript = !!meta.use_script_on_launch;
         const toggle = document.getElementById("profile-use-script-toggle");
         const wrap   = document.getElementById("profile-script-pick-wrap");
         if (toggle) {

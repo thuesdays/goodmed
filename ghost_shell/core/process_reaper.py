@@ -129,6 +129,279 @@ def kill_process_tree(pid: int, reason: str = "cleanup") -> bool:
     return True
 
 
+def kill_chrome_for_user_data_dir(user_data_dir: str,
+                                  reason: str = "orphan sweep") -> int:
+    """Find and kill any chrome.exe / chromedriver.exe / chromium binaries
+    whose command line references our --user-data-dir. Returns the count
+    of process trees killed.
+
+    Why this exists: when ``webdriver.Chrome(...)`` constructor raises
+    SessionNotCreatedException, ``self.driver`` is never assigned, so the
+    regular ``self.driver.service.process.pid`` cleanup path doesn't have
+    a PID to kill. Chrome and chromedriver are still alive, holding our
+    user-data-dir's files. The next retry then fails with WinError 32 on
+    History/Top Sites and WinError 5 on quarantine rename.
+
+    This helper does NOT need a known PID — it scans every process by
+    command-line and kills the matches. Idempotent and safe to call any
+    time before/after a launch attempt.
+
+    Matching strategy:
+      * chrome.exe / chromium binaries: parent (browser) process has
+        ``--user-data-dir=<our_path>`` in cmdline. Renderer / utility /
+        GPU subprocesses are children of the parent and inherit no such
+        flag, so they only get hit transitively via
+        ``kill_process_tree``.
+      * chromedriver.exe: its cmdline doesn't contain --user-data-dir,
+        but its child (Chrome) does. We catch chromedriver indirectly by
+        also walking parent->child relationships of any matched chrome
+        process and confirming the chromedriver's parent matches our
+        Python PID. Stragglers parented elsewhere are left alone — they
+        belong to some other ghost_shell session.
+
+    Path comparison is case-insensitive and tolerates both forward- and
+    back-slash forms (Windows quirks)."""
+    if not HAVE_PSUTIL:
+        logging.debug(
+            "[ProcessReaper] psutil not available — orphan sweep skipped"
+        )
+        return 0
+    if not user_data_dir:
+        return 0
+
+    # Normalize the target both ways so we can match cmdlines that came
+    # through with either separator.
+    target_native = os.path.normpath(user_data_dir).lower()
+    target_fwd    = target_native.replace("\\", "/")
+
+    own_pid = os.getpid()
+
+    # Pass 1: find chrome browser-process matches by cmdline.
+    chrome_matches: list[psutil.Process] = []
+    chromedriver_candidates: list[psutil.Process] = []
+
+    for p in psutil.process_iter(["pid", "name", "cmdline", "ppid"]):
+        try:
+            name = (p.info.get("name") or "").lower()
+            if not name:
+                continue
+            cmdline = p.info.get("cmdline") or []
+            if not cmdline:
+                continue
+            joined = " ".join(cmdline).lower()
+            joined_fwd = joined.replace("\\", "/")
+
+            # chrome.exe / chrome / chromium with our user-data-dir
+            is_chrome = (
+                name in ("chrome.exe", "chrome", "chromium",
+                         "chromium.exe", "chromium-browser")
+                or name.startswith("chrome ")
+            )
+            if is_chrome and (target_native in joined or target_fwd in joined_fwd):
+                chrome_matches.append(p)
+                continue
+
+            # chromedriver — record as candidate; we'll filter by parent below
+            is_chromedriver = (
+                name in ("chromedriver.exe", "chromedriver")
+                or "chromedriver" in name
+            )
+            if is_chromedriver:
+                chromedriver_candidates.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception:
+            # process_iter rarely throws other things; be defensive
+            continue
+
+    # Pass 2: filter chromedriver candidates — keep only those that are
+    # ours (parent is our Python OR a direct ancestor of one of the
+    # matched chrome processes).
+    matched_chrome_pids = {p.info["pid"] for p in chrome_matches}
+    relevant_chromedriver: list[psutil.Process] = []
+
+    for cd in chromedriver_candidates:
+        try:
+            ppid = cd.info.get("ppid")
+            # Direct child of our Python — definitely ours
+            if ppid == own_pid:
+                relevant_chromedriver.append(cd)
+                continue
+            # Or: any of the matched chrome processes is a descendant
+            # of this chromedriver. Walk down once.
+            try:
+                children = cd.children(recursive=False)
+            except Exception:
+                children = []
+            for child in children:
+                if child.pid in matched_chrome_pids:
+                    relevant_chromedriver.append(cd)
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    targets = chrome_matches + relevant_chromedriver
+    if not targets:
+        return 0
+
+    killed = 0
+    for proc in targets:
+        try:
+            pid = proc.info["pid"]
+        except Exception:
+            continue
+        # kill_process_tree handles "already dead" gracefully
+        if kill_process_tree(pid, reason=reason):
+            killed += 1
+
+    if killed:
+        # Windows takes a beat to release file handles after process exit.
+        # Without this delay the next pre-flight still hits WinError 32.
+        time.sleep(0.6)
+        logging.warning(
+            f"[ProcessReaper] orphan sweep: killed {killed} process(es) "
+            f"holding user-data-dir={user_data_dir}"
+        )
+    return killed
+
+
+def _windows_schedule_delete_on_reboot(path: str) -> bool:
+    """Use the Win32 ``MoveFileExW`` API with ``MOVEFILE_DELAY_UNTIL_REBOOT``
+    to schedule a path for deletion on the next system restart. Returns
+    True on success, False if the API call failed (e.g. non-Windows OS,
+    no admin rights for system-level paths, the path doesn't exist).
+
+    This is the last resort when ``shutil.rmtree`` fails because some
+    file is held open by an orphan process we can't reach (e.g. a Chrome
+    process belonging to a different Windows session, anti-virus
+    scanning, etc.). After reboot the path is gone, no manual cleanup
+    needed."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.MoveFileExW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ]
+        kernel32.MoveFileExW.restype = wintypes.BOOL
+        ok = kernel32.MoveFileExW(path, None, MOVEFILE_DELAY_UNTIL_REBOOT)
+        if ok:
+            return True
+        err = ctypes.get_last_error()
+        logging.debug(
+            f"[ProcessReaper] MoveFileExW({path}, DELAY_UNTIL_REBOOT) "
+            f"failed: GetLastError={err}"
+        )
+        return False
+    except Exception as e:
+        logging.debug(f"[ProcessReaper] MoveFileExW unavailable: {e}")
+        return False
+
+
+def cleanup_quarantine_dirs(parent_dir: str,
+                            max_age_days: int = 0,
+                            schedule_delete_on_reboot: bool = True) -> dict:
+    """Scan ``parent_dir`` for ``*.quarantine-*`` subfolders left behind by
+    failed runs and try to remove them robustly.
+
+    Strategy per dir:
+      1. Kill any orphan chrome.exe / chromedriver.exe whose cmdline
+         references the dir (could keep it locked).
+      2. ``shutil.rmtree`` with one short backoff retry.
+      3. On Windows, if the dir is still around, schedule it for
+         deletion on the next reboot via ``MoveFileExW``.
+
+    Args:
+      parent_dir: Folder to scan (e.g. ``%LOCALAPPDATA%\\GhostShellAnty\\profiles``).
+      max_age_days: If > 0, only touch dirs whose ``mtime`` is older than
+        this many days. Set to 0 (default) to clean every quarantine
+        regardless of age.
+      schedule_delete_on_reboot: Apply the MoveFileExW fallback if
+        rmtree fails. Disable if you're testing and don't want a reboot
+        to silently delete data.
+
+    Returns: stats dict with keys ``scanned``, ``deleted``, ``deferred``
+    (scheduled for reboot), ``failed``."""
+    import glob
+    import shutil
+    stats = {"scanned": 0, "deleted": 0, "deferred": 0, "failed": 0}
+
+    if not parent_dir or not os.path.isdir(parent_dir):
+        return stats
+
+    cutoff = None
+    if max_age_days > 0:
+        cutoff = time.time() - (max_age_days * 86400)
+
+    try:
+        entries = os.listdir(parent_dir)
+    except OSError as e:
+        logging.warning(f"[ProcessReaper] cleanup_quarantine_dirs list: {e}")
+        return stats
+
+    for name in entries:
+        if ".quarantine-" not in name:
+            continue
+        full = os.path.join(parent_dir, name)
+        if not os.path.isdir(full):
+            continue
+        if cutoff is not None:
+            try:
+                if os.path.getmtime(full) > cutoff:
+                    continue   # too recent, leave alone
+            except OSError:
+                pass
+        stats["scanned"] += 1
+
+        # Step 1: kill orphans that might be holding the dir
+        try:
+            kill_chrome_for_user_data_dir(full, reason="quarantine cleanup")
+        except Exception as e:
+            logging.debug(f"[ProcessReaper] orphan sweep ({full}): {e}")
+
+        # Step 2: rmtree with retry
+        deleted = False
+        last_err = None
+        for attempt in range(2):
+            try:
+                shutil.rmtree(full)
+                deleted = True
+                break
+            except OSError as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(0.6)
+        if deleted:
+            stats["deleted"] += 1
+            continue
+
+        # Step 3: still here. Schedule for reboot deletion.
+        if schedule_delete_on_reboot and _windows_schedule_delete_on_reboot(full):
+            stats["deferred"] += 1
+            logging.info(
+                f"[ProcessReaper] quarantine {name}: rmtree failed "
+                f"({last_err}); scheduled for delete-on-next-reboot"
+            )
+            continue
+
+        stats["failed"] += 1
+        logging.warning(
+            f"[ProcessReaper] quarantine {name}: couldn't remove and "
+            f"couldn't schedule reboot-delete. {last_err}"
+        )
+
+    if stats["scanned"]:
+        logging.info(
+            f"[ProcessReaper] quarantine cleanup in {parent_dir}: "
+            f"scanned={stats['scanned']} deleted={stats['deleted']} "
+            f"deferred={stats['deferred']} failed={stats['failed']}"
+        )
+    return stats
+
+
 def pid_looks_like_ghost_shell(pid: int) -> bool:
     """Defensive check: before we kill a stored PID, confirm it's actually
     one of ours. An ancient PID could have been recycled by the OS for an

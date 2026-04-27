@@ -463,29 +463,96 @@ class ProfileValidator:
         so a fresh one can be created. Used after Chrome crashes that
         our individual checks can't resolve.
 
+        Resilient to common Windows quirks:
+          1. Kill any orphan chrome.exe / chromedriver.exe holding files
+             inside the profile dir (the #1 cause of WinError 5 on the
+             rename — orphans from a prior failed launch).
+          2. Retry rename with short backoff to ride out transient
+             Windows file-handle release lag.
+          3. If rename still fails, fall back to *in-place wipe* — the
+             outer dir keeps its name (so config stays consistent) but
+             gets emptied so the next launch sees a clean slate.
+
         Returns the new path of the quarantined folder, or empty string
-        on failure. Caller should let Chrome recreate user_data_path
-        on next launch — profile name stays the same in config; just
-        the on-disk folder is rotated."""
+        if rename was impossible (in-place wipe path). Caller can treat
+        empty return as "fresh profile, in same dir, ready to launch"."""
         if not os.path.exists(self.user_data_path):
             return ""
 
+        # Step 1: kill orphans holding our files. WinError 5 on rename
+        # almost always means a chrome.exe / chromedriver.exe is still
+        # alive with a handle into the profile dir. _cleanup_after_failed_start
+        # in browser/runtime.py should have caught these already, but
+        # belt-and-suspenders is cheap.
+        try:
+            from ghost_shell.core.process_reaper import (
+                kill_chrome_for_user_data_dir,
+            )
+            kill_chrome_for_user_data_dir(
+                self.user_data_path, reason="quarantine"
+            )
+        except Exception as _e:
+            logging.debug(f"[ProfileValidator] orphan sweep: {_e}")
+
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         new_path = f"{self.user_data_path}.quarantine-{ts}"
+
+        # Step 2: rename with backoff
+        last_err: Optional[OSError] = None
+        for attempt in range(3):
+            try:
+                os.rename(self.user_data_path, new_path)
+                logging.warning(
+                    f"[ProfileValidator] ⚠ QUARANTINED profile: "
+                    f"{self.user_data_path} → {new_path}. "
+                    f"Reason: {reason or 'unspecified'}. "
+                    f"Chrome will create a fresh empty profile on next launch."
+                )
+                return new_path
+            except OSError as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))   # 0.5s, 1.0s
+
+        # Step 3: rename gave up. In-place wipe so the next launch can
+        # succeed against a clean dir — even if SOME items inside
+        # remain locked, killing the outer Default/* trees usually
+        # frees enough that Chrome doesn't see corruption.
+        logging.error(
+            f"[ProfileValidator] couldn't rename to quarantine after 3 "
+            f"attempts ({type(last_err).__name__ if last_err else '?'}: "
+            f"{last_err}). Falling back to in-place wipe — outer dir "
+            f"name preserved for config consistency."
+        )
+        wiped, failed = 0, 0
         try:
-            os.rename(self.user_data_path, new_path)
-            logging.warning(
-                f"[ProfileValidator] ⚠ QUARANTINED profile: {self.user_data_path} "
-                f"→ {new_path}. Reason: {reason or 'unspecified'}. "
-                f"Chrome will create a fresh empty profile on next launch."
-            )
-            return new_path
+            entries = os.listdir(self.user_data_path)
         except OSError as e:
             logging.error(
-                f"[ProfileValidator] couldn't quarantine {self.user_data_path}: {e}. "
-                f"Manual cleanup may be needed."
+                f"[ProfileValidator] in-place wipe: can't even list "
+                f"contents ({e}). Profile dir is fully locked. Manual "
+                f"cleanup REQUIRED — kill all chrome.exe / chromedriver.exe "
+                f"and delete {self.user_data_path}"
             )
             return ""
+
+        for entry in entries:
+            full = os.path.join(self.user_data_path, entry)
+            try:
+                if os.path.islink(full):
+                    os.unlink(full)
+                elif os.path.isdir(full):
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                wiped += 1
+            except OSError:
+                failed += 1
+        logging.warning(
+            f"[ProfileValidator] in-place wipe: cleaned {wiped} entries"
+            f"{f', {failed} still locked' if failed else ''}"
+        )
+        return ""   # signals "wiped in place, no rename"
 
 
 def preflight(user_data_path: str) -> dict:

@@ -296,12 +296,87 @@ const ProxyPage = {
     );
     $("#edit-proxy-is-rotating").addEventListener("change", (e) => {
       $("#edit-rotation-fields").style.display = e.target.checked ? "" : "none";
+      this._updateEditRotateBtnVisibility();
     });
     $("#proxy-edit-save-btn").addEventListener("click", () => this.saveProxy());
     // Discover button -- only meaningful when provider is asocks
     const discoverBtn = $("#asocks-discover-btn");
     if (discoverBtn) {
       discoverBtn.addEventListener("click", () => this.asocksDiscover());
+    }
+
+    // Manual "Rotate IP now" button inside the Edit modal. Mirrors the
+    // per-row rotate behaviour but lets you verify a freshly-pasted
+    // rotation URL works BEFORE saving the proxy as production-ready.
+    // Visibility: only shown in Edit mode (need an ID for the API
+    // call) AND when the rotation URL field is non-empty.
+    $("#edit-rotation-url")?.addEventListener("input",
+      () => this._updateEditRotateBtnVisibility()
+    );
+    $("#edit-rotate-now-btn")?.addEventListener("click",
+      () => this._editRotateNow()
+    );
+  },
+
+  _updateEditRotateBtnVisibility() {
+    const row = $("#edit-rotate-now-row");
+    if (!row) return;
+    const hasUrl   = ($("#edit-rotation-url")?.value || "").trim().length > 0;
+    const isRotat  = !!$("#edit-proxy-is-rotating")?.checked;
+    const isExisting = !!this.editingId;
+    row.style.display = (hasUrl && isRotat && isExisting) ? "" : "none";
+    // Reset the hint to neutral when the row reappears (it may have
+    // been left in success/error state from a previous click)
+    if (row.style.display !== "none") {
+      const hint = $("#edit-rotate-now-hint");
+      if (hint && !hint.dataset._touched) {
+        hint.textContent = "Tests the rotation URL by fetching a new "
+                         + "exit IP — handy before you commit a "
+                         + "freshly-pasted URL.";
+      }
+    }
+  },
+
+  async _editRotateNow() {
+    if (!this.editingId) {
+      toast("Save the proxy first, then come back to rotate", true);
+      return;
+    }
+    const btn  = $("#edit-rotate-now-btn");
+    const hint = $("#edit-rotate-now-hint");
+    if (!btn) return;
+    const originalLabel = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = "⏳ Rotating…";
+    if (hint) {
+      hint.textContent = "Calling rotation API and re-testing exit IP…";
+      hint.dataset._touched = "1";
+    }
+    try {
+      const resp = await api(
+        `/api/proxies/${this.editingId}/rotate`,
+        { method: "POST" }
+      );
+      if (resp.ok === false && resp.error) {
+        toast(`✗ Rotate failed: ${resp.error}`, true);
+        if (hint) hint.textContent = `✗ ${resp.error}`;
+      } else {
+        const diag    = resp.diag || {};
+        const newIp   = diag.exit_ip || diag.ip || "?";
+        const country = diag.country  ? ` · ${diag.country}` : "";
+        const latency = diag.latency_ms ? ` · ${diag.latency_ms}ms` : "";
+        toast(`✓ Rotated → ${newIp}${country}`);
+        if (hint) hint.textContent = `✓ New exit: ${newIp}${country}${latency}`;
+      }
+      // Refresh the table behind the modal so the row badge updates
+      // with the new IP — same as rotateOne does.
+      await this.loadProxies();
+    } catch (e) {
+      toast(`Rotate failed: ${e.message}`, true);
+      if (hint) hint.textContent = `✗ ${e.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalLabel;
     }
   },
 
@@ -452,6 +527,11 @@ const ProxyPage = {
       $("#edit-proxy-auto-test").checked = true;
       $("#edit-rotation-fields").style.display = "none";
     }
+    // Reset the rotate-now hint each time the modal reopens so it
+    // doesn't carry over a previous run's success/error message.
+    const hint = $("#edit-rotate-now-hint");
+    if (hint) delete hint.dataset._touched;
+    this._updateEditRotateBtnVisibility();
     modal.style.display = "";
     setTimeout(() => $("#edit-proxy-url").focus(), 30);
   },

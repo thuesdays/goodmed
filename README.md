@@ -1,17 +1,88 @@
 # Ghost Shell Anty
 
-> Self-hosted antidetect browser + control dashboard for Google Ads
-> competitive intelligence. Patched Chromium 149 at the C++ level —
-> no JavaScript shims, no `undetected-chromedriver` tricks. Runs each
-> profile through its own coherent fingerprint, proxy, cookie pool,
-> and behavior pipeline.
+> Self-hosted antidetect browser with a control dashboard for
+> multi-profile workflows: privacy isolation, multi-account management,
+> QA and fingerprint research, and ad-ops monitoring of your own
+> campaigns. Patched Chromium 149 at the C++ level — no JavaScript
+> shims, no `undetected-chromedriver` tricks. Each profile gets its own
+> coherent fingerprint, proxy, cookie pool, extensions, and behavior
+> pipeline.
 
 | | |
 |---|---|
 | **Engine** | Chromium 149.0.7805 (custom build, stealth patches in C++) |
 | **Stack** | Python 3.11+ · Flask dashboard · SQLite · Selenium 4 + CDP |
 | **Platform** | Windows 10/11 (x64) — Linux/macOS source-buildable |
-| **Status** | Production-ready · 11 device templates · 8 vault kinds · cron scheduler |
+| **Latest release** | [`v0.2.0.11`](https://github.com/thuesdays/ghost_shell_browser/releases/tag/0.2.0.11) — Extensions pool, Cookie pool injection, Bulk profile create |
+| **Status** | Production-ready · 11 device templates · 8 vault kinds · cron scheduler · MIT |
+
+> ⚠️ **Intended use.** This project is for legitimate workflows where
+> you control the accounts and the property being automated:
+> isolating your own logins, agency-style social-media management,
+> QA and accessibility automation, fingerprint and privacy research,
+> monitoring your own ad spend and SERP visibility. It is **not**
+> intended for sybil farming on third-party platforms, click-fraud
+> against advertisers, evading another platform's ToS, or impersonation.
+> See the [License & Acceptable Use](#license--acceptable-use) section.
+
+---
+
+## What's new in v0.2.0.11
+
+### Extensions
+
+A shared **extensions pool** with per-profile assignment. Install once,
+opt any subset of profiles in, each profile keeps its own data
+(local-storage / IndexedDB / settings) inside its `user-data-dir`.
+
+- Install from Chrome Web Store by ID/URL or via search
+- Upload CRX (CRX2/CRX3) or unpacked `.zip`
+- Per-profile chip-based assignment UI on the profile detail page
+- Toolbar auto-pin via `extensions.pinned_actions` (Chrome 138+) plus
+  legacy fallbacks for the 88-149 range
+- Permission auto-accept on first launch
+- Manifest normalization: `default_locale`, `manifest_version` auto-
+  detection, match-pattern sanitization
+- Original manifest preserved as `manifest.json.original` on import
+
+Seven new **flow-runner steps** drive extensions from automation
+scripts: `open_extension_popup`, `open_extension_page`,
+`extension_wait_for`, `extension_click`, `extension_fill`,
+`extension_eval`, `extension_close`. Vault placeholders
+(`{vault.<id>.password}`) resolve at runtime so secrets stay out of
+saved scripts.
+
+### Cookie pool
+
+Cross-profile cookie injection. Warm a donor profile to your liking,
+take a snapshot, then seed fresh production profiles from it — fewer
+cold starts, more consistent session continuity.
+
+- Country/category-aware matching
+- Browserless write to `session_dir/cookies.json` before launch;
+  CDP session-restore picks them up on next start
+- Endpoints: `/api/cookies/pool`, `/api/cookies/pool/match`,
+  `/api/cookies/pool/inject`
+
+### Bulk profile create
+
+Create 1–100 profiles in a single dialog: round-robin proxy assignment,
+optional script binding, tag application, optional cookie-pool
+injection per profile. Auto-close on full success; "Close" button on
+partial failure with per-row error details.
+
+### Other
+
+- Search refinement: dead 0-ad queries auto-generate commercial long-
+  tail variants via `query_expander`
+- Many install-pipeline and manifest fixes (most-painful one was a
+  comment-stripping regex in `parse_manifest` that ate valid JSON in
+  real-world wallet manifests; full notes in the wiki's [Critical
+  lessons](https://github.com/thuesdays/ghost_shell_browser/wiki/Critical-Lessons)
+  page)
+
+Full release notes:
+[v0.2.0.11 on GitHub](https://github.com/thuesdays/ghost_shell_browser/releases/tag/0.2.0.11).
 
 ---
 
@@ -62,6 +133,10 @@ Three CLI entrypoints:
 
 VS Code launch configs for all three are in `.vscode/launch.json`.
 
+macOS notes: see [`MACOS_SETUP.md`](MACOS_SETUP.md) (dashboard-only or
+SSH-bridged Windows runner) and [`MACOS_BUILD.md`](MACOS_BUILD.md)
+(building patched Chromium natively).
+
 ---
 
 ## Architecture
@@ -75,81 +150,81 @@ ghost_shell/
 ├── profile/      manager · enricher · validator · pool
 ├── session/      cookies · cookie pool (resurrection) · warmup robot
 ├── browser/      runtime (CDP-driven) · watchdog · traffic collector
-├── actions/      script flow runner (15+ actions, 15+ conditions)
+├── extensions/   pool (CWS install, CRX unpack, manifest normalize)
+├── actions/      script flow runner (20+ actions, 15+ conditions)
 ├── scheduler/    pure-Python cron parser + 3 schedule modes
-├── dashboard/    Flask server (4500+ LOC, 70+ endpoints)
+├── dashboard/    Flask server (5000+ LOC, 80+ endpoints)
 ├── accounts/     Fernet-encrypted vault (8 kinds: account/wallet/api_key/…)
 ├── __main__.py   runpy dispatcher for monitor|dashboard|scheduler
 └── main.py       monitor entrypoint
 ```
 
-Standalone scripts live in `scripts/`, tests in `tests/`, and the
+DB reference: [`DATABASE.md`](DATABASE.md) — 18 tables, idempotent
+migrations, settings stored as flat dotted keys in `config_kv`.
 
 ---
 
 ## Features (dashboard pages)
 
 - **Overview** — 24h KPIs, 7-day chart, fingerprint health rollup,
-  per-profile self-check status, traffic-card.
+  per-profile self-check status, traffic card.
 - **Profiles** — table of profiles with per-row Start/Stop, status
   badges, "Set as default", quick-jump links to fingerprint/session.
-- **Profile detail** — script + proxy + fingerprint assignments,
-  cookies/session summary, **Danger zone** at the bottom (reset
-  blocks / clear history / delete profile).
+  **Bulk create** (1–100 profiles in one dialog).
+- **Profile detail** — script + proxy + fingerprint + extensions
+  assignments, cookies/session summary, **Danger zone** at the bottom
+  (reset blocks / clear history / delete profile).
 - **Fingerprint** — coherence editor: 11 device templates (7 desktop +
   4 mobile), category filter, score badge with grade colours,
   field-by-field editor with locks, history with restore, live
   self-test that launches a real browser and compares configured vs
   actual, **dual-mode toggle** (desktop ↔ mobile, switches active FP
   instantly).
-- **🍪 Session/Cookies** — left-side profile nav (vertical card list
-  with active-border accent), 4 tabs:
+- **🍪 Session/Cookies** — left-side profile nav, 4 tabs:
   - **Warmup robot** — 5 categorized presets (general, medical, tech,
     news, mobile), preset cards, run-now + history table. Real-browser
     visits with cookie-consent auto-clicker.
   - **Cookies** — live table per next-run, filter, import/export,
     flag indicators (S/H/N/L).
-  - **Snapshots** — cookie pool with auto-snapshot after clean runs;
-    restore queues injection at next launch.
+  - **Snapshots / Cookie pool** — auto-snapshot after clean runs;
+    restore queues injection at next launch. Cross-profile inject from
+    the donor pool, country/category-aware matching.
   - **Chrome import** — pulls real history/bookmarks from your own
     Chrome install (WAL-safe even while Chrome is open).
+- **🧩 Extensions** — pool of installed extensions with dense IDE-style
+  layout, install from CWS / CRX / unpacked zip, per-profile
+  assignment UI on the profile detail page, source filter
+  (cws / manual_crx / manual_unpacked), pool-size badge in sidebar.
 - **Proxy** — library of named proxies with cached diagnostics
   (geo/ISP/latency/risk), bulk import (9 formats), per-profile
   assignment.
 - **Domains** — your own domains (skipped as competitors), targets
   (trigger on-target action chain), block list.
-- **Competitors** — ad-intel dashboard: trend chart (line/stacked),
-  activity badges (NEW/ACTIVE/QUIETING), per-row 7-day sparklines,
-  expandable rows with titles + display URLs + matched queries,
-  share-of-voice tab, inline 🎯/🏠/🚫 actions to push a domain into
-  the Domains lists, CSV/JSON export.
+- **Competitors** — ad-intel dashboard (only useful if you're
+  monitoring your own SERP/ad presence): trend chart, activity badges
+  (NEW/ACTIVE/QUIETING), per-row 7-day sparklines, expandable rows
+  with titles + display URLs + matched queries, share-of-voice tab,
+  CSV/JSON export.
 - **Behavior** — typing/dwell/scroll/refresh timing knobs, captcha
   recovery policy, traffic block-list patterns.
-- **Scripts** — visual flow builder for the per-ad pipeline. 15+
-  actions (click, dwell, scroll, type, swipe, touch_click, …) and
-  15+ conditions (ads_found, captcha_present, var_*, …). Library
-  with named scripts, one is default, profiles can override.
+- **Scripts** — visual flow builder. 20+ actions (click, dwell, scroll,
+  type, swipe, touch_click, generic web automation primitives,
+  extension steps, …) and 15+ conditions (var_*, captcha_present,
+  ads_found, …). Library with named scripts, one is default,
+  profiles can override. Figma-style Ctrl+scroll zoom on the canvas.
 - **🔐 Accounts & Vault** — encrypted local password manager. Master
   password unlocks an in-memory key (PBKDF2-HMAC-SHA256, 200k iters →
-  Fernet). 8 kinds:
-  - `account` (login + password + 2FA),
-  - `email` (with IMAP/SMTP fields),
-  - `social`, `crypto_wallet` (seed + private key),
-  - `api_key`, `totp_only`, `note`, `custom` (free-form fields).
-  Each kind has its own form layout. TOTP code revealed inline,
-  one-click copy. RFC 6238 compliant.
-- **Runs** — table of every monitor run with exit code, captcha count,
+  Fernet). 8 kinds: `account` (login + password + 2FA), `email`
+  (with IMAP/SMTP fields), `social`, `crypto_wallet` (seed + private
+  key), `api_key`, `totp_only`, `note`, `custom`. TOTP code revealed
+  inline, one-click copy. RFC 6238 compliant.
+- **Runs** — every monitor run with exit code, captcha count,
   duration, profile, log link.
 - **Traffic** — per-profile + per-host bandwidth tracker; Network.*
   CDP events drive the counters.
-- **Scheduler** — three modes:
-  - **Simple** (density) — N runs/day spread over active hours w/ jitter,
-  - **Interval** — fixed gap between runs,
-  - **Cron** — full 5-field cron expression with live "next 5 runs"
-    preview. Active days-of-week (Mon-Sun) chips on top of all modes.
-  Profile selection card-grid with search + bulk (All/None/Invert/✓Healthy).
-  Group launch (parallel/serial) when monitoring needs to fire several
-  profiles per iteration.
+- **Scheduler** — three modes (Simple density / Interval / Cron),
+  active days-of-week chips, profile selection card-grid with bulk
+  ops, group launch (parallel/serial).
 - **Logs** — terminal-style live tail with level filter + grep,
   per-run timestamp grouping, ring buffer (10k lines).
 - **Settings** — VSCode-style sidebar: paths · UA spoof range · proxy
@@ -176,25 +251,15 @@ Stacked top-to-bottom — each layer hides a different signal:
    curve-fitting, dwell times sampled from human distributions,
    gentle scroll with pauses, on mobile profiles → CDP touch swipes.
 5. **Session warmup** — fresh profiles visit 7-8 realistic sites
-   first (cookie-consent banners auto-clicked) so Google sees
-   organic history before the first SERP query.
+   first (cookie-consent banners auto-clicked) so a fresh profile
+   doesn't look like a bot's blank slate on its first navigation.
 6. **Cookie pool** — clean-run snapshots; if a session degrades,
    restore the last good one rather than starting cold.
 7. **Proxy intelligence** — geo/ASN/IP-type validation per run,
    exit-IP gating against expected country/timezone.
-
----
-
-## Installation
-
-End users: grab the latest **`GhostShellAntySetup.exe`** from
-[Releases](https://github.com/thuesdays/ghost_shell_browser/releases)
-and run it. The installer ships the patched Chromium runtime, a
-Python venv, and every dependency — no git or pip needed.
-
-The installer build pipeline is maintainer-only and lives in a
-private toolchain; this repo only carries the source and the
-download script for the patched Chromium binary.
+8. **Extensions** (new in v0.2.0.11) — real browser extensions,
+   loaded from a shared pool, can be required for sites that
+   gate on extension presence.
 
 ---
 
@@ -207,6 +272,12 @@ download script for the patched Chromium binary.
   source-only checkout, run `.\scripts\download_chromium.ps1` to
   pull the matching release asset. Releases also include a
   ready-to-run `GhostShellAntySetup.exe` for end users.
+- **Extension ID derivation** — Chrome derives an extension's ID from
+  the SHA-256 of its public key. Without a `key` field in the
+  manifest, IDs are path-based — moving the pool dir would break
+  every assignment. We auto-inject `key` on import (minimal byte-
+  level patch on the manifest, preserving every original byte) so
+  IDs stay stable.
 - **Refactor v0.2.0**: project moved from 39 flat files at the root
   into a proper `ghost_shell/` package. Old paths preserved in
   `_legacy/` for reference only — not on `sys.path`, not shipped.
@@ -220,14 +291,36 @@ download script for the patched Chromium binary.
 
 ---
 
-## License
+## License & Acceptable Use
 
 MIT — see [`LICENSE`](LICENSE).
 
-This software is provided for legitimate uses (competitive intelligence
-on your own ad spend, QA, accessibility automation, etc). Users are
-responsible for compliance with the terms of service of any sites they
-automate against.
+This software is provided for **legitimate uses on properties you
+control or have permission to automate**: privacy isolation,
+multi-account workflows for agencies and creators on platforms whose
+ToS allows multi-account, QA and accessibility automation, fingerprint
+and anti-detection *research*, and competitive-intelligence on **your
+own** ad presence.
+
+Things this project is **not** intended for and the maintainer does
+not support:
+
+- Click-fraud against third-party advertisers
+- Sybil attacks / airdrop multi-claiming on protocols that prohibit it
+- Account-farming on platforms that prohibit multi-accounting
+- Evading another platform's anti-fraud or anti-spam systems for
+  commercial gain at their users' expense
+- Impersonation, harassment, or any use that targets a specific
+  person or group
+
+If your use case clearly fits one of the items in the second list,
+please don't deploy this. Privacy and anti-fingerprinting tooling
+exist because users have legitimate reasons to resist surveillance —
+abusing those tools to defraud third parties hurts everyone who
+relies on them for the legitimate reasons.
+
+Users are responsible for compliance with the terms of service of any
+sites they automate against.
 
 ---
 
@@ -243,9 +336,10 @@ a fingerprint expert to help.
   Android) in [`device_templates.py`](ghost_shell/fingerprint/device_templates.py)
   with a coherence test
 - A new warmup preset for a vertical you understand (e-commerce,
-  fashion, gambling, …)
+  fashion, news, …)
 - CSS polish on the dashboard
 - Issues with reproduction steps when something breaks
+- Wiki improvements — corrections, screenshots, examples
 
 **Before opening a PR:**
 
@@ -291,8 +385,8 @@ Sponsors row in the next release.
 ### Other ways to help
 
 - ⭐ **Star the repo** — costs nothing, helps with discovery
-- 📣 **Tell a friend** running ad ops at scale — word of mouth is most
-  of how this tool finds users
+- 📣 **Tell a friend** running real multi-profile workflows — word of
+  mouth is most of how this tool finds users
 - 🐛 **Report bugs with logs** — the dashboard's Logs page has a
   Download button that captures everything maintainers need
 - 📝 **Write a blog post / video** if you build something interesting
