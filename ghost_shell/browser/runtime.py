@@ -19,6 +19,7 @@ import math
 import re
 import threading
 from datetime import datetime
+from typing import Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -43,6 +44,128 @@ from ghost_shell.fingerprint.device_templates import DeviceTemplateBuilder
 # below for the wiring — every fresh dashboard / monitor / scheduler
 # Python process scrubs old *.quarantine-* dirs on its first launch.
 _QUARANTINE_CLEANUP_DONE = False
+# Lock-protected check-and-set so two concurrent launches don't both
+# decide to run cleanup (RC-03 from sprint-1 audit).
+_QUARANTINE_CLEANUP_LOCK = threading.Lock()
+
+
+# ─── .ghost_shell.lock helpers ──────────────────────────────────
+# JSON-formatted lock: {pid, acquired_at, heartbeat_at}. Heartbeat
+# refreshed by a daemon thread in the running process every
+# LOCK_HEARTBEAT_REFRESH_SEC. A lock with stale heartbeat (>SEC) is
+# treated as a hung process — closes RC-33 from the audit.
+LOCK_HEARTBEAT_STALE_SEC = 180
+LOCK_HEARTBEAT_REFRESH_SEC = 30
+
+
+def _read_gs_lock(lock_path):
+    """Parse the lock file, tolerating legacy plain-PID format. Returns
+    {"pid", "acquired_at", "heartbeat_at"} or {} if unreadable."""
+    if not lock_path or not os.path.exists(lock_path):
+        return {}
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return {}
+        if raw.startswith("{"):
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    return {}
+                pid = int(data.get("pid") or 0)
+                if pid <= 0:
+                    return {}
+                return {"pid": pid,
+                        "acquired_at":  data.get("acquired_at"),
+                        "heartbeat_at": data.get("heartbeat_at")}
+            except (ValueError, json.JSONDecodeError):
+                return {}
+        try:
+            return {"pid": int(raw), "acquired_at": None, "heartbeat_at": None}
+        except ValueError:
+            return {}
+    except OSError:
+        return {}
+
+
+def _heartbeat_age_sec(lock_data, lock_path):
+    """Seconds since last heartbeat. Falls back to file mtime for
+    legacy plain-PID locks. None if unknown."""
+    hb = (lock_data or {}).get("heartbeat_at")
+    if hb:
+        try:
+            return (datetime.now() - datetime.fromisoformat(hb)).total_seconds()
+        except (ValueError, TypeError):
+            pass
+    try:
+        return time.time() - os.path.getmtime(lock_path)
+    except OSError:
+        return None
+
+
+def _is_lock_live(lock_data, lock_path):
+    """True if PID alive AND ours AND heartbeat fresh. False otherwise."""
+    pid = (lock_data or {}).get("pid") or 0
+    if pid <= 0:
+        return False
+    try:
+        import psutil
+        if not psutil.pid_exists(pid):
+            return False
+    except ImportError:
+        # Conservative: refuse to launch when we can't verify.
+        return True
+    try:
+        from ghost_shell.core.process_reaper import pid_looks_like_ghost_shell
+        if not pid_looks_like_ghost_shell(pid):
+            return False
+    except ImportError:
+        pass
+    age = _heartbeat_age_sec(lock_data, lock_path)
+    if age is None:
+        return True
+    return age < LOCK_HEARTBEAT_STALE_SEC
+
+
+def _write_gs_lock(lock_path):
+    """Atomic write of fresh lock {pid, acquired_at, heartbeat_at}."""
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        now = datetime.now().isoformat(timespec="seconds")
+        data = {"pid": os.getpid(), "acquired_at": now, "heartbeat_at": now}
+        tmp = lock_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, lock_path)
+        return True
+    except OSError as e:
+        logging.debug("[GhostShellBrowser] lock write failed: %s" % e)
+        return False
+
+
+def _heartbeat_gs_lock(lock_path):
+    """Refresh heartbeat_at preserving pid + acquired_at. Returns False
+    if lock is gone or claimed by someone else (signals heartbeat
+    thread to stop)."""
+    try:
+        data = _read_gs_lock(lock_path)
+        if not data or data.get("pid") != os.getpid():
+            return False
+        data["heartbeat_at"] = datetime.now().isoformat(timespec="seconds")
+        if not data.get("acquired_at"):
+            data["acquired_at"] = data["heartbeat_at"]
+        tmp = lock_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, lock_path)
+        try:
+            os.utime(lock_path, None)
+        except OSError:
+            pass
+        return True
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 # ─── Extension Preferences pre-accept (Phase 6) ─────────────────────
@@ -254,7 +377,12 @@ class GhostShellBrowser:
         self._watchdog_thread      = None
         self._watchdog_stop        = threading.Event()
         self._watchdog_fail_count  = 0
-        self._gs_lock_path         = None
+        self._gs_lock_path          = None
+        # Lock heartbeat thread (RC-33 fix): refreshes
+        # .ghost_shell.lock periodically so other ghost_shell processes
+        # can detect a hung run vs a live one.
+        self._lock_heartbeat_thread = None
+        self._lock_heartbeat_stop   = threading.Event()
 
         # Profile Enrichment (Simulate an aged browser profile before creation).
         # Can be disabled via env (GHOST_SHELL_SKIP_ENRICH=1) for debugging.
@@ -356,6 +484,29 @@ class GhostShellBrowser:
         )
         from ghost_shell.profile.validator import ProfileValidator
 
+        # ── ACTIVE-RUN GUARD (RC-01 + RC-33) ────────────────────
+        # CRITICAL: must run BEFORE the orphan sweep below. If another
+        # ghost_shell process owns this profile (legitimate concurrent
+        # run), the chrome.exe we'd find by cmdline is NOT an orphan —
+        # killing it would terminate the legit run. JSON-format lock
+        # holds {pid, acquired_at, heartbeat_at}; live = PID alive +
+        # heartbeat fresh. Stale lock (PID dead OR heartbeat absent
+        # >180s = hung process) → continue, sweep cleans up.
+        gs_lock = os.path.join(self.user_data_path, ".ghost_shell.lock")
+        if os.path.exists(gs_lock):
+            lock_data = _read_gs_lock(gs_lock)
+            if lock_data and _is_lock_live(lock_data, gs_lock):
+                age = _heartbeat_age_sec(lock_data, gs_lock)
+                age_str = ("%.0fs" % age) if age is not None else "?"
+                raise RuntimeError(
+                    f"Profile '{self.profile_name}' has an active run "
+                    f"(lock owned by PID {lock_data.get('pid')}, "
+                    f"heartbeat {age_str} ago). Refusing to start a "
+                    f"second one — stop the existing run first "
+                    f"(Dashboard → Scheduler → 🧹 Clean zombies, or "
+                    f"kill the PID manually)."
+                )
+
         # ── PRE-FLIGHT ORPHAN SWEEP ─────────────────────────────
         # Catch the case where a previous failed run left chrome.exe /
         # chromedriver.exe alive (Python crashed mid-cleanup, Windows
@@ -391,8 +542,12 @@ class GhostShellBrowser:
         # processes, dashboard, monitor — each scrubs once on first
         # launch.
         global _QUARANTINE_CLEANUP_DONE
-        if not _QUARANTINE_CLEANUP_DONE:
-            _QUARANTINE_CLEANUP_DONE = True
+        should_run = False
+        with _QUARANTINE_CLEANUP_LOCK:
+            if not _QUARANTINE_CLEANUP_DONE:
+                _QUARANTINE_CLEANUP_DONE = True
+                should_run = True
+        if should_run:
             try:
                 from ghost_shell.core.process_reaper import cleanup_quarantine_dirs as _cqd
                 profiles_parent = os.path.dirname(
@@ -449,6 +604,18 @@ class GhostShellBrowser:
                     "session not created"    in msg
                 )
                 if not is_chrome_crash or attempt == 3:
+                    # RC-02: cleanup BEFORE raise on terminal attempts.
+                    # Otherwise orphan chrome.exe / chromedriver.exe
+                    # spawned by the failed webdriver.Chrome() ctor
+                    # stay alive holding our user-data-dir, corrupting
+                    # the next legitimate launch attempt.
+                    try:
+                        self._cleanup_after_failed_start()
+                    except Exception as _ce:
+                        logging.debug(
+                            "[GhostShellBrowser] cleanup-before-raise "
+                            "failed: %s" % _ce
+                        )
                     raise
 
                 self._cleanup_after_failed_start()
@@ -553,6 +720,14 @@ class GhostShellBrowser:
                 pass
             self._proxy_forwarder = None
 
+        # Stop heartbeat BEFORE removing the lock — otherwise it could
+        # resurrect the file with a fresh heartbeat moments after we
+        # delete it.
+        try:
+            self._stop_lock_heartbeat()
+        except Exception:
+            pass
+
         # Release the GS lock file — _start_once reclaims it on retry.
         try:
             if self._gs_lock_path and os.path.exists(self._gs_lock_path):
@@ -569,6 +744,51 @@ class GhostShellBrowser:
             except Exception:
                 pass
             self._traffic_collector = None
+
+    # ──────────────────────────────────────────────────────────
+    # Lock heartbeat — keeps .ghost_shell.lock fresh while we run
+    # ──────────────────────────────────────────────────────────
+
+    def _start_lock_heartbeat(self):
+        """Spawn a daemon thread that refreshes the lock file every
+        LOCK_HEARTBEAT_REFRESH_SEC. Idempotent — calling twice replaces
+        the existing thread cleanly. No-op if no lock path is set."""
+        if not self._gs_lock_path:
+            return
+        try:
+            self._stop_lock_heartbeat()
+        except Exception:
+            pass
+        self._lock_heartbeat_stop.clear()
+        self._lock_heartbeat_thread = threading.Thread(
+            target=self._lock_heartbeat_loop,
+            daemon=True,
+            name="GSB-lock-heartbeat",
+        )
+        self._lock_heartbeat_thread.start()
+
+    def _lock_heartbeat_loop(self):
+        """Daemon body — touches the lock every refresh interval until
+        signalled to stop OR a heartbeat write fails (lock claimed by
+        someone else / file deleted by close)."""
+        while not self._lock_heartbeat_stop.wait(LOCK_HEARTBEAT_REFRESH_SEC):
+            if not self._gs_lock_path:
+                return
+            ok = _heartbeat_gs_lock(self._gs_lock_path)
+            if not ok:
+                return
+
+    def _stop_lock_heartbeat(self):
+        """Signal the heartbeat loop to exit and wait briefly."""
+        try:
+            self._lock_heartbeat_stop.set()
+            t = self._lock_heartbeat_thread
+            if t is not None and t.is_alive():
+                t.join(timeout=2.0)
+        except Exception:
+            pass
+        finally:
+            self._lock_heartbeat_thread = None
 
     def _start_once(self, skip_extensions: bool = False) -> webdriver.Chrome:
         """Launches the C++ native stealth browser.
@@ -645,50 +865,19 @@ class GhostShellBrowser:
                     logging.debug(f"[GhostShellBrowser] Could not remove {lock_name}: {e}")
 
         # ── Ghost Shell-specific lock file ─────────────────────────
-        # Belt-and-suspenders on top of the DB-level guard in
-        # process_reaper.ensure_no_live_run_for_profile(). If the DB
-        # is unavailable (e.g. user blew away ghost_shell.db to reset),
-        # this file still blocks a second Chrome from spawning against
-        # the same user-data-dir (which would silently corrupt session
-        # state on both).
+        # The active-run guard at the top of start() already rejected
+        # this launch if a *live* lock existed (PID alive + heartbeat
+        # fresh). Anything still here is STALE — safe to overwrite
+        # atomically with our own {pid, acquired_at, heartbeat_at}
+        # JSON. _write_gs_lock + _start_lock_heartbeat replace the
+        # legacy plain-PID write to fix RC-33 (hung process holding
+        # profile forever).
         gs_lock = os.path.join(self.user_data_path, ".ghost_shell.lock")
-        if os.path.exists(gs_lock):
-            stale = True
-            try:
-                with open(gs_lock, "r") as f:
-                    old_pid = int(f.read().strip() or "0")
-                if old_pid > 0:
-                    try:
-                        import psutil
-                        if psutil.pid_exists(old_pid):
-                            # Is it actually a Ghost Shell process?
-                            from ghost_shell.core.process_reaper import pid_looks_like_ghost_shell
-                            if pid_looks_like_ghost_shell(old_pid):
-                                raise RuntimeError(
-                                    f"Profile '{self.profile_name}' is locked by "
-                                    f"live PID {old_pid}. Stop that run first "
-                                    f"(Dashboard → Scheduler → 🧹 Clean zombies, "
-                                    f"or kill PID manually)."
-                                )
-                    except ImportError:
-                        pass  # no psutil — fall through, treat as stale
-            except RuntimeError:
-                raise
-            except Exception:
-                pass  # corrupt lock file → treat as stale
-            if stale:
-                try:
-                    os.remove(gs_lock)
-                except OSError:
-                    pass
-
-        # Write our own PID into the lock. Cleared in close().
-        try:
-            with open(gs_lock, "w") as f:
-                f.write(str(os.getpid()))
+        if _write_gs_lock(gs_lock):
             self._gs_lock_path = gs_lock
-        except Exception as e:
-            logging.debug(f"[GhostShellBrowser] lock write skipped: {e}")
+            # Spawn the heartbeat refresher daemon
+            self._start_lock_heartbeat()
+        else:
             self._gs_lock_path = None
 
         # 3. Configure Local Preferences (WebRTC, permissions, session).
@@ -895,10 +1084,23 @@ class GhostShellBrowser:
                             parse_manifest, _ensure_default_locale,
                             _sanitize_match_patterns,
                             _ensure_required_fields,
+                            _get_repair_lock,
                         )
                         import json as _json
                         mf_path = os.path.join(pp, "manifest.json")
                         manifest = parse_manifest(mf_path)
+                        # RC-07: serialize repair across concurrent
+                        # launches. Without this, two profiles fixing
+                        # the same shared pool extension simultaneously
+                        # could race the manifest.json write — last
+                        # writer wins and the OTHER reader could see a
+                        # partially-written file.
+                        _repair_lock = _get_repair_lock(pp)
+                        with _repair_lock:
+                            # Re-read manifest INSIDE the lock so we
+                            # see any concurrent repair's output and
+                            # don't redo work / corrupt fresh content.
+                            manifest = parse_manifest(mf_path)
                         if manifest:
                             # Snapshot the keys we mutate to detect
                             # whether anything actually changed (avoid
@@ -926,13 +1128,17 @@ class GhostShellBrowser:
                                 "war":             manifest.get("web_accessible_resources"),
                             }, sort_keys=True)
                             if before != after:
-                                with open(mf_path, "w", encoding="utf-8") as _f:
-                                    _json.dump(manifest, _f,
-                                               ensure_ascii=False, indent=2)
-                                logging.info(
-                                    f"[GhostShellBrowser] manifest repaired "
-                                    f"for {os.path.basename(pp)}"
-                                )
+                                # RC-07: write inside the per-extension
+                                # lock so concurrent launches of other
+                                # profiles don't see torn JSON.
+                                with _repair_lock:
+                                    with open(mf_path, "w", encoding="utf-8") as _f:
+                                        _json.dump(manifest, _f,
+                                                   ensure_ascii=False, indent=2)
+                                    logging.info(
+                                        f"[GhostShellBrowser] manifest repaired "
+                                        f"for {os.path.basename(pp)}"
+                                    )
                     except Exception as _e:
                         logging.debug(
                             f"[GhostShellBrowser] manifest repair skipped "
@@ -1297,9 +1503,15 @@ class GhostShellBrowser:
                     os.remove(os.path.join(chromedriver_log_dir, old))
                 except OSError:
                     pass
+            # RC-05: timestamp + PID + 4-char random salt avoids
+            # filename collisions when two launches fire in the same
+            # millisecond (scheduler can spawn N profiles in lockstep
+            # on a fast machine, sub-ms timing is plausible).
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+            salt = "".join(random.choices("abcdefghijklmnop", k=4))
             log_file = os.path.join(
-                chromedriver_log_dir, f"chromedriver-{ts}.log"
+                chromedriver_log_dir,
+                f"chromedriver-{ts}-{os.getpid()}-{salt}.log"
             )
         except OSError as _e:
             # Fallback to old behaviour if logs/ can't be created
@@ -3193,4 +3405,96 @@ class GhostShellBrowser:
 
     def close(self):
         """Gracefully terminates the driver and background processes."""
-        # Release our profile lock ASAP 
+        # Release our profile lock ASAP         # Stop lock heartbeat thread FIRST (introduced in Sprint 2.1)
+        # so it can't resurrect the lock file with a fresh heartbeat
+        # between our remove() below and the next launch's stale check.
+        try:
+            self._stop_lock_heartbeat()
+        except AttributeError:
+            # heartbeat machinery wasn't installed (e.g. start() never
+            # ran) — nothing to stop. Defensive only; init() should
+            # always set up the attributes.
+            pass
+        except Exception:
+            pass
+
+        # Release our profile lock ASAP — even if the rest of shutdown
+        # fails, a follow-up run against the same profile should be able
+        # to start (other protections will still catch true double-spawn).
+        gs_lock = getattr(self, "_gs_lock_path", None)
+        if gs_lock and os.path.exists(gs_lock):
+            try:
+                os.remove(gs_lock)
+            except OSError:
+                pass
+            self._gs_lock_path = None
+
+        # Stop watchdog FIRST — we don't want it killing Chrome mid-shutdown
+        # if our save operations take >30s.
+        try:
+            self._watchdog_stop.set()
+        except Exception:
+            pass
+
+        # Stop traffic collector SECOND — it does one final poll via
+        # execute_script(). That requires the driver to still be alive.
+        if getattr(self, "_traffic_collector", None):
+            try:
+                self._traffic_collector.stop()
+            except Exception as e:
+                logging.debug(f"[GhostShellBrowser] traffic collector stop: {e}")
+            self._traffic_collector = None
+
+        if self.driver and self.auto_session and self.is_alive():
+            try:
+                self._auto_save_session()
+            except Exception as e:
+                logging.warning(f"[GhostShellBrowser] Session auto-save failed during shutdown: {e}")
+
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+
+        if self._proxy_forwarder:
+            try:
+                self._proxy_forwarder.stop()
+                logging.info("[GhostShellBrowser] Local proxy forwarder terminated.")
+            except Exception:
+                pass
+            self._proxy_forwarder = None
+
+        # Re-stamp Preferences with exited_cleanly=true. driver.quit()
+        # closes handles, which Chrome uses to write its own clean-exit
+        # markers. BUT if we got here via the hang detector killing the
+        # process (SIGKILL), or the OS terminated the process, Chrome
+        # never got that chance — its Preferences still has
+        # exited_cleanly=false. On next launch Chrome treats that as a
+        # crash and tries to restore tabs (the "9 tabs pile up" bug).
+        try:
+            pref_path = os.path.join(self.user_data_path, "Default", "Preferences")
+            if os.path.exists(pref_path):
+                with open(pref_path, "r", encoding="utf-8") as f:
+                    prefs = json.load(f)
+                if isinstance(prefs, dict):
+                    prefs.setdefault("profile", {})
+                    prefs["profile"]["exit_type"]      = "Normal"
+                    prefs["profile"]["exited_cleanly"] = True
+                    tmp = pref_path + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(prefs, f)
+                    os.replace(tmp, pref_path)
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] post-shutdown pref stamp: {e}")
+
+        # Detach our profile-specific file handler so logs from the next
+        # run don't double up if the process stays alive (e.g. scheduler).
+        if getattr(self, "_profile_log_handler", None) is not None:
+            try:
+                logging.getLogger().removeHandler(self._profile_log_handler)
+                self._profile_log_handler.close()
+            except Exception:
+                pass
+            self._profile_log_handler = None

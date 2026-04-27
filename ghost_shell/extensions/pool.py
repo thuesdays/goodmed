@@ -74,6 +74,33 @@ from ghost_shell.core.platform_paths import PROJECT_ROOT
 POOL_DIR = os.path.join(PROJECT_ROOT, "data", "extensions_pool")
 
 
+# RC-07: per-extension repair lock. Two profiles launching at the same
+# time both call the manifest repair pass on the same shared pool dir.
+# Without serialisation, both can write manifest.json simultaneously —
+# last writer wins, intermediate state could be a partially-written
+# JSON file that the OTHER reader sees as truncated. The lock is keyed
+# by pool path (one lock per extension), so different extensions can
+# still repair concurrently. The dict is module-level and lock-protected
+# so dict mutation itself is safe.
+import threading as _threading
+_REPAIR_LOCKS_REGISTRY: dict = {}
+_REPAIR_LOCKS_GUARD = _threading.Lock()
+
+
+def _get_repair_lock(pool_path: str):
+    """Return the (singleton) lock for the given pool dir. Creates one
+    on first use. Pool path is normalized for safe dict lookup across
+    forward/back-slash variants."""
+    key = os.path.normpath(pool_path).lower()
+    with _REPAIR_LOCKS_GUARD:
+        lk = _REPAIR_LOCKS_REGISTRY.get(key)
+        if lk is None:
+            lk = _threading.Lock()
+            _REPAIR_LOCKS_REGISTRY[key] = lk
+        return lk
+
+
+
 def _ensure_pool_dir() -> str:
     os.makedirs(POOL_DIR, exist_ok=True)
     return POOL_DIR

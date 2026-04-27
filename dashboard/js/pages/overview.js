@@ -11,6 +11,7 @@
 
 const Overview = {
   _pollTimer: null,
+  _healthPollTimer: null,
   _unsubRunFinished: null,
 
   async init() {
@@ -24,12 +25,19 @@ const Overview = {
       this.loadActivityFeed(),
       this.loadFingerprintHealth(),
       this.loadAdDensity(),
+      this.loadHealthBanner(),
     ]);
     // Wire the refresh button on the density panel (idempotent)
     const refreshBtn = document.getElementById("ov-density-refresh");
     if (refreshBtn && refreshBtn.dataset._wired !== "1") {
       refreshBtn.dataset._wired = "1";
       refreshBtn.addEventListener("click", () => this.loadAdDensity());
+    }
+    // Wire the Re-check button on the health banner (idempotent)
+    const recheckBtn = document.getElementById("ov-health-recheck");
+    if (recheckBtn && recheckBtn.dataset._wired !== "1") {
+      recheckBtn.dataset._wired = "1";
+      recheckBtn.addEventListener("click", () => this.loadHealthBanner({force: true}));
     }
 
     // Auto-refresh — quick polls, only the cheap stuff
@@ -41,6 +49,24 @@ const Overview = {
       this.loadSchedulerTile();
       this.loadCaptchaTile();
     }, 5000);
+
+    // Health banner re-poll — RC-23 fix. Backend caches verdict for
+    // 60s and individual binary probes for 1h with mtime-aware
+    // refresh, so post-deploy version changes are detected
+    // automatically once the cache expires. We re-poll every 5min
+    // with refresh=1 every 4th call (every 20min) to bypass the
+    // backend cache and pick up Chrome rebuilds even when mtime
+    // tracking misses.
+    clearInterval(this._healthPollTimer);
+    this._healthPollCount = 0;
+    this._healthPollTimer = setInterval(() => {
+      if (currentPage !== "overview") {
+        clearInterval(this._healthPollTimer); return;
+      }
+      this._healthPollCount += 1;
+      const force = (this._healthPollCount % 4 === 0);
+      this.loadHealthBanner({force, silent: true});
+    }, 5 * 60 * 1000);  // 5 minutes
 
     // SSE invalidate on run finish — refresh the heavier pieces
     if (typeof onSystemEvent === "function") {
@@ -55,7 +81,99 @@ const Overview = {
 
   teardown() {
     clearInterval(this._pollTimer);
+    clearInterval(this._healthPollTimer);
     if (typeof this._unsubRunFinished === "function") this._unsubRunFinished();
+  },
+
+  // ── Health banner — Chrome / chromedriver version compatibility ──
+  // Renders a top-of-page alert when /api/health/versions reports a
+  // mismatch or missing binary. Cheap one-shot fetch on init; the
+  // backend caches the verdict for 60s. Click "Re-check" to bypass
+  // the cache (e.g. after deploying a new chromium build).
+  async loadHealthBanner(opts = {}) {
+    const banner  = document.getElementById("ov-health-banner");
+    const icon    = document.getElementById("ov-health-icon");
+    const titleEl = document.getElementById("ov-health-title");
+    const detail  = document.getElementById("ov-health-detail");
+    const recheckBtn = document.getElementById("ov-health-recheck");
+    if (!banner || !titleEl || !detail) return;
+
+    // Background poll mode (silent: true) — skip the "Probing…" button
+    // feedback. The banner still updates if the verdict changes.
+    if (opts.silent) {
+      try { await this._renderHealthVerdict(!!opts.force); }
+      catch (e) { /* swallow — silent path */ }
+      return;
+    }
+
+    if (opts.force && recheckBtn) {
+      recheckBtn.disabled = true;
+      const orig = recheckBtn.textContent;
+      recheckBtn.textContent = "Probing…";
+      try { await this._renderHealthVerdict(true); }
+      finally {
+        recheckBtn.disabled = false;
+        recheckBtn.textContent = orig;
+      }
+    } else {
+      await this._renderHealthVerdict(false);
+    }
+  },
+
+  async _renderHealthVerdict(force) {
+    const banner  = document.getElementById("ov-health-banner");
+    const icon    = document.getElementById("ov-health-icon");
+    const titleEl = document.getElementById("ov-health-title");
+    const detail  = document.getElementById("ov-health-detail");
+    let verdict;
+    try {
+      verdict = await api(
+        "/api/health/versions" + (force ? "?refresh=1" : "")
+      );
+    } catch (e) {
+      // Endpoint failure — stay silent rather than spam the user
+      // with an "endpoint broke" banner. Logged for ops.
+      console.warn("[overview] health/versions fetch failed:", e);
+      banner.style.display = "none";
+      return;
+    }
+
+    // Reset modifier classes
+    banner.classList.remove("is-critical", "is-warn");
+
+    if (verdict && verdict.ok && verdict.level === "ok") {
+      // All good — banner hidden. (Could add a transient "✓ all
+      // versions match" toast on Re-check click, but quiet success
+      // is the right default for a startup banner.)
+      banner.style.display = "none";
+      return;
+    }
+
+    const level  = verdict?.level || "warn";
+    const reason = verdict?.reason || "Compatibility check returned no detail.";
+    let title = "Environment problem";
+    if (level === "critical") {
+      title = "Chrome / ChromeDriver version mismatch — sessions will fail";
+      banner.classList.add("is-critical");
+      if (icon) icon.textContent = "⛔";
+    } else {
+      title = "Environment warning";
+      banner.classList.add("is-warn");
+      if (icon) icon.textContent = "⚠";
+    }
+
+    // Add version pair to the detail when available, so the user can
+    // see at a glance what's wrong without parsing the long reason.
+    let detailText = reason;
+    if (verdict?.chrome_version || verdict?.driver_version) {
+      detailText = `Chrome ${verdict.chrome_version || "?"} ↔ `
+                 + `ChromeDriver ${verdict.driver_version || "?"}.\n`
+                 + reason;
+    }
+
+    titleEl.textContent = title;
+    detail.textContent  = detailText;
+    banner.style.display = "";
   },
 
   // ─── Hero tiles ────────────────────────────────────────────

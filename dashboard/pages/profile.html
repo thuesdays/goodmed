@@ -196,6 +196,13 @@
         </button>
       </div>
     </div>
+
+    <!-- Per-domain breakdown — populated by _renderFingerprintCard
+         from coherence_report.by_domain. Hidden when there's no
+         report yet. Lets the user see at-a-glance which dimension
+         is weak (Identity / Hardware / Network / Automation) instead
+         of guessing from the aggregate score. -->
+    <div class="profile-fp-domains" id="profile-fp-domains" style="display: none;"></div>
   </div>
 
   <!-- ─── PROXY / NETWORK ─────────────────────────────────────

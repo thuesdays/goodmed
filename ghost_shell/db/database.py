@@ -828,6 +828,27 @@ class DB:
         self._ensure_column(conn, "runs", "heartbeat_at", "TEXT")
         self._ensure_column(conn, "profiles", "script_id", "INTEGER")
 
+        # Sprint 2.4 (RC-31): ready_at marks the moment a profile's
+        # full setup pipeline completed (fingerprint + proxy + tags +
+        # script binding + user-data dir + cookie-pool inject). The
+        # scheduler's launch picker filters by ready_at IS NOT NULL —
+        # without this a scheduler tick could fire a half-created
+        # profile from an in-flight bulk-create and cause weird
+        # half-applied state.
+        #
+        # Backfill is one-shot: any existing row without ready_at gets
+        # ready_at = created_at, treating it as ready (preserves
+        # current behaviour for already-installed users).
+        self._ensure_column(conn, "profiles", "ready_at", "TEXT")
+        try:
+            conn.execute(
+                "UPDATE profiles SET ready_at = COALESCE(created_at, "
+                "datetime('now')) WHERE ready_at IS NULL"
+            )
+            conn.commit()
+        except Exception as _e:
+            logging.debug(f"[db] ready_at backfill skipped: {_e}")
+
         # Phase 5.1: opt-in to per-profile script execution. Default 0
         # (off): runs ignore profile.script_id and execute the legacy
         # flow without an attached script. When the user ticks the
@@ -3741,6 +3762,95 @@ class DB:
         )
         conn.commit()
 
+    def profile_delete_cascade(self, name: str) -> dict:
+        """Comprehensive profile-row cleanup across every table that
+        holds a foreign reference. PR-33 from the sprint-2 audit.
+
+        Tables purged (one DELETE per table, all in one transaction):
+          * profiles                  (the row itself)
+          * profile_group_members     (membership)
+          * profile_extensions        (per-profile assignments — no
+                                        FK on profile_name, must do
+                                        explicitly)
+          * vault_items               (profile-scoped credentials —
+                                        same)
+          * cookie_snapshots          (cookie pool entries)
+          * events                    (search/captcha events)
+          * selfchecks                (runtime fingerprint checks)
+          * fingerprints              (FP history snapshots)
+          * warmup_runs               (warmup robot history)
+          * action_events             (per-step action log)
+          * traffic_stats             (bandwidth counter)
+          * config_kv                 (session.pending_restore.<name>
+                                        + profile.<name>.* keys)
+
+        Tables intentionally NOT touched:
+          * runs                      (run history kept for Overview
+                                        aggregate stats; competitors
+                                        + action_events FK to runs
+                                        with ON DELETE SET NULL/CASCADE
+                                        already)
+          * proxies / scripts /
+            extensions (the pool)     (these are shared resources,
+                                        not profile-owned)
+
+        Returns a dict ``{table: rowcount}`` of how many rows were
+        deleted from each table — useful for logging / surfacing in
+        the UI ("Deleted profile + 3 vault items + 12 cookie
+        snapshots + 1.4k events").
+
+        Idempotent — calling on a non-existent profile returns all
+        zeros, doesn't raise."""
+        conn = self._get_conn()
+        out: dict = {}
+
+        # All single-row DELETEs first — keep them in one transaction
+        # so a mid-cleanup failure doesn't leave half-orphaned state.
+        with conn:
+            for table, col in [
+                # Order: most-derived → least-derived. profiles row
+                # last so other tables' references don't briefly point
+                # at a missing parent (irrelevant to SQLite without
+                # FKs but cleaner conceptually).
+                ("profile_extensions",     "profile_name"),
+                ("vault_items",            "profile_name"),
+                ("cookie_snapshots",       "profile_name"),
+                ("events",                 "profile_name"),
+                ("selfchecks",             "profile_name"),
+                ("fingerprints",           "profile_name"),
+                ("warmup_runs",            "profile_name"),
+                ("action_events",          "profile_name"),
+                ("traffic_stats",          "profile_name"),
+                ("profile_group_members",  "profile_name"),
+                ("profiles",               "name"),
+            ]:
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE {col} = ?", (name,)
+                    )
+                    out[table] = cur.rowcount or 0
+                except Exception as e:
+                    # Table may not exist on a pre-migration DB. Log
+                    # and continue — partial cleanup is better than
+                    # all-or-nothing on legacy installs.
+                    logging.debug(
+                        f"[profile_delete_cascade] {table}: {e}"
+                    )
+                    out[table] = -1
+
+            # config_kv: session.pending_restore.<name> + profile.<name>.*
+            try:
+                cur = conn.execute(
+                    "DELETE FROM config_kv WHERE key = ? OR key LIKE ?",
+                    (f"session.pending_restore.{name}", f"profile.{name}.%")
+                )
+                out["config_kv"] = cur.rowcount or 0
+            except Exception as e:
+                logging.debug(f"[profile_delete_cascade] config_kv: {e}")
+                out["config_kv"] = -1
+
+        return out
+
     def profile_effective_proxy(self, name: str) -> dict:
         """Return the proxy settings a run would actually use for this
         profile. Per-profile overrides win over global config values.
@@ -4086,6 +4196,43 @@ class DB:
         prefix = f"profile.{name}."
         for k, v in meta.items():
             self.config_set(prefix + k, v)
+
+    def profile_mark_ready(self, name: str) -> bool:
+        """Stamp ready_at = NOW() for the profile, signalling all
+        setup steps completed and the scheduler may launch it.
+
+        Bulk-create flow: insert profile row → run setup steps →
+        profile_mark_ready() at the end. Single-create can call this
+        immediately after profile_meta_upsert().
+
+        Idempotent — re-marking a ready profile just refreshes the
+        timestamp. Returns True on update, False if no row exists."""
+        conn = self._get_conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE profiles SET ready_at = datetime('now') "
+                "WHERE name = ?", (name,)
+            )
+            return (cur.rowcount or 0) > 0
+
+    def profile_is_ready(self, name: str) -> bool:
+        """True if the profile has a non-NULL ready_at (or doesn't
+        track readiness — legacy rows). False only when the column
+        exists AND the row's value is NULL (mid-bulk-create)."""
+        try:
+            row = self._get_conn().execute(
+                "SELECT ready_at FROM profiles WHERE name = ?", (name,)
+            ).fetchone()
+        except Exception:
+            # Column may not exist on a very old DB — treat as ready
+            # to preserve legacy behaviour.
+            return True
+        if not row:
+            return False
+        # If the column doesn't exist, sqlite returns the row but
+        # ready_at access fails. dict-row access returns None for
+        # missing columns; we treat None as not-ready.
+        return row["ready_at"] is not None
 
     def reset_profile_health(self, name: str):
         """

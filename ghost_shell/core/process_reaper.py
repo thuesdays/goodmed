@@ -162,8 +162,17 @@ def kill_chrome_for_user_data_dir(user_data_dir: str,
     Path comparison is case-insensitive and tolerates both forward- and
     back-slash forms (Windows quirks)."""
     if not HAVE_PSUTIL:
-        logging.debug(
-            "[ProcessReaper] psutil not available — orphan sweep skipped"
+        # Promote to WARNING — this is a real safety-net failure mode.
+        # Without psutil the orphan-cleanup story collapses and the user
+        # will hit the WinError-32 cascade we worked hard to prevent.
+        # The dashboard's normal install includes psutil; this only
+        # fires on bare-bones Python environments. Suggest the fix
+        # inline so users don't dig.
+        logging.warning(
+            "[ProcessReaper] psutil not available — orphan sweep "
+            "DISABLED. Chrome processes from failed runs cannot be "
+            "auto-killed and may lock user-data-dir on retry. "
+            "Install psutil: pip install psutil"
         )
         return 0
     if not user_data_dir:
@@ -523,6 +532,100 @@ def reap_stale_runs(db, reason_prefix: str = "startup") -> dict:
             stats["alive_left_alone"] += 1
 
     return stats
+
+
+def is_profile_actually_running(db, profile_name: str) -> bool:
+    """Cross-process liveness check for a profile. Replaces the
+    dashboard-local ``RUNNER_POOL.is_profile_running()`` which only
+    sees runs spawned by THIS Flask process — scheduler-spawned runs
+    are invisible to it (PR-31/PR-66 disaster scenario).
+
+    Returns True iff the DB has at least one ``runs`` row for this
+    profile with ``finished_at IS NULL`` AND either:
+      * the recorded PID is alive and looks like ghost_shell, OR
+      * the heartbeat is fresher than ``STALE_HEARTBEAT_SEC``
+
+    False otherwise — including the case where the run row exists but
+    its PID is dead and heartbeat is stale (a crashed run that nobody
+    finished).
+
+    This is the canonical liveness check for "should I refuse to
+    delete / mutate this profile because something's running it?"
+    """
+    try:
+        live_rows = db.runs_live_for_profile(profile_name)
+    except Exception as e:
+        # On DB error, conservative: assume alive, refuse the
+        # destructive op. Matches the policy of the lock helpers in
+        # browser/runtime.py.
+        logging.warning(
+            f"[ProcessReaper] runs_live_for_profile failed for "
+            f"{profile_name!r}: {e}. Assuming run is alive."
+        )
+        return True
+
+    if not live_rows:
+        return False
+
+    now = datetime.now()
+    for row in live_rows:
+        # Heartbeat-fresh runs are definitively alive
+        hb_str = row.get("heartbeat_at")
+        if hb_str:
+            try:
+                hb_age = (now - datetime.fromisoformat(hb_str)).total_seconds()
+                if hb_age < STALE_HEARTBEAT_SEC:
+                    return True
+            except (ValueError, TypeError):
+                pass
+        # Heartbeat is stale or missing — fall back to PID check
+        pid = row.get("pid")
+        if pid and HAVE_PSUTIL:
+            try:
+                if psutil.pid_exists(pid) and pid_looks_like_ghost_shell(pid):
+                    return True
+            except Exception:
+                pass
+        # Else: run is dead per heartbeat staleness AND PID check;
+        # this row should be reaped, but we don't reap during a
+        # liveness check. Caller can call reap_stale_runs() if the
+        # check returned False but they want belt-and-braces.
+
+    # All live rows are actually stale → caller can proceed with
+    # destructive op. The stale rows will be cleaned up by the next
+    # reap_stale_runs() pass.
+    return False
+
+
+def ensure_profile_ready_to_launch(db, profile_name: str) -> Optional[str]:
+    """Pre-spawn check used by scheduler/dashboard before they fire a
+    new run. Returns None if the profile is ready to launch, or an
+    error string if it isn't.
+
+    Two reasons we'd refuse:
+
+    1. **Not ready** — bulk-create populated the row but didn't finish
+       its setup pipeline (RC-31 fix). Profile_extensions, proxy
+       assignment, cookie inject etc. may still be in flight, and a
+       launch right now would see partial state.
+    2. **Already running** — handled by ``ensure_no_live_run_for_profile``
+       below; we delegate.
+
+    Combined helper so callers don't need two checks. Order matters:
+    readiness check is cheap (one SQL row), liveness check involves
+    process scans, so gate on readiness first.
+    """
+    try:
+        if hasattr(db, "profile_is_ready") and not db.profile_is_ready(profile_name):
+            return (
+                f"profile '{profile_name}' is not ready yet "
+                f"(setup pipeline incomplete — likely a bulk-create "
+                f"in progress). Wait a moment and try again."
+            )
+    except Exception as e:
+        # Don't break legacy DBs that lack the column — log and proceed
+        logging.debug(f"[ProcessReaper] ready check skipped: {e}")
+    return ensure_no_live_run_for_profile(db, profile_name)
 
 
 def ensure_no_live_run_for_profile(db, profile_name: str) -> Optional[str]:

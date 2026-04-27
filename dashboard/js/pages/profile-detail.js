@@ -706,6 +706,48 @@ const ProfileDetail = {
     sumEl.textContent = rep.summary
       || (fp.template_name || fp.template_id || "unknown template");
 
+    // Per-domain breakdown badges (Identity / Hardware / Network /
+    // Automation). Surfaces which dimension is weak instead of just
+    // an aggregate score. Hidden when validator didn't return
+    // by_domain (older snapshots predating the catalog refactor).
+    const domainsBox = document.getElementById("profile-fp-domains");
+    if (domainsBox) {
+      const byDomain = rep.by_domain || null;
+      if (byDomain && Object.keys(byDomain).length > 0) {
+        const ICONS = {
+          identity:   "🪪",
+          hardware:   "🖥",
+          network:    "🌐",
+          automation: "🤖",
+        };
+        const ORDER = ["identity", "hardware", "network", "automation"];
+        const sortedKeys = ORDER.filter(k => k in byDomain).concat(
+          Object.keys(byDomain).filter(k => !ORDER.includes(k))
+        );
+        domainsBox.innerHTML = sortedKeys.map(d => {
+          const v = byDomain[d];
+          const dg = v.grade || "unknown";
+          const failBit = v.fail
+            ? `<span class="fp-domain-fail">${v.fail} fail</span>`
+            : "";
+          const warnBit = v.warn
+            ? `<span class="fp-domain-warn">${v.warn} warn</span>`
+            : "";
+          return `
+            <div class="fp-domain-pill fp-score-${dg}" title="${v.pass} pass · ${v.warn} warn · ${v.fail} fail · ${v.skip} skip">
+              <span class="fp-domain-icon">${ICONS[d] || "•"}</span>
+              <span class="fp-domain-label">${d}</span>
+              <span class="fp-domain-score">${v.score}</span>
+              ${failBit}${warnBit}
+            </div>`;
+        }).join("");
+        domainsBox.style.display = "";
+      } else {
+        domainsBox.innerHTML = "";
+        domainsBox.style.display = "none";
+      }
+    }
+
     const parts = [];
     if (fp.template_name || fp.template_id) {
       parts.push(`📦 ${fp.template_name || fp.template_id}`);
@@ -1039,6 +1081,31 @@ const ProfileDetail = {
   async loadProfileMeta(name) {
     if (!name) return;
     this._metaProfileName = name;
+    // RC-25 fix: disable Save buttons until the load completes.
+    // Without this, a fast typist could open the form, type before
+    // load resolves, hit Save — and write back the still-empty
+    // payload, wiping the saved values they just opened. Disabling
+    // tells the user "wait, reading state".
+    const saveBtns = [
+      document.getElementById("pp-save-btn"),
+      document.getElementById("pp-proxy-save-btn-new"),
+    ].filter(Boolean);
+    saveBtns.forEach(b => {
+      b.disabled = true;
+      // Track the original label so we can restore it. data-attr is
+      // safe across re-renders — survives DOM mutation by other
+      // handlers.
+      if (!b.dataset._origLabel) b.dataset._origLabel = b.textContent;
+      b.textContent = "Loading…";
+    });
+    const restoreSaveBtns = () => {
+      saveBtns.forEach(b => {
+        b.disabled = false;
+        if (b.dataset._origLabel) {
+          b.textContent = b.dataset._origLabel;
+        }
+      });
+    };
     try {
       const meta = await api(`/api/profiles/${encodeURIComponent(name)}/meta`);
       this._workingTags = Array.isArray(meta.tags) ? meta.tags.slice() : [];
@@ -1071,6 +1138,10 @@ const ProfileDetail = {
       // 404 is OK — just means no custom metadata yet
       this._workingTags = [];
       this._renderTagChips();
+    } finally {
+      // RC-25: re-enable Save buttons regardless of success/failure
+      // so the user can save once they've reviewed the form.
+      restoreSaveBtns();
     }
   },
 

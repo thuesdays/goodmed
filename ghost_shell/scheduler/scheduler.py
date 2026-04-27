@@ -473,8 +473,8 @@ def run_one_iteration(profile_name: str) -> tuple:
     # spawn a second main.py for a profile whose previous iteration
     # wedged.
     try:
-        from ghost_shell.core.process_reaper import ensure_no_live_run_for_profile
-        err = ensure_no_live_run_for_profile(get_db(), profile_name)
+        from ghost_shell.core.process_reaper import ensure_profile_ready_to_launch
+        err = ensure_profile_ready_to_launch(get_db(), profile_name)
         if err:
             logging.error(f"[scheduler] Refusing to spawn: {err}")
             return -2, time.time() - started
@@ -729,8 +729,8 @@ def main():
                             continue
                         # Fallback: direct Popen with pre-spawn guard
                         try:
-                            from ghost_shell.core.process_reaper import ensure_no_live_run_for_profile
-                            err = ensure_no_live_run_for_profile(get_db(), name)
+                            from ghost_shell.core.process_reaper import ensure_profile_ready_to_launch
+                            err = ensure_profile_ready_to_launch(get_db(), name)
                             if err:
                                 logging.warning(f"  ✗ {name}: skipped — {err}")
                                 continue

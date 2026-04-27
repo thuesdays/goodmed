@@ -516,6 +516,37 @@ def api_config_set():
 
 
 # ──────────────────────────────────────────────────────────────
+# API: HEALTH — environment-level checks the dashboard surfaces
+# as banners (version mismatch, missing binaries, etc.)
+# ──────────────────────────────────────────────────────────────
+
+@app.route("/api/health/versions", methods=["GET"])
+def api_health_versions():
+    """Return Chrome / chromedriver compatibility verdict.
+
+    Used by the Overview page to render a top banner when versions
+    don't match (most common cause of SessionNotCreatedException).
+
+    Query params:
+      refresh=1  — bypass the in-memory cache and re-probe
+    """
+    try:
+        from ghost_shell.core.version_check import (
+            check_compatibility, invalidate_cache,
+        )
+        if request.args.get("refresh") == "1":
+            invalidate_cache()
+        return jsonify(check_compatibility())
+    except Exception as e:
+        logging.exception("[health] version check failed")
+        return jsonify({
+            "ok":      False,
+            "level":   "warn",
+            "reason":  f"version check itself failed: {e}",
+        }), 500
+
+
+# ──────────────────────────────────────────────────────────────
 # API: STATS
 # ──────────────────────────────────────────────────────────────
 
@@ -1653,7 +1684,16 @@ def api_groups_start(group_id: int):
 
     started, queued, errors = [], [], []
     for name in g["members"]:
-        if RUNNER_POOL.is_profile_running(name):
+        # PR-31/PR-66: DB-level check catches scheduler-spawned runs
+        # too. Wrapped in try so a legacy DB without heartbeat_at
+        # falls back to RUNNER_POOL gracefully.
+        _running = False
+        try:
+            from ghost_shell.core.process_reaper import is_profile_actually_running
+            _running = is_profile_actually_running(get_db(), name)
+        except Exception:
+            _running = RUNNER_POOL.is_profile_running(name)
+        if _running:
             continue
         if len(started) >= room:
             queued.append(name)
@@ -2293,18 +2333,35 @@ def _spawn_run(profile_name: str, *,
     user-data-dir. The lock serialises the "check → reserve" window.
     """
     with _SPAWN_LOCK:
+        # Two-tier check: process-local + DB-level. RUNNER_POOL handles
+        # the in-flight-spawn race (two requests in quick succession
+        # in this Flask process). DB-level check catches scheduler-
+        # spawned runs and crashed-but-heartbeat-fresh runs from a
+        # previous dashboard process.
         if RUNNER_POOL.is_profile_running(profile_name):
             raise ValueError(
                 f"Profile {profile_name!r} is already running — one run per "
                 f"profile at a time (they'd corrupt each other's user-data-dir)"
             )
+        try:
+            from ghost_shell.core.process_reaper import is_profile_actually_running
+            if is_profile_actually_running(get_db(), profile_name):
+                raise ValueError(
+                    f"Profile {profile_name!r} has an active run in the DB "
+                    f"(another ghost_shell process — scheduler / second "
+                    f"dashboard — owns it). Stop that one first."
+                )
+        except ValueError:
+            raise
+        except Exception:
+            pass  # legacy DB — RUNNER_POOL guard above covers us
 
         db = get_db()
 
         # Cross-process guard (separate from RunnerPool check)
         try:
-            from ghost_shell.core.process_reaper import ensure_no_live_run_for_profile
-            err = ensure_no_live_run_for_profile(db, profile_name)
+            from ghost_shell.core.process_reaper import ensure_profile_ready_to_launch
+            err = ensure_profile_ready_to_launch(db, profile_name)
             if err:
                 raise ValueError(err)
         except ValueError:
@@ -2529,27 +2586,111 @@ def api_profile_delete(name: str):
     useful aggregate data for the Overview stats. The name appears in
     run history but not in dropdowns / Profiles page.
     """
-    if RUNNER_POOL.is_profile_running(name):
-        return jsonify({
-            "error": f"Profile '{name}' is currently running - stop it "
-                     f"before deleting."
-        }), 409
+    # PR-31/PR-66 fix: DB-level liveness check, not the dashboard-local
+    # RUNNER_POOL. RUNNER_POOL only sees runs spawned by THIS Flask
+    # process; scheduler-spawned monitors are invisible to it. Without
+    # this fix, a delete during an active scheduler run silently
+    # succeeded — monitor kept running against a deleted profile,
+    # writing to gone DB row + gone dir = corruption.
+    db = get_db()
+    try:
+        from ghost_shell.core.process_reaper import (
+            is_profile_actually_running, kill_chrome_for_user_data_dir,
+        )
+        if is_profile_actually_running(db, name):
+            return jsonify({
+                "error": f"Profile '{name}' is currently running - stop it "
+                         f"before deleting (DB shows a live run with fresh "
+                         f"heartbeat)."
+            }), 409
+    except Exception as e:
+        # Fall back to RUNNER_POOL if the new helper failed (legacy DB
+        # missing runs.heartbeat_at column, etc). Conservative path —
+        # at least catches dashboard-local runs.
+        logging.warning(f"[delete profile] DB liveness check failed: {e}")
+        if RUNNER_POOL.is_profile_running(name):
+            return jsonify({
+                "error": f"Profile '{name}' is currently running - stop it "
+                         f"before deleting."
+            }), 409
 
     try:
         import shutil
         profile_dir = os.path.join("profiles", name)
-        if os.path.exists(profile_dir):
-            shutil.rmtree(profile_dir, ignore_errors=True)
 
-        db = get_db()
-        conn = db._get_conn()
-        for table in ("events", "selfchecks", "fingerprints"):
-            conn.execute(f"DELETE FROM {table} WHERE profile_name = ?", (name,))
-
+        # PR-32: kill any orphan chrome.exe / chromedriver.exe holding
+        # files inside the profile dir BEFORE rmtree. Without this,
+        # rmtree silently fails (ignore_errors=True) leaving DB rows
+        # gone but dir half-deleted — next single-create of same name
+        # collides on partial files. Also, the rmtree below now
+        # propagates the error back to the user instead of swallowing
+        # it: the cascade DELETE has already deleted the profile row,
+        # so a half-deleted dir is a real problem the user needs to
+        # know about.
         try:
-            db.profile_meta_delete(name)
+            n_killed = kill_chrome_for_user_data_dir(
+                profile_dir, reason="profile delete pre-cleanup"
+            )
+            if n_killed:
+                logging.info(
+                    f"[delete profile] killed {n_killed} chrome process(es) "
+                    f"holding {profile_dir} before rmtree"
+                )
+        except Exception as _e:
+            logging.debug(f"[delete profile] orphan sweep skipped: {_e}")
+
+        # rmtree with one retry for Windows handle release lag, then
+        # ignore_errors=True as the final fallback so DB cleanup still
+        # runs even if the dir is fully locked. Failures are logged
+        # loudly so the user knows.
+        if os.path.exists(profile_dir):
+            try:
+                shutil.rmtree(profile_dir)
+            except OSError as e:
+                logging.warning(
+                    f"[delete profile] rmtree retry after {e}"
+                )
+                import time as _t
+                _t.sleep(0.6)
+                try:
+                    shutil.rmtree(profile_dir)
+                except OSError as e2:
+                    logging.error(
+                        f"[delete profile] rmtree FAILED after retry: {e2}. "
+                        f"Manual cleanup may be needed at {profile_dir}"
+                    )
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+
+        # PR-33: comprehensive cascade-cleanup. Replaces the previous
+        # ad-hoc 3-table loop. Now sweeps vault_items, profile_extensions,
+        # cookie_snapshots, warmup_runs, action_events, traffic_stats,
+        # config_kv (pending_restore + profile.* keys), profile_group_members,
+        # plus the original events/selfchecks/fingerprints/profiles row.
+        # Returns counts per table for logging.
+        try:
+            cleanup = db.profile_delete_cascade(name)
+            logging.info(
+                f"[delete profile] cascade summary for {name!r}: "
+                + ", ".join(f"{t}={c}" for t, c in cleanup.items()
+                            if c not in (0, -1))
+            )
         except Exception as e:
-            logging.debug(f"[delete profile] profile_meta_delete: {e}")
+            logging.debug(f"[delete profile] profile_delete_cascade: {e}")
+            # Last-ditch fallback to old behaviour if cascade helper
+            # is missing (legacy install upgrade in flight).
+            conn = db._get_conn()
+            for table in ("events", "selfchecks", "fingerprints"):
+                try:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE profile_name = ?",
+                        (name,),
+                    )
+                except Exception:
+                    pass
+            try:
+                db.profile_meta_delete(name)
+            except Exception as _me:
+                logging.debug(f"[delete profile] meta_delete fallback: {_me}")
 
         # Reassign active profile if we nuked the default. Without this,
         # browser.profile_name keeps pointing at a dead profile and every
@@ -3382,6 +3523,16 @@ def api_profiles_bulk_create():
                 except Exception as e:
                     pool_summary = {"ok": False, "error": str(e)}
 
+            # 8. Mark ready — all setup steps completed successfully.
+            # Until this stamp lands the scheduler skips this profile
+            # (RC-31 fix: half-created profiles can't get launched).
+            try:
+                db.profile_mark_ready(name)
+            except Exception as _re:
+                logging.debug(
+                    f"[bulk] mark-ready failed for {name}: {_re}"
+                )
+
             created.append({
                 "name":       name,
                 "template":   payload.get("template_name"),
@@ -3396,6 +3547,11 @@ def api_profiles_bulk_create():
         except Exception as e:
             failed.append({"name": name, "error": str(e)})
             logging.warning(f"[bulk] create {name!r} failed: {e}")
+            # Half-created profile is left with ready_at IS NULL on
+            # purpose — scheduler will skip it. User can either delete
+            # it from the Profiles page (Danger zone → Delete profile)
+            # or finish the manual setup and click "Mark ready"
+            # (planned admin action).
 
     return jsonify({
         "ok":       len(created) > 0,
@@ -3569,7 +3725,15 @@ def api_profile_chrome_import(name: str):
     Returns a summary dict with counts per category imported."""
     data = request.get_json(silent=True) or {}
 
-    if RUNNER_POOL.is_profile_running(name):
+    # PR-31/PR-66: DB-level liveness so scheduler-spawned runs are
+    # also visible (importing into a profile someone else is running
+    # would corrupt their session).
+    try:
+        from ghost_shell.core.process_reaper import is_profile_actually_running
+        _running = is_profile_actually_running(get_db(), name)
+    except Exception:
+        _running = RUNNER_POOL.is_profile_running(name)
+    if _running:
         return jsonify({
             "error": "Profile is currently running - stop it first, "
                      "then retry import."
@@ -5000,6 +5164,86 @@ def api_extensions_update(ext_id: str):
     return jsonify({"ok": True})
 
 
+@app.route("/api/extensions/<ext_id>/test-solo", methods=["POST"])
+def api_extensions_test_solo(ext_id: str):
+    """Enqueue a solo-test job and return its job_id.
+
+    Solo test takes 5-8s per extension (spawn headless Chrome, watch
+    for crash/load-success, parse log). Running synchronously inside
+    a Flask request blocks the worker thread for the whole duration,
+    starving other concurrent requests. RC-26 from sprint-1 audit.
+
+    The response is a 202 Accepted with the job id. Frontend polls
+    /api/jobs/<id> at ~1Hz until status flips to 'done' or 'error',
+    then renders ``result`` (which is the same dict the synchronous
+    version used to return — see ``ghost_shell.extensions.solo_test``).
+
+    Body params (optional JSON):
+      timeout: float seconds (default 8.0, max 30)
+    """
+    body = request.get_json(silent=True) or {}
+    timeout = body.get("timeout", 8.0)
+    try:
+        timeout = max(2.0, min(float(timeout), 30.0))
+    except (TypeError, ValueError):
+        timeout = 8.0
+    try:
+        from ghost_shell.dashboard.jobs import enqueue
+        from ghost_shell.extensions.solo_test import test_extension
+        job_id = enqueue(
+            kind=f"solo_test:{ext_id}",
+            fn=test_extension,
+            ext_id=ext_id,
+            timeout=timeout,
+        )
+        return jsonify({
+            "ok":     True,
+            "job_id": job_id,
+            "kind":   f"solo_test:{ext_id}",
+            "status": "queued",
+            "poll_url": f"/api/jobs/{job_id}",
+        }), 202
+    except RuntimeError as qfull:
+        # Queue full — return 429 so the frontend can show a friendly
+        # "try again in a moment" toast.
+        return jsonify({
+            "ok":     False,
+            "status": "queue_full",
+            "reason": str(qfull),
+        }), 429
+    except Exception as e:
+        logging.exception("[ext solo test] enqueue crashed")
+        return jsonify({
+            "ok":     False,
+            "status": "error",
+            "reason": f"solo test enqueue failed: {e}",
+        }), 500
+
+
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def api_jobs_get(job_id: str):
+    """Poll endpoint for background jobs (solo-test and friends).
+
+    Returns the full status dict — see ``ghost_shell.dashboard.jobs``
+    for schema. Returns 404 if the job is unknown OR has aged out of
+    the in-memory cache (TTL = 5min after completion). Frontends
+    should treat 404 on a previously-known job_id as "result expired,
+    please re-submit".
+    """
+    try:
+        from ghost_shell.dashboard.jobs import get_status
+        status = get_status(job_id)
+        if status is None:
+            return jsonify({
+                "ok": False,
+                "error": "unknown or expired job",
+            }), 404
+        return jsonify(status)
+    except Exception as e:
+        logging.exception("[jobs] poll failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/extensions/upload", methods=["POST"])
 def api_extensions_upload():
     """Upload a CRX file (.crx) or unpacked-extension zip (.zip).
@@ -5259,7 +5503,12 @@ def api_cookies_pool_inject():
     if not target:
         return jsonify({"ok": False, "error": "target_profile required"}), 400
 
-    if RUNNER_POOL.is_profile_running(target):
+    try:
+        from ghost_shell.core.process_reaper import is_profile_actually_running
+        _running = is_profile_actually_running(get_db(), target)
+    except Exception:
+        _running = RUNNER_POOL.is_profile_running(target)
+    if _running:
         return jsonify({
             "ok":    False,
             "error": "target profile is currently running -- stop it first",

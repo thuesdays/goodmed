@@ -350,42 +350,89 @@ def check_audio_sample_rate(fp, template):
 # Important checks: medium weight (10-15).
 # Warnings: low weight (3-7).
 
+# Each check is tagged with TWO orthogonal dimensions:
+#   * severity ("critical" / "important" / "warning")
+#       — drives the score-impact weight when the check fails
+#   * domain   ("identity" / "hardware" / "network" / "automation")
+#       — drives the dashboard's per-category badge UI so the user
+#         sees which DIMENSION is weak ("Identity 100, Hardware 65")
+#         instead of just one aggregate number
+#
+# Domain definitions:
+#   identity   — claims about who/what this browser is (UA, platform,
+#                vendor, language, version)
+#   hardware   — facts about the underlying device (GPU, screen,
+#                fonts, audio, cores, memory, touch points, viewport)
+#   network    — environment-level signals tied to network/locale
+#                (timezone — paired with proxy geo; future: WebRTC,
+#                DNS leak, JA3 fingerprint match)
+#   automation — markers of automated control (navigator.webdriver,
+#                detection of CDP / automation banners, eventually
+#                sub-millisecond timer precision)
 CHECKS = [
-    # (name, category, weight_fail, weight_warn, check_fn)
-    ("UA platform matches OS",     "critical",  30, 10, check_ua_platform_matches_os),
-    ("navigator.platform",          "critical",  25,  8, check_navigator_platform),
+    # (name, severity, domain, weight_fail, weight_warn, check_fn)
+    ("UA platform matches OS",     "critical",  "identity",   30, 10, check_ua_platform_matches_os),
+    ("navigator.platform",          "critical",  "identity",   25,  8, check_navigator_platform),
     # webdriver is a special case: if it's exposed, game over.
     # Weight is artificially huge so score collapses immediately.
-    ("navigator.webdriver = false", "critical",  60,  0, check_webdriver_false),
-    ("navigator.vendor = Google",   "critical",  15,  5, check_vendor_chrome),
-    ("GPU vendor matches OS",       "critical",  25,  8, check_gpu_vendor),
-    ("GPU renderer plausibility",   "important", 10,  3, check_gpu_renderer),
-    ("Screen dimensions",           "important", 12,  4, check_screen_dimensions),
-    ("Device pixel ratio",          "important",  8,  2, check_dpr),
-    ("Hardware concurrency",        "important",  7,  2, check_hardware_concurrency),
-    ("Device memory",               "warning",    4,  1, check_device_memory),
-    ("maxTouchPoints",              "important", 10,  3, check_max_touch_points),
-    ("mobile UA marker",            "critical",  20,  5, check_mobile_ua_consistency),
-    ("mobile viewport",             "important", 10,  3, check_mobile_viewport),
-    ("No forbidden fonts",          "critical",  30, 10, check_fonts_no_forbidden),
-    ("Core fonts present",          "important", 15,  4, check_fonts_core_present),
-    ("Chrome version in range",     "warning",    5,  1, check_chrome_version_in_range),
-    ("Timezone plausibility",       "warning",    3,  1, check_timezone_plausibility),
-    ("Language plausibility",       "warning",    3,  1, check_language_plausibility),
-    ("Audio sample rate",           "warning",    4,  1, check_audio_sample_rate),
+    ("navigator.webdriver = false", "critical",  "automation", 60,  0, check_webdriver_false),
+    ("navigator.vendor = Google",   "critical",  "identity",   15,  5, check_vendor_chrome),
+    ("GPU vendor matches OS",       "critical",  "hardware",   25,  8, check_gpu_vendor),
+    ("GPU renderer plausibility",   "important", "hardware",   10,  3, check_gpu_renderer),
+    ("Screen dimensions",           "important", "hardware",   12,  4, check_screen_dimensions),
+    ("Device pixel ratio",          "important", "hardware",    8,  2, check_dpr),
+    ("Hardware concurrency",        "important", "hardware",    7,  2, check_hardware_concurrency),
+    ("Device memory",               "warning",   "hardware",    4,  1, check_device_memory),
+    ("maxTouchPoints",              "important", "hardware",   10,  3, check_max_touch_points),
+    ("mobile UA marker",            "critical",  "identity",   20,  5, check_mobile_ua_consistency),
+    ("mobile viewport",             "important", "hardware",   10,  3, check_mobile_viewport),
+    ("No forbidden fonts",          "critical",  "hardware",   30, 10, check_fonts_no_forbidden),
+    ("Core fonts present",          "important", "hardware",   15,  4, check_fonts_core_present),
+    ("Chrome version in range",     "warning",   "identity",    5,  1, check_chrome_version_in_range),
+    ("Timezone plausibility",       "warning",   "network",     3,  1, check_timezone_plausibility),
+    ("Language plausibility",       "warning",   "identity",    3,  1, check_language_plausibility),
+    ("Audio sample rate",           "warning",   "hardware",    4,  1, check_audio_sample_rate),
 ]
 
 
+# Canonical domain order — used by UI for consistent badge placement.
+DOMAINS = ["identity", "hardware", "network", "automation"]
+
+
 def validate(fp: dict, template: dict) -> dict:
-    """Run every check against fingerprint dict. Return full report."""
+    """Run every check against fingerprint dict. Return full report.
+
+    Output now includes a per-domain breakdown under ``by_domain`` so
+    the dashboard can surface separate badges per dimension (Identity /
+    Hardware / Network / Automation). The flat ``checks`` list still
+    contains every check with both ``category`` (severity) and ``domain``
+    fields, so existing consumers that ignore ``by_domain`` keep working.
+    """
     results = []
     total_penalty = 0
     max_possible_penalty = 0
     critical_fails = []
     warnings = []
 
-    for name, category, w_fail, w_warn, fn in CHECKS:
-        max_possible_penalty += w_fail   # worst-case scoring baseline
+    # Per-domain accumulator: {domain: {pass, warn, fail, skip,
+    # penalty, max_penalty}}
+    domain_stats: dict = {
+        d: {"pass": 0, "warn": 0, "fail": 0, "skip": 0,
+            "penalty": 0, "max_penalty": 0}
+        for d in DOMAINS
+    }
+
+    for name, category, domain, w_fail, w_warn, fn in CHECKS:
+        max_possible_penalty += w_fail
+        if domain not in domain_stats:
+            # Robust to future check entries with a domain we forgot
+            # to add to DOMAINS — they get tracked but won't appear in
+            # the canonical UI ordering.
+            domain_stats[domain] = {
+                "pass": 0, "warn": 0, "fail": 0, "skip": 0,
+                "penalty": 0, "max_penalty": 0,
+            }
+        domain_stats[domain]["max_penalty"] += w_fail
 
         try:
             result = fn(fp, template)
@@ -393,40 +440,41 @@ def validate(fp: dict, template: dict) -> dict:
             result = ("warn", f"check error: {type(e).__name__}: {e}")
 
         if result is None:
-            # Field missing — check skipped. We don't penalize for missing
-            # data: a runtime scan might be partial. But note it.
             results.append({
-                "name": name, "category": category,
+                "name": name, "category": category, "domain": domain,
                 "status": "skip",
                 "detail": "field not present in fingerprint",
             })
+            domain_stats[domain]["skip"] += 1
             continue
 
         status, detail = result
-        entry = {
-            "name": name, "category": category,
+        results.append({
+            "name": name, "category": category, "domain": domain,
             "status": status, "detail": detail,
-        }
-        results.append(entry)
+        })
 
-        if status == "fail":
+        if status == "pass":
+            domain_stats[domain]["pass"] += 1
+        elif status == "fail":
             total_penalty += w_fail
+            domain_stats[domain]["fail"] += 1
+            domain_stats[domain]["penalty"] += w_fail
             if category == "critical":
                 critical_fails.append(f"{name}: {detail}")
             else:
                 warnings.append(f"{name}: {detail}")
         elif status == "warn":
             total_penalty += w_warn
+            domain_stats[domain]["warn"] += 1
+            domain_stats[domain]["penalty"] += w_warn
             warnings.append(f"{name}: {detail}")
 
-    # Score — bounded 0-100, scaled against max possible penalty
-    # We clamp because max_possible is theoretical worst, almost never hit
-    # Use a softer denominator so that hitting all warnings ≈ 80 score
+    # Aggregate score — same formula as before
     denom = max_possible_penalty * 0.5
     score = max(0, min(100, round(100 - (total_penalty / denom * 100)
                                    if denom else 100)))
 
-    # Grade mapping — user-friendly labels
     if score >= 90:
         grade = "excellent"
     elif score >= 75:
@@ -436,6 +484,34 @@ def validate(fp: dict, template: dict) -> dict:
     else:
         grade = "critical"
 
+    # Per-domain score (same scaling) + grade
+    by_domain: dict = {}
+    for d in (list(DOMAINS) + [k for k in domain_stats if k not in DOMAINS]):
+        s = domain_stats[d]
+        total = s["pass"] + s["warn"] + s["fail"] + s["skip"]
+        if total == 0:
+            continue
+        d_denom = s["max_penalty"] * 0.5
+        d_score = max(0, min(100, round(100 - (s["penalty"] / d_denom * 100)
+                                         if d_denom else 100)))
+        if d_score >= 90:
+            d_grade = "excellent"
+        elif d_score >= 75:
+            d_grade = "good"
+        elif d_score >= 55:
+            d_grade = "warning"
+        else:
+            d_grade = "critical"
+        by_domain[d] = {
+            "score":   d_score,
+            "grade":   d_grade,
+            "pass":    s["pass"],
+            "warn":    s["warn"],
+            "fail":    s["fail"],
+            "skip":    s["skip"],
+            "total":   total,
+        }
+
     summary = (
         f"{score}/100 — "
         f"{len(critical_fails)} critical, "
@@ -443,13 +519,14 @@ def validate(fp: dict, template: dict) -> dict:
     )
 
     return {
-        "score":     score,
-        "grade":     grade,
-        "summary":   summary,
-        "checks":    results,
-        "critical":  critical_fails,
-        "warnings":  warnings,
-        "template_id":   template.get("id"),
+        "score":          score,
+        "grade":          grade,
+        "summary":        summary,
+        "checks":         results,
+        "by_domain":      by_domain,
+        "critical":       critical_fails,
+        "warnings":       warnings,
+        "template_id":    template.get("id"),
         "template_label": template.get("label"),
     }
 

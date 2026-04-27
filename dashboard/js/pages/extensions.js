@@ -443,11 +443,19 @@ const ExtensionsPage = (() => {
       <div class="ext-detail-actions">
         <button class="btn btn-secondary btn-small" id="ext-detail-reveal-id"
                 title="Copy the extension ID to clipboard">📋 Copy ID</button>
+        <button class="btn btn-secondary btn-small" id="ext-detail-test-solo"
+                title="Spawn an isolated Chrome with only this extension to verify it loads cleanly. Catches errors the manifest gate doesn't (missing service_worker file, broken default_locale, etc).">
+          🧪 Test solo
+        </button>
         <div style="flex: 1;"></div>
         <button class="btn btn-danger btn-small" id="ext-detail-remove">
           🗑 Remove from pool
         </button>
       </div>
+      <!-- Test result panel — populated by the Test solo handler.
+           Hidden until the user clicks Test solo. Shows pass/fail
+           verdict + first error/warning + log excerpt. -->
+      <div id="ext-detail-solo-result" class="ext-solo-result" style="display: none;"></div>
     `;
   }
 
@@ -517,6 +525,12 @@ const ExtensionsPage = (() => {
       }
     });
 
+    // Test solo — isolate this extension in a fresh Chrome to verify
+    // it actually loads at runtime. Useful when the manifest gate
+    // accepted it but a profile launch keeps failing — narrows the
+    // cause from "one of N extensions" to "this specific one".
+    $("#ext-detail-test-solo")?.addEventListener("click", () => testSolo(x));
+
     // Copy ID
     $("#ext-detail-reveal-id")?.addEventListener("click", () => {
       navigator.clipboard?.writeText(x.id).then(
@@ -550,6 +564,153 @@ const ExtensionsPage = (() => {
     for (const { cb, want } of targets) {
       cb.checked = want;
       cb.dispatchEvent(new Event("change"));
+    }
+  }
+
+  // ── Solo test — isolate one extension in a fresh Chrome ──────
+  // Calls /api/extensions/<id>/test-solo (backend in dashboard/server.py
+  // → ghost_shell.extensions.solo_test.test_extension). Renders the
+  // verdict inline below the action buttons.
+  async function testSolo(x) {
+    const btn   = document.getElementById("ext-detail-test-solo");
+    const panel = document.getElementById("ext-detail-solo-result");
+    if (!btn || !panel) return;
+
+    const origLabel = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = "⏳ Testing…";
+    panel.style.display = "";
+    panel.className = "ext-solo-result is-pending";
+    panel.innerHTML = `
+      <div class="ext-solo-line">
+        Spawning an isolated Chrome with only this extension…
+        <span class="muted">(typically 5-8 seconds)</span>
+      </div>
+    `;
+
+    try {
+      // Step 1: enqueue the job. Backend returns 202 + job_id.
+      const enq = await api(
+        `/api/extensions/${encodeURIComponent(x.id)}/test-solo`,
+        { method: "POST", body: JSON.stringify({ timeout: 8 }) }
+      );
+      const jobId = enq && enq.job_id;
+      if (!jobId) {
+        throw new Error(enq?.reason || "no job_id returned");
+      }
+
+      // Step 2: poll /api/jobs/<id> at 1Hz until done/error.
+      // Update the panel periodically so the user sees progress.
+      const result = await new Promise((resolve, reject) => {
+        const POLL_MS = 1000;
+        const MAX_POLLS = 60;   // hard cap = 60s, well past timeout
+        let polls = 0;
+        const tick = async () => {
+          polls += 1;
+          try {
+            const st = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+            // Update progress text on slow runs
+            if (st.status === "queued") {
+              const line = panel.querySelector(".ext-solo-line");
+              if (line) line.textContent = "Waiting for worker (queue)…";
+            } else if (st.status === "running") {
+              const line = panel.querySelector(".ext-solo-line");
+              if (line) {
+                line.innerHTML =
+                  `Spawning isolated Chrome with only this extension… ` +
+                  `<span class="muted">(${st.elapsed || 0}s)</span>`;
+              }
+            }
+            if (st.status === "done") {
+              resolve(st.result);
+              return;
+            }
+            if (st.status === "error") {
+              reject(new Error(st.error || "job failed"));
+              return;
+            }
+            if (polls >= MAX_POLLS) {
+              reject(new Error("polling timed out"));
+              return;
+            }
+            setTimeout(tick, POLL_MS);
+          } catch (e) {
+            reject(e);
+          }
+        };
+        setTimeout(tick, POLL_MS);
+      });
+
+      // Verdict styling
+      const status = result.status || "error";
+      const cls    = status === "loads"    ? "is-ok"
+                   : status === "warnings" ? "is-warn"
+                   : "is-fail";
+      const icon   = status === "loads"    ? "✅"
+                   : status === "warnings" ? "⚠"
+                   : "❌";
+      panel.className = `ext-solo-result ${cls}`;
+
+      const errorsHtml = (result.errors || []).length
+        ? `<div class="ext-solo-section">
+             <div class="ext-solo-section-label">Errors (${result.errors.length})</div>
+             <ul class="ext-solo-list">
+               ${result.errors.slice(0, 5).map(e =>
+                 `<li><code>${escapeHtml(e)}</code></li>`).join("")}
+             </ul>
+           </div>`
+        : "";
+      const warningsHtml = (result.warnings || []).length
+        ? `<div class="ext-solo-section">
+             <div class="ext-solo-section-label">Warnings (${result.warnings.length})</div>
+             <ul class="ext-solo-list">
+               ${result.warnings.slice(0, 5).map(w =>
+                 `<li><code>${escapeHtml(w)}</code></li>`).join("")}
+             </ul>
+           </div>`
+        : "";
+      const excerptHtml = result.log_excerpt
+        ? `<details class="ext-solo-details">
+             <summary>chrome_debug.log tail</summary>
+             <pre class="ext-solo-log">${escapeHtml(result.log_excerpt)}</pre>
+           </details>`
+        : "";
+
+      panel.innerHTML = `
+        <div class="ext-solo-verdict">
+          <span class="ext-solo-icon">${icon}</span>
+          <span class="ext-solo-status">${status.toUpperCase()}</span>
+          <span class="ext-solo-duration">${result.duration ?? "?"}s</span>
+          ${result.exit_code !== null && result.exit_code !== undefined
+            ? `<span class="ext-solo-exit">exit ${result.exit_code}</span>`
+            : ""}
+        </div>
+        <div class="ext-solo-reason">${escapeHtml(result.reason || "")}</div>
+        ${errorsHtml}
+        ${warningsHtml}
+        ${excerptHtml}
+      `;
+
+      if (status === "loads") {
+        toast("✓ Extension loads cleanly");
+      } else if (status === "warnings") {
+        toast("⚠ Loads with warnings — see panel", false);
+      } else {
+        toast("✗ Extension does NOT load — see panel", true);
+      }
+    } catch (e) {
+      panel.className = "ext-solo-result is-fail";
+      panel.innerHTML = `
+        <div class="ext-solo-verdict">
+          <span class="ext-solo-icon">❌</span>
+          <span class="ext-solo-status">ERROR</span>
+        </div>
+        <div class="ext-solo-reason">Test endpoint failed: ${escapeHtml(e.message || String(e))}</div>
+      `;
+      toast(`Test failed: ${e.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = origLabel;
     }
   }
 

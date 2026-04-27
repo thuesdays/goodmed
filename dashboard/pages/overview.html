@@ -23,6 +23,25 @@
     </div>
   </div>
 
+  <!-- Health banner — Chrome/chromedriver version compatibility.
+       Hidden by default; populated and unhidden by overview.js when
+       /api/health/versions returns a non-ok verdict. Critical
+       (red) for major-version mismatch — sessions will fail until
+       binaries are re-deployed in matched versions. Warn (amber)
+       for missing binaries / unprobeable versions. -->
+  <div id="ov-health-banner" class="health-banner" style="display: none;"
+       role="alert" aria-live="polite">
+    <div class="health-banner-icon" id="ov-health-icon">⚠</div>
+    <div class="health-banner-body">
+      <div class="health-banner-title" id="ov-health-title">—</div>
+      <div class="health-banner-detail" id="ov-health-detail">—</div>
+    </div>
+    <button type="button" class="btn btn-secondary btn-sm"
+            id="ov-health-recheck" title="Force re-probe (bypass cache)">
+      Re-check
+    </button>
+  </div>
+
   <!-- ═══ Operational status hero (5 colour-coded tiles) ══════ -->
   <div class="ov-hero">
     <a href="#" data-nav="accounts" class="ov-tile ov-tile-vault">

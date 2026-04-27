@@ -314,6 +314,190 @@ html, body {
 .page-title    { font-size: 22px; font-weight: 600; }
 .page-subtitle { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
 
+/* ─── HEALTH BANNER ───
+   Top-of-page alert for environment-level problems the dashboard
+   detected (Chrome/chromedriver version mismatch, missing binaries,
+   etc.). Hidden by default; populated and revealed by overview.js
+   when /api/health/versions returns a non-ok verdict.
+
+   Two severity levels via modifier classes:
+     .is-critical  red — Chrome won't launch
+     .is-warn      amber — degraded / unknown but maybe usable
+*/
+.health-banner {
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 16px;
+  margin-bottom: 24px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #1f1f1f);
+}
+.health-banner.is-critical {
+  border-color: #d74848;
+  background: rgba(215, 72, 72, 0.08);
+}
+.health-banner.is-warn {
+  border-color: #d4a83a;
+  background: rgba(212, 168, 58, 0.08);
+}
+.health-banner-icon {
+  font-size: 20px; line-height: 1;
+  flex: 0 0 auto;
+}
+.health-banner.is-critical .health-banner-icon { color: #ff6b6b; }
+.health-banner.is-warn     .health-banner-icon { color: #ffc857; }
+.health-banner-body { flex: 1; min-width: 0; }
+.health-banner-title {
+  font-weight: 600; font-size: 14px;
+  margin-bottom: 2px;
+}
+.health-banner-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.health-banner .btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+/* ─── EXT SOLO TEST RESULT PANEL ───
+   Inline verdict block under the extension detail page's action
+   buttons. Three severity states (is-ok, is-warn, is-fail) plus
+   transient is-pending. Renders verdict header + reason + optional
+   errors/warnings lists + collapsible chrome_debug.log tail. */
+.ext-solo-result {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #1f1f1f);
+  font-size: 13px;
+}
+.ext-solo-result.is-ok      { border-color: #4caf72; background: rgba(76, 175, 114, 0.08); }
+.ext-solo-result.is-warn    { border-color: #d4a83a; background: rgba(212, 168, 58, 0.08); }
+.ext-solo-result.is-fail    { border-color: #d74848; background: rgba(215, 72, 72, 0.08); }
+.ext-solo-result.is-pending { border-color: var(--accent, #6a8aff); background: rgba(106, 138, 255, 0.06); }
+.ext-solo-line { color: var(--text-muted); }
+
+.ext-solo-verdict {
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 600; font-size: 14px;
+  margin-bottom: 4px;
+}
+.ext-solo-icon     { font-size: 16px; }
+.ext-solo-status   { letter-spacing: 0.5px; }
+.ext-solo-duration { color: var(--text-muted); font-size: 12px; font-weight: 400; }
+.ext-solo-exit {
+  color: var(--text-muted);
+  font-size: 11px; font-weight: 400;
+  padding: 2px 6px; border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+  font-family: ui-monospace, monospace;
+}
+.ext-solo-reason {
+  color: var(--text-secondary, #c0c0c0);
+  font-size: 12px;
+  margin-bottom: 8px;
+  line-height: 1.45;
+}
+
+.ext-solo-section { margin-top: 10px; }
+.ext-solo-section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.ext-solo-list {
+  margin: 0; padding-left: 16px;
+  list-style: square;
+}
+.ext-solo-list li {
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.ext-solo-list code {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--text-secondary, #c0c0c0);
+  background: transparent;
+}
+
+.ext-solo-details {
+  margin-top: 10px;
+  font-size: 12px;
+}
+.ext-solo-details > summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  user-select: none;
+}
+.ext-solo-details > summary:hover { color: var(--text-secondary, #c0c0c0); }
+.ext-solo-log {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-muted);
+}
+
+/* ─── FINGERPRINT PER-DOMAIN PILLS ───
+   Renders the 4 axis breakdowns (identity / hardware / network /
+   automation) as a row of compact pills below the main FP card row.
+   Re-uses the existing fp-score-{grade} colour classes for parity
+   with the main score badge. */
+.profile-fp-domains {
+  display: flex; flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color, #2a2a2a);
+}
+.fp-domain-pill {
+  display: inline-flex; align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--border-color, #444);
+  background: var(--bg-secondary, #1f1f1f);
+}
+.fp-domain-pill.fp-score-excellent { border-color: #4caf72; background: rgba(76, 175, 114, 0.10); }
+.fp-domain-pill.fp-score-good      { border-color: #8ab86a; background: rgba(138, 184, 106, 0.08); }
+.fp-domain-pill.fp-score-warning   { border-color: #d4a83a; background: rgba(212, 168, 58, 0.08); }
+.fp-domain-pill.fp-score-critical  { border-color: #d74848; background: rgba(215, 72, 72, 0.10); }
+.fp-domain-pill.fp-score-unknown   { opacity: 0.7; }
+.fp-domain-icon  { font-size: 13px; }
+.fp-domain-label {
+  font-weight: 500;
+  text-transform: capitalize;
+  color: var(--text-secondary, #d0d0d0);
+}
+.fp-domain-score {
+  font-family: ui-monospace, monospace;
+  font-weight: 600;
+  font-size: 12px;
+}
+.fp-domain-fail, .fp-domain-warn {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 500;
+}
+.fp-domain-fail { background: rgba(215, 72, 72, 0.18); color: #ff9595; }
+.fp-domain-warn { background: rgba(212, 168, 58, 0.18); color: #ffd47a; }
+
 /* ─── CARDS ─── */
 /*
  * Every card gets a subtle left-edge accent bar. It's 2px wide and
