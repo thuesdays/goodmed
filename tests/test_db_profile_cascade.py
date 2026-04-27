@@ -21,12 +21,29 @@ def fresh_db(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "ghost_shell.core.platform_paths.PROJECT_ROOT", str(tmp_path)
     )
-    # Reset singleton
+    # Sprint 10.2: same gotcha as test_backup.py / conftest.py:
+    # the actual singleton is _db_instance (lowercase); DB_PATH is
+    # read at module-import-time; DB._local is class-level
+    # threading.local(). All three need explicit reset for a true
+    # fresh DB per test.
     import ghost_shell.db.database as db_mod
+    monkeypatch.setenv("GHOST_SHELL_DB", str(db_path))
+    monkeypatch.setattr(db_mod, "DB_PATH", str(db_path))
+    db_mod._db_instance = None
     if hasattr(db_mod, "_DB_INSTANCE"):
         db_mod._DB_INSTANCE = None
     if hasattr(db_mod, "_DB"):
         db_mod._DB = None
+    if hasattr(db_mod, "DB") and hasattr(db_mod.DB, "_local"):
+        if hasattr(db_mod.DB._local, "conn"):
+            try:
+                db_mod.DB._local.conn.close()
+            except Exception:
+                pass
+            try:
+                delattr(db_mod.DB._local, "conn")
+            except Exception:
+                pass
 
     db = db_mod.get_db()
     return db

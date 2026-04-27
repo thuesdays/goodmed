@@ -91,8 +91,14 @@ def test_liveness_no_runs_returns_false():
     assert pr.is_profile_actually_running(db, "p1") is False
 
 
-def test_liveness_fresh_heartbeat_returns_true():
+def test_liveness_fresh_heartbeat_returns_true(monkeypatch):
+    """Sprint 10.2: classify_run_liveness Case C tries
+    ``psutil.pid_exists(123)``. On a real machine PID 123 almost
+    certainly doesn't exist, so the assertion would fail. Force
+    HAVE_PSUTIL=False so Case B (heartbeat-only) handles it — that
+    branch returns alive purely from the fresh heartbeat."""
     from ghost_shell.core import process_reaper as pr
+    monkeypatch.setattr(pr, "HAVE_PSUTIL", False)
     db = MagicMock()
     db.runs_live_for_profile.return_value = [_mk_run_row(123, hb_offset_sec=-30)]
     assert pr.is_profile_actually_running(db, "p1") is True

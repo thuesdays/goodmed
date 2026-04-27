@@ -133,3 +133,14 @@ def in_memory_db(monkeypatch, tmp_path):
     db_mod._db_instance = None
     if hasattr(db_mod, "_DB_INSTANCE"):
         db_mod._DB_INSTANCE = None
+
+# Sprint 10.2: pytest 9 dropped collect_ignore_glob from .ini files;
+# the equivalent must live in conftest.py. These three files use the
+# test_ prefix but have function args (host, port, proxy_url) that
+# pytest tries to resolve as fixtures. They're standalone integration
+# scripts meant to be run as `python tests/test_proxy_live.py`.
+collect_ignore = [
+    "test_chromedriver.py",
+    "test_proxy_live.py",
+    "test_proxy_rotation.py",
+]

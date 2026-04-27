@@ -105,19 +105,32 @@ def test_verdict_match_returns_ok(monkeypatch):
     assert v["level"] == "ok"
 
 
-def test_verdict_match_case_insensitive():
-    from ghost_shell.fingerprint.ja3_check import verdict_for
-    v = verdict_for(
+def test_verdict_match_case_insensitive(monkeypatch):
+    """Sprint 10.2: Sprint 3.2 cleared EXPECTED_JA3_BY_MAJOR[149] to
+    avoid the placeholder-hash regression. Tests that need a known
+    sentinel must inject one via monkeypatch."""
+    from ghost_shell.fingerprint import ja3_check
+    monkeypatch.setattr(
+        ja3_check, "EXPECTED_JA3_BY_MAJOR",
+        {149: ["cd08e31494f9531f560d64c695473da9"]},
+    )
+    v = ja3_check.verdict_for(
         {"ja3": "CD08E31494F9531F560D64C695473DA9"},
         expected_chrome_major=149,
     )
     assert v["ok"] is True
 
 
-def test_verdict_mismatch_critical():
-    from ghost_shell.fingerprint.ja3_check import verdict_for
+def test_verdict_mismatch_critical(monkeypatch):
+    """Sprint 10.2: same monkeypatch pattern — provide a sentinel
+    EXPECTED so the verdict logic has something to mismatch against."""
+    from ghost_shell.fingerprint import ja3_check
+    monkeypatch.setattr(
+        ja3_check, "EXPECTED_JA3_BY_MAJOR",
+        {149: ["cd08e31494f9531f560d64c695473da9"]},
+    )
     fake_drift = "00112233445566778899aabbccddeeff"
-    v = verdict_for({"ja3": fake_drift}, expected_chrome_major=149)
+    v = ja3_check.verdict_for({"ja3": fake_drift}, expected_chrome_major=149)
     assert v["ok"] is False
     assert v["level"] == "critical"
     assert "mismatch" in v["reason"].lower()

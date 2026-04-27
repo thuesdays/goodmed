@@ -3924,7 +3924,7 @@ class DB:
         if site:
             sql += " AND site = ?"
             params.append(site)
-        sql += " ORDER BY checked_at DESC LIMIT ?"
+        sql += " ORDER BY checked_at DESC, id DESC LIMIT ?"  # Sprint 10.2: deterministic tiebreaker for second-precision timestamps
         params.append(int(limit))
         rows = self._get_conn().execute(sql, params).fetchall()
         return [dict(r) for r in rows]
