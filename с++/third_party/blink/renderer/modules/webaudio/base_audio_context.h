@@ -117,11 +117,32 @@ class MODULES_EXPORT BaseAudioContext
   // Cannot be called from the audio thread.
   AudioDestinationNode* destination() const;
   float sampleRate() const {
-    // --- GHOST SHELL CORE PATCH ---
-    if (GhostShellConfig::GetInstance().IsActive()) {
-      return GhostShellConfig::GetInstance().GetAudioSampleRate();
+    // --- GHOST SHELL CORE PATCH (Tier 1 #1) ---
+    // Override hardware-reported sample rate with per-profile target
+    // (default 48000) plus small per-profile integer jitter from
+    // GetAudioRateJitter() (typically ±2 Hz, deterministic per profile).
+    // The jitter band keeps two profiles on the same template
+    // distinguishable while staying within the validator's tolerance
+    // (Sprint 11.2 relaxed audio_rate_in_jitter_band to ±2 Hz).
+    //
+    // Only applied to realtime AudioContext — OfflineAudioContext must
+    // return its constructor-supplied rate verbatim (fingerprinters that
+    // do `new OfflineAudioContext(2, 44100, 44100).sampleRate` expect
+    // 44100 back; mismatch is itself a tell).
+    //
+    // GetAudioSampleRate() == 0 means "config did not set this field" —
+    // fall back to the hardware value so we don't accidentally report
+    // 0 Hz on profiles that never enabled audio enforcement.
+    auto& gs_cfg = GhostShellConfig::GetInstance();
+    if (gs_cfg.IsActive() &&
+        const_cast<BaseAudioContext*>(this)->HasRealtimeConstraint()) {
+      const int gs_base = gs_cfg.GetAudioSampleRate();
+      if (gs_base > 0) {
+        const int gs_jit = gs_cfg.GetAudioRateJitter();
+        return static_cast<float>(gs_base + gs_jit);
+      }
     }
-    // ------------------------------
+    // ------------------------------------------
     return destination_handler_->SampleRate();
   }
   double currentTime() const { return destination_handler_->CurrentTime(); }

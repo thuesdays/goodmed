@@ -728,6 +728,95 @@ def _read_varint(buf: bytes, offset: int) -> tuple[Optional[int], int]:
     return None, 0
 
 
+def validate_crx_integrity(crx_bytes: bytes) -> tuple[bool, str]:
+    """Polish #2 — lightweight CRX integrity validation.
+
+    Catches the realistic tampering vectors WITHOUT pulling RSA crypto
+    as a dependency. Returns (ok, reason). On ok=False, reason is a
+    human-readable explanation; callers should refuse the import.
+
+    Checks:
+      1. Minimum length (not a zero-byte / placeholder file)
+      2. CRX3 magic bytes (or accept plain ZIP for unpacked imports)
+      3. Header length sanity (no integer-overflow attacks)
+      4. ZIP central directory parses (zipfile.BadZipFile on tamper)
+      5. ZIP entry count in a sane range (1 ≤ N ≤ 10000)
+      6. No zip-slip: every entry name must be relative + not contain
+         ".." segments. Chrome's CRX unpacker rejects these too, but
+         our temp dir extraction would happily follow them.
+      7. manifest.json present in the archive
+
+    What this DOESN'T verify (would require RSA via `cryptography`):
+      - That the CRX3 RSA signature actually matches the SignedData
+        block. A rebundled CRX with mismatched pubkey would still
+        pass this check. Acceptable trade since Chrome itself will
+        refuse the broken CRX at load time, and we'd notice.
+    """
+    if len(crx_bytes) < 64:
+        return False, "file too short to be a valid CRX"
+
+    is_crx = crx_bytes[:4] == CRX3_MAGIC
+    if is_crx:
+        if len(crx_bytes) < 16:
+            return False, "CRX header truncated"
+        version = struct.unpack("<I", crx_bytes[4:8])[0]
+        if version == 3:
+            header_size = struct.unpack("<I", crx_bytes[8:12])[0]
+            # Sanity: header should never exceed 1 MB. Real CRX3 headers
+            # are 1-4 KB; >1 MB is either corruption or attack.
+            if header_size > 1_048_576:
+                return False, f"CRX3 header_size implausibly large: {header_size}"
+            if 12 + header_size > len(crx_bytes):
+                return False, "CRX3 header extends past EOF"
+        elif version == 2:
+            if len(crx_bytes) < 16:
+                return False, "CRX2 header truncated"
+            pubkey_len = struct.unpack("<I", crx_bytes[8:12])[0]
+            sig_len    = struct.unpack("<I", crx_bytes[12:16])[0]
+            if pubkey_len > 65536 or sig_len > 65536:
+                return False, "CRX2 pubkey/sig length implausible"
+            if 16 + pubkey_len + sig_len > len(crx_bytes):
+                return False, "CRX2 header extends past EOF"
+        else:
+            return False, f"unsupported CRX version {version}"
+
+    # Extract the ZIP portion (regardless of whether it's a CRX or
+    # plain ZIP). _crx_to_zip handles both — but we want to call it
+    # with the same logic, so just re-do the strip lightweight here:
+    if is_crx:
+        try:
+            zip_part, _ = _crx_to_zip(crx_bytes)
+        except Exception as e:
+            return False, f"CRX header parse failed: {e}"
+    else:
+        zip_part = crx_bytes
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_part)) as zf:
+            names = zf.namelist()
+            if not names:
+                return False, "ZIP is empty"
+            if len(names) > 10000:
+                return False, f"ZIP entry count implausible: {len(names)}"
+            for n in names:
+                if n.startswith("/") or n.startswith("\\"):
+                    return False, f"absolute path in ZIP: {n!r}"
+                # Reject any segment that's exactly ".." — the safest
+                # rule. Don't try to canonicalise: forward and back
+                # slashes both count as separators on Windows.
+                segs = n.replace("\\", "/").split("/")
+                if any(s == ".." for s in segs):
+                    return False, f"zip-slip path in ZIP: {n!r}"
+            if "manifest.json" not in names:
+                return False, "no manifest.json in ZIP"
+    except zipfile.BadZipFile as e:
+        return False, f"corrupt ZIP body: {e}"
+    except Exception as e:
+        return False, f"ZIP probe failed: {e}"
+
+    return True, ""
+
+
 def _crx_to_zip(crx_bytes: bytes) -> tuple[bytes, Optional[bytes]]:
     """Strip CRX header, return (zip_bytes, embedded_pubkey_or_None).
 
@@ -793,6 +882,16 @@ def add_from_crx(crx_bytes: bytes,
          own merge logic
     """
     _ensure_pool_dir()
+
+    # Polish #2 — CRX integrity gate. Reject obviously broken /
+    # tampered / zip-slip-vulnerable archives BEFORE we extract them
+    # into a temp dir. This catches: empty files, magic-byte-mangled
+    # CRX, zip-slip, missing manifest. Full RSA signature verify is
+    # left to Chrome's own loader.
+    ok, reason = validate_crx_integrity(crx_bytes)
+    if not ok:
+        raise ValueError(f"CRX integrity check failed: {reason}")
+
     zip_bytes, pubkey = _crx_to_zip(crx_bytes)
 
     candidate_id = extension_id_from_pubkey(pubkey) if pubkey else None

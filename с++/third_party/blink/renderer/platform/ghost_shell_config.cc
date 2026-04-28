@@ -287,6 +287,31 @@ void GhostShellConfig::Initialize() {
     }
   }
 
+  // ─── TLS / JA3 (Tier 1 #4) ─────────────────────────────
+  // Payload shape:
+  //   "tls": {
+  //     "cipher_suites":     [4865, 4866, 4867, 49195, 49199, ...],
+  //     "supported_groups":  [29, 23, 24]
+  //   }
+  // IDs are wire-format uint16 values (RFC8446). Empty / missing
+  // sections leave the existing BoringSSL defaults untouched. Non-int
+  // entries are skipped silently — strict validation belongs in the
+  // Python config builder, not here in the renderer.
+  tls_cipher_suites_.clear();
+  tls_supported_groups_.clear();
+  if (const auto* tls = dict.FindDict("tls")) {
+    if (const auto* ciphers = tls->FindList("cipher_suites")) {
+      for (const auto& v : *ciphers) {
+        if (v.is_int()) tls_cipher_suites_.push_back(v.GetInt());
+      }
+    }
+    if (const auto* groups = tls->FindList("supported_groups")) {
+      for (const auto& v : *groups) {
+        if (v.is_int()) tls_supported_groups_.push_back(v.GetInt());
+      }
+    }
+  }
+
   // Use VLOG(1) instead of LOG(INFO) so these only appear when explicitly
   // debugging via --v=1 / --enable-logging. Prevents console spam in
   // normal runs where Chromium spawns renderers/GPU/utility subprocesses.
@@ -341,5 +366,34 @@ bool GhostShell_IsActive() {
 }
 int GhostShell_GetRandomSeed() {
   return blink::GhostShellConfig::GetInstance().GetRandomSeed();
+}
+
+// Tier 1 #4 — JA3 cipher suites bridge.
+// Copies up to `max` u16 values from the per-profile cipher list into
+// `out`. Returns the count actually written (or 0 if inactive / list
+// empty / out null). BoringSSL uses the count to decide whether to
+// override its default cipher selection.
+int GhostShell_GetTLSCipherSuites(unsigned short* out, int max) {
+  auto& cfg = blink::GhostShellConfig::GetInstance();
+  if (!cfg.IsActive() || !out || max <= 0) return 0;
+  const auto& list = cfg.GetTLSCipherSuites();
+  int n = 0;
+  for (int v : list) {
+    if (n >= max) break;
+    out[n++] = static_cast<unsigned short>(v & 0xFFFF);
+  }
+  return n;
+}
+
+int GhostShell_GetTLSSupportedGroups(unsigned short* out, int max) {
+  auto& cfg = blink::GhostShellConfig::GetInstance();
+  if (!cfg.IsActive() || !out || max <= 0) return 0;
+  const auto& list = cfg.GetTLSSupportedGroups();
+  int n = 0;
+  for (int v : list) {
+    if (n >= max) break;
+    out[n++] = static_cast<unsigned short>(v & 0xFFFF);
+  }
+  return n;
 }
 }

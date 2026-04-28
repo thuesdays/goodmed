@@ -1039,45 +1039,14 @@ class GhostShellBrowser:
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-popup-blocking")
 
-        # Sprint 11: per-profile C++ stealth flags. These hit the
-        # Tier-2 patches in chromium_patches/ — Skia canvas noise,
-        # WebRTC ICE filter, BoringSSL JA3 ordering, font privacy
-        # budget. Each patch silently no-ops when its flag is absent
-        # OR when the running chrome.exe wasn't built from a patched
-        # tree, so this code is forward-safe even on operators who
-        # haven't applied the patches yet.
-        #
-        # The seeds are derived deterministically from (profile_id,
-        # profile_name) so two launches of the same profile produce
-        # the same canvas hash, the same JA3, the same font list —
-        # i.e. a cross-session identity that's stable in the way a
-        # real user is, but uncorrelated with other profiles on the
-        # same host.
-        try:
-            from ghost_shell.fingerprint.profile_seed import build_chrome_args
-            # profile_id is optional — pulled from the DB if available.
-            # Falls back to None which keys the seed off name only.
-            _profile_id = None
-            try:
-                from ghost_shell.db.database import get_db
-                _row = get_db()._get_conn().execute(
-                    "SELECT id FROM profiles WHERE name = ?",
-                    (self.profile_name,)
-                ).fetchone()
-                if _row:
-                    _profile_id = int(_row["id"])
-            except Exception:
-                pass
-            for flag in build_chrome_args(_profile_id, self.profile_name):
-                options.add_argument(flag)
-        except Exception as e:
-            # Stealth-flag injection failures are NEVER fatal — we
-            # log and proceed with stock launch. A misconfigured
-            # salt or missing module shouldn't prevent a run.
-            logging.debug(
-                f"[stealth-flags] profile-seed flag injection "
-                f"skipped: {e}"
-            )
+        # Sprint 12 Tier 0: per-profile C++ stealth state is no longer
+        # passed via per-feature CLI flags. The four Tier-2 patches
+        # (canvas noise, WebRTC ICE filter, BoringSSL JA3,
+        # font allowlist) all read from GhostShellConfig — the
+        # singleton populated once on launch from the existing
+        # --ghost-shell-payload base64 JSON. Adding new fingerprint
+        # fields therefore touches only GhostShellConfig + the JSON
+        # encoder, NOT this Python file.
 
         # ── Per-profile extensions ───────────────────────────────────
         # Pull the assigned extension list from DB and inject the
@@ -1366,6 +1335,23 @@ class GhostShellBrowser:
         options.add_argument("--safebrowsing-disable-auto-update")
         options.add_argument("--disable-sync")
         options.add_argument("--disable-translate")
+        # Sprint 12 / Tier 2 #5 — stealth defense-in-depth:
+        # We already have a C++ patch on navigator.webdriver (always
+        # returns false), but the AutomationControlled blink-feature
+        # also strips other webdriver-related signals (chrome.runtime
+        # presence under controlled conditions, contentscript markers).
+        # Belt-and-suspenders: kill it from CLI too. Cheap and stable.
+        options.add_argument(
+            "--disable-blink-features=AutomationControlled")
+        # Polish #3 — kill the extension-store auto-update poll
+        # (CRX manifest fetch to clients2.google.com/service/update2/crx
+        # that fires every ~5 hours per installed extension). Background
+        # traffic over a paid proxy + screams "Chrome with extensions"
+        # to traffic profilers. `--disable-component-update` already
+        # kills the broader component updater; this stops the per-
+        # extension timer specifically.
+        options.add_argument("--extensions-not-webstore")
+        options.add_argument("--disable-default-apps")
         # ONE unified --disable-features flag. Chrome overwrites duplicates,
         # so we merge WebRtcHideLocalIpsWithMdns (fingerprint hardening)
         # with traffic-saving feature disables AND any per-launch features
@@ -1384,6 +1370,28 @@ class GhostShellBrowser:
             "Translate",
             "AutofillServerCommunication",
             "CertificateTransparencyComponentUpdater",
+            # Sprint 12 / Tier 2 #5 — additional stealth + traffic kills.
+            # AcceptCHFrame              — server-driven Client Hints
+            #                              probe; hits even on fresh nav
+            # DialMediaRouteProvider     — Cast/DIAL discovery, mDNS leak
+            # IsolateOrigins             — when off, fewer process boundary
+            #                              ETW signals on Windows
+            # LazyFrameLoading           — small but consistent timing tell
+            # GlobalMediaControls        — UI-side, also taps a reporter
+            # DestroyProfileOnBrowserClose
+            #                            — keeps cookies stable run→run
+            # AutoExpandDetailsElement   — tiny semantic timing diff
+            # AvoidUnnecessaryBeforeUnloadCheckSync
+            #                            — async path triggers sync probe
+            # ExtensionsManifestV3UnpackerOverhead — disable manifest probe
+            "AcceptCHFrame",
+            "DialMediaRouteProvider",
+            "IsolateOrigins",
+            "LazyFrameLoading",
+            "GlobalMediaControls",
+            "DestroyProfileOnBrowserClose",
+            "AutoExpandDetailsElement",
+            "AvoidUnnecessaryBeforeUnloadCheckSync",
         ]
         _disable_features += list(getattr(self, "_extra_disable_features", []))
         # de-dupe while preserving order (some Chrome builds care)
@@ -1406,6 +1414,16 @@ class GhostShellBrowser:
             "net.network_prediction_options": 2,  # 2 = disabled
             # Don't upload usage metrics to Google
             "user_experience_metrics.reporting_enabled": False,
+            # Polish #3 — kill the extension auto-update timer at
+            # the pref level so even if the CLI flag misses a path,
+            # the scheduler is disabled in the profile prefs. Note:
+            # extensions still load; only the periodic CWS poll dies.
+            "extensions.autoupdate.enabled": False,
+            "extensions.autoupdate.next_check": 0,
+            # Don't dial home for first-run experience messaging
+            "browser.startup_pages_pref_migration_state": 1,
+            # Don't upload crash reports
+            "browser.crash_reporter_local_storage_path": "",
         })
 
         # Defensive: force the window to be visible on the primary desktop.
@@ -1810,6 +1828,55 @@ class GhostShellBrowser:
         # overrides so the browser presents itself as a phone. Silent
         # no-op for desktop profiles and profiles without a Phase 2 FP.
         self._maybe_apply_mobile_emulation()
+
+        # Sprint 12 / Tier 2 #2: per-profile Date.getTimezoneOffset
+        # jitter. ICU returns offset in 15-minute steps (+ DST rules);
+        # there's no clean C++ way to inject ±1-minute drift without
+        # subclassing icu::TimeZone (DST handling becomes a maintenance
+        # nightmare). The pragmatic shim re-defines the JS getter so
+        # offset = real_offset - jitter (matches the V8 sign convention
+        # where getTimezoneOffset returns minutes WEST of UTC).
+        self._inject_timezone_jitter_shim(payload)
+
+    def _inject_timezone_jitter_shim(self, payload: dict):
+        """Page-load injection: per-profile ±1 minute jitter on
+        Date.prototype.getTimezoneOffset.
+
+        The jitter value lives in the profile's noise.timezone_offset_jitter
+        field (passed through --ghost-shell-payload). 0 = no shim. The
+        getter override is non-enumerable & non-configurable so a page
+        can't trivially detect it via Object.getOwnPropertyDescriptor —
+        though a determined fingerprinter that brute-forces every
+        millisecond near a 15-minute boundary can still observe it.
+        That's an acceptable trade since the alternative (TZ subclass
+        in ICU) is much worse for stability.
+        """
+        try:
+            noise = payload.get("noise", {}) or {}
+            jitter = int(noise.get("timezone_offset_jitter", 0))
+        except (TypeError, ValueError):
+            jitter = 0
+        if jitter == 0:
+            return  # no-op — patch off for this profile
+        # Inject as Page.addScriptToEvaluateOnNewDocument so it runs
+        # before page JS on every navigation in every frame.
+        shim = (
+            "(()=>{"
+            "const J=" + str(jitter) + ";"
+            "const orig=Date.prototype.getTimezoneOffset;"
+            "Object.defineProperty(Date.prototype,'getTimezoneOffset',{"
+            "  configurable:true,enumerable:false,writable:false,"
+            "  value:function(){return orig.call(this)-J;}"
+            "});"
+            "})();"
+        )
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument", {"source": shim})
+            logging.debug(
+                f"[GhostShellBrowser] tz jitter shim installed: ±{jitter} min")
+        except Exception as e:
+            logging.debug(f"[GhostShellBrowser] tz jitter shim failed: {e}")
 
     def _maybe_apply_mobile_emulation(self):
         """Read the current Phase 2 fingerprint for this profile and,

@@ -3788,6 +3788,65 @@ ScriptObject WebGLRenderingContextBase::getExtension(ScriptState* script_state,
     UseCounter::Count(context, WebFeature::kWebGLDebugRendererInfo);
   }
 
+  // === GHOST SHELL (Tier 1 #2 + Tier 2 #3) ===
+  // If the per-profile allowlist excludes this extension, deny it the
+  // same way an unsupported extension would be denied — return null to
+  // keep behaviour identical between filtered and unsupported.
+  //
+  // Always-keep core (same list as in getSupportedExtensions): real
+  // GPUs report these universally, so denying them would itself be a
+  // fingerprint signal. WEBGL_debug_renderer_info also stays enabled
+  // so our UNMASKED_VENDOR/RENDERER override fires.
+  auto& gs = blink::GhostShellConfig::GetInstance();
+  if (gs.IsActive()) {
+    const auto& allow = gs.GetWebGLExtensions();
+    if (!allow.empty()) {
+      static const char* const kCore[] = {
+          "ANGLE_instanced_arrays",
+          "EXT_blend_minmax",
+          "EXT_color_buffer_half_float",
+          "EXT_float_blend",
+          "EXT_frag_depth",
+          "EXT_shader_texture_lod",
+          "EXT_texture_compression_bptc",
+          "EXT_texture_compression_rgtc",
+          "EXT_texture_filter_anisotropic",
+          "OES_element_index_uint",
+          "OES_fbo_render_mipmap",
+          "OES_standard_derivatives",
+          "OES_texture_float",
+          "OES_texture_float_linear",
+          "OES_texture_half_float",
+          "OES_texture_half_float_linear",
+          "OES_vertex_array_object",
+          "WEBGL_color_buffer_float",
+          "WEBGL_compressed_texture_s3tc",
+          "WEBGL_debug_renderer_info",
+          "WEBGL_debug_shaders",
+          "WEBGL_depth_texture",
+          "WEBGL_draw_buffers",
+          "WEBGL_lose_context",
+          "WEBGL_multi_draw",
+      };
+      bool ok = false;
+      for (const String& a : allow) {
+        if (a == name) { ok = true; break; }
+      }
+      if (!ok) {
+        for (const char* c : kCore) {
+          if (name == c) { ok = true; break; }
+        }
+      }
+      if (!ok) {
+        return ScriptObject(
+            script_state->GetIsolate(),
+            ToV8Traits<IDLNullable<WebGLExtension>>::ToV8(script_state,
+                                                          nullptr));
+      }
+    }
+  }
+  // === END GHOST SHELL ===
+
   WebGLExtension* extension = EnableExtensionIfSupported(name, context);
   return ScriptObject(
       script_state->GetIsolate(),
@@ -4110,9 +4169,14 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
       return ScriptValue::CreateNull(script_state->GetIsolate());
     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
-        // === GHOST SHELL ===
+        // === GHOST SHELL (Tier 1 #2) ===
+        // UNMASKED_RENDERER_WEBGL must agree with WebGPU adapter info,
+        // so we read the dedicated unmasked field. Fall back to the
+        // legacy GetGLRenderer() if a profile didn't populate the new
+        // field (compat with profiles created before Tier 0).
         if (GhostShellConfig::GetInstance().IsActive()) {
-          String v = GhostShellConfig::GetInstance().GetGLRenderer();
+          String v = GhostShellConfig::GetInstance().GetUnmaskedRenderer();
+          if (v.empty()) v = GhostShellConfig::GetInstance().GetGLRenderer();
           if (!v.empty()) return WebGLAny(script_state, v);
         }
         // === END GHOST SHELL ===
@@ -4126,9 +4190,13 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
 
     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
-        // === GHOST SHELL ===
+        // === GHOST SHELL (Tier 1 #2) ===
+        // UNMASKED_VENDOR_WEBGL must agree with WebGPU adapter.vendor.
+        // Read GetUnmaskedVendor() first; fall back to legacy GetGLVendor()
+        // for profiles created before Tier 0.
         if (GhostShellConfig::GetInstance().IsActive()) {
-          String v = GhostShellConfig::GetInstance().GetGLVendor();
+          String v = GhostShellConfig::GetInstance().GetUnmaskedVendor();
+          if (v.empty()) v = GhostShellConfig::GetInstance().GetGLVendor();
           if (!v.empty()) return WebGLAny(script_state, v);
         }
         // === END GHOST SHELL ===
@@ -4476,6 +4544,70 @@ WebGLRenderingContextBase::getSupportedExtensions() {
       result.push_back(tracker->ExtensionName());
     }
   }
+
+  // === GHOST SHELL (Tier 1 #2 + Tier 2 #3) ===
+  // Filter the extension list down to the per-profile allowlist
+  // (GetWebGLExtensions) PLUS a hardcoded "always-keep core" of
+  // extensions that effectively every modern GPU advertises. This
+  // prevents a profile with a short allowlist from breaking sites
+  // that depend on universal extensions (Three.js / Babylon.js
+  // probe these on first frame and refuse to render without them).
+  //
+  // An empty allowlist means "no filter" — existing profiles that
+  // don't populate the field stay unchanged. Same-name comparison
+  // is case-sensitive — matches ExtensionTracker::ExtensionName().
+  auto& gs = blink::GhostShellConfig::GetInstance();
+  if (gs.IsActive()) {
+    const auto& allow = gs.GetWebGLExtensions();
+    if (!allow.empty()) {
+      // Always-keep core: extensions present on >99% of real GPUs
+      // per WebGL Stats (https://web3dsurvey.com). Removing any of
+      // these is itself a tell, regardless of profile config.
+      static const char* const kCore[] = {
+          "ANGLE_instanced_arrays",
+          "EXT_blend_minmax",
+          "EXT_color_buffer_half_float",
+          "EXT_float_blend",
+          "EXT_frag_depth",
+          "EXT_shader_texture_lod",
+          "EXT_texture_compression_bptc",
+          "EXT_texture_compression_rgtc",
+          "EXT_texture_filter_anisotropic",
+          "OES_element_index_uint",
+          "OES_fbo_render_mipmap",
+          "OES_standard_derivatives",
+          "OES_texture_float",
+          "OES_texture_float_linear",
+          "OES_texture_half_float",
+          "OES_texture_half_float_linear",
+          "OES_vertex_array_object",
+          "WEBGL_color_buffer_float",
+          "WEBGL_compressed_texture_s3tc",
+          "WEBGL_debug_renderer_info",
+          "WEBGL_debug_shaders",
+          "WEBGL_depth_texture",
+          "WEBGL_draw_buffers",
+          "WEBGL_lose_context",
+          "WEBGL_multi_draw",
+      };
+      Vector<String> filtered;
+      filtered.reserve(allow.size() + std::size(kCore));
+      for (const String& name : result) {
+        bool keep = false;
+        for (const String& a : allow) {
+          if (a == name) { keep = true; break; }
+        }
+        if (!keep) {
+          for (const char* c : kCore) {
+            if (name == c) { keep = true; break; }
+          }
+        }
+        if (keep) filtered.push_back(name);
+      }
+      return filtered;
+    }
+  }
+  // === END GHOST SHELL ===
 
   return result;
 }
@@ -7873,6 +8005,39 @@ ScriptValue WebGLRenderingContextBase::GetIntParameter(
       default:
         break;
     }
+
+    // === GHOST SHELL (Tier 1 #2) ===
+    // Apply per-profile jitter to a curated set of fingerprint-prone
+    // MAX_* WebGL parameters. The mask in GetWebGLParamsMask() decides
+    // which params are jittered (default 0 = none — safe for profiles
+    // mimicking known hardware, where MAX_TEXTURE_SIZE is hardware-fixed).
+    // A non-zero mask selects bits per param (see numbers below).
+    // Jitter is ±1 deterministic per (profile-seed, pname); enabled only
+    // when WebGL noise > 0 to keep this opt-in via the profile config.
+    auto& gs_cfg = blink::GhostShellConfig::GetInstance();
+    if (gs_cfg.IsActive() && gs_cfg.GetWebGLNoise() > 0.0) {
+      const int gs_mask = gs_cfg.GetWebGLParamsMask();
+      const uint32_t gs_seed = static_cast<uint32_t>(gs_cfg.GetRandomSeed());
+      auto gs_jitter = [&](int bit) -> GLint {
+        if (!(gs_mask & (1 << bit))) return value;
+        uint32_t h = gs_seed * 2654435761u + static_cast<uint32_t>(pname);
+        return value + ((h >> 28) & 1u ? 1 : -1);
+      };
+      switch (pname) {
+        case GL_MAX_TEXTURE_SIZE:                 value = gs_jitter(3); break;
+        case GL_MAX_CUBE_MAP_TEXTURE_SIZE:        value = gs_jitter(4); break;
+        case GL_MAX_RENDERBUFFER_SIZE:            value = gs_jitter(5); break;
+        case GL_MAX_VERTEX_UNIFORM_VECTORS:       value = gs_jitter(6); break;
+        case GL_MAX_FRAGMENT_UNIFORM_VECTORS:     value = gs_jitter(7); break;
+        case GL_MAX_VARYING_VECTORS:              value = gs_jitter(8); break;
+        case GL_MAX_VERTEX_ATTRIBS:               value = gs_jitter(9); break;
+        case GL_MAX_TEXTURE_IMAGE_UNITS:          value = gs_jitter(10); break;
+        case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:   value = gs_jitter(11); break;
+        case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: value = gs_jitter(12); break;
+        default: break;
+      }
+    }
+    // === END GHOST SHELL ===
   }
   return WebGLAny(script_state, value);
 }

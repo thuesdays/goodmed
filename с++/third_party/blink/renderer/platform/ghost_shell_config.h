@@ -200,6 +200,25 @@ class PLATFORM_EXPORT GhostShellConfig {
   // feature name ("geolocation", "notifications", "camera", etc.).
   String GetPermissionState(const String& name) const;
 
+  // ─── TLS / JA3 fingerprint (Tier 1 #4) ──────────────────
+  //
+  // Per-profile cipher-suite list and supported_groups (curve) list
+  // for ClientHello. Empty vector means "do not override" — BoringSSL
+  // keeps its default for that profile. The same SHA1 hash that JA3
+  // computes covers cipher_suites and supported_groups, so two
+  // profiles with different lists produce different JA3s without
+  // needing a separate "shuffle" patch (which the Sprint 11 extension-
+  // ordering patch already handles).
+  //
+  // Values are wire-format uint16 cipher IDs (e.g. 0x1301, 0xc02b)
+  // and named-group IDs (e.g. 0x001d for x25519). Parsed from the
+  // profile config JSON as integer arrays under "tls.cipher_suites"
+  // and "tls.supported_groups".
+  const Vector<int>& GetTLSCipherSuites() const { return tls_cipher_suites_; }
+  const Vector<int>& GetTLSSupportedGroups() const {
+    return tls_supported_groups_;
+  }
+
  private:
   friend class base::NoDestructor<GhostShellConfig>;
   GhostShellConfig();
@@ -324,6 +343,10 @@ class PLATFORM_EXPORT GhostShellConfig {
   // Example default: {"geolocation": "prompt", "notifications": "prompt",
   //                   "clipboard-read": "prompt", "camera": "prompt"}
   HashMap<String, String> permissions_;
+
+  // TLS / JA3 — empty by default = use BoringSSL's defaults.
+  Vector<int> tls_cipher_suites_;
+  Vector<int> tls_supported_groups_;
 };
 
 }  // namespace blink
@@ -332,6 +355,23 @@ class PLATFORM_EXPORT GhostShellConfig {
 extern "C" {
 PLATFORM_EXPORT bool GhostShell_IsActive();
 PLATFORM_EXPORT int GhostShell_GetRandomSeed();
+
+// Tier 1 #4 — JA3 cipher / supported-groups bridge for BoringSSL.
+//
+// BoringSSL is a standalone library and can't include Blink headers,
+// so we expose plain-C accessors. The buffer-out form is used because
+// the caller (BoringSSL) needs the values as a contiguous uint16_t
+// array on the stack — same shape it would otherwise build from its
+// own defaults.
+//
+//   GhostShell_GetTLSCipherSuites(out, max) -> count actually written
+//   GhostShell_GetTLSSupportedGroups(out, max) -> count actually written
+//
+// Both return 0 when GhostShell is inactive or the profile didn't set
+// the field; in that case BoringSSL keeps its default behaviour.
+PLATFORM_EXPORT int GhostShell_GetTLSCipherSuites(unsigned short* out, int max);
+PLATFORM_EXPORT int GhostShell_GetTLSSupportedGroups(unsigned short* out,
+                                                     int max);
 }
 
 #endif  // THIRD_PARTY_BLINK_RENDERER_PLATFORM_GHOST_SHELL_CONFIG_H_
