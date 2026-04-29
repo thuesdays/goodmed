@@ -247,15 +247,45 @@ class CookieWarmer:
     # ГИБРИДНЫЙ ПРОГРЕВ — fast + короткие посещения
     # ──────────────────────────────────────────────────────────
 
-    def hybrid_warmup(self, short_visits: bool = True):
+    def hybrid_warmup(self, short_visits: bool = True) -> dict:
         """
         Гибридный: сначала cookies, then 1-2 коротких real посещения
         for максимальной достоверности. Overнимает 20-30 секунд.
+
+        Audit D3 (Apr 2026): the previous implementation returned None
+        and never tracked which sites were actually visited, so the
+        caller's 'visited X sites' log line was a hard-coded zero
+        regardless of outcome (we logged "✓ warmup completed: visited
+        0 sites" even on a healthy two-site visit). Now returns a
+        dict with sites_planned, sites_visited, sites_succeeded, and
+        a `notes` field that explains EVERY skip / abort so the user
+        can see WHY the warmup did or didn't visit anything:
+
+          notes examples:
+            "all-skipped: offline page detected on google.com"
+            "all-skipped: short_visits=False"
+            "1/2 visits ok; youtube.com timed out"
+            "0/2 visits ok; google.com nav exception: ..."
+            "ok: 2/2"
         """
+        # Run the cookie-injection layer first. This part is reliable
+        # — it just installs CDP cookies — so we don't track failures
+        # here, just count it as a 0-site "fast" phase.
         self.fast_warmup()
 
+        result = {
+            "sites_planned":  0,
+            "sites_visited":  0,
+            "sites_succeeded": 0,
+            "notes":          "",
+        }
+
         if not short_visits:
-            return
+            result["notes"] = "all-skipped: short_visits=False"
+            logging.info(
+                f"[CookieWarmer] {result['notes']} (cookie injection only)"
+            )
+            return result
 
         logging.info("[CookieWarmer] Supplementing with short visits...")
 
@@ -265,32 +295,71 @@ class CookieWarmer:
             "https://www.google.com/",
             "https://www.youtube.com/",
         ]
+        result["sites_planned"] = len(quick_sites)
+        skip_reasons: list[str] = []
 
-        for url in quick_sites[:2]:
+        for url in quick_sites:
+            site_label = url.replace("https://www.", "").rstrip("/")
             try:
                 self.driver.get(url)
                 # Waiting loading document (не networkidle — слишком строго)
-                self._wait_page_ready(timeout=15)
+                ready_ok = self._wait_page_ready(timeout=15)
+                result["sites_visited"] += 1
 
                 # Проверяем that не whileзалась офлайн-страница
                 if self._is_offline_page():
-                    logging.warning(f"[CookieWarmer] {url} whileзал офлайн — пропускаем визиты")
+                    logging.warning(
+                        f"[CookieWarmer] {url} returned offline page — "
+                        f"aborting subsequent visits"
+                    )
+                    skip_reasons.append(
+                        f"offline page on {site_label}; remaining sites skipped"
+                    )
                     # Возвращаемся на blank тотбы не оставлять офлайн-страницу
                     try:
                         self.driver.get("about:blank")
                     except Exception:
                         pass
-                    return
+                    break
+
+                if not ready_ok:
+                    skip_reasons.append(
+                        f"{site_label} did not reach readyState=complete in 15s"
+                    )
+                    # Don't break — partial success still counts.
+                else:
+                    result["sites_succeeded"] += 1
 
                 time.sleep(random.uniform(3, 5))
                 # Небольшой скролл
                 try:
-                    self.driver.execute_script(f"window.scrollBy(0, {random.randint(200, 500)});")
+                    self.driver.execute_script(
+                        f"window.scrollBy(0, {random.randint(200, 500)});"
+                    )
                 except Exception:
                     pass
                 time.sleep(random.uniform(1, 2))
             except Exception as e:
-                logging.debug(f"[CookieWarmer] {url}: {e}")
+                # nav exception, driver dead, etc. — log loudly, NOT
+                # silently. The previous behaviour swallowed this at
+                # debug level so users couldn't see why warmup did
+                # nothing.
+                logging.warning(
+                    f"[CookieWarmer] {url}: {type(e).__name__}: {e}"
+                )
+                skip_reasons.append(
+                    f"{site_label} nav exception: "
+                    f"{type(e).__name__}: {str(e)[:80]}"
+                )
+
+        if result["sites_succeeded"] == result["sites_planned"]:
+            result["notes"] = f"ok: {result['sites_succeeded']}/{result['sites_planned']}"
+        else:
+            parts = [f"{result['sites_succeeded']}/{result['sites_planned']} visits ok"]
+            if skip_reasons:
+                parts.extend(skip_reasons)
+            result["notes"] = "; ".join(parts)
+        return result
 
     def _wait_page_ready(self, timeout: int = 15):
         """Waiting document.readyState === complete"""

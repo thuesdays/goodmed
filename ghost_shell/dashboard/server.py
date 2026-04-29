@@ -1585,11 +1585,42 @@ def api_profile_meta_set(name: str):
         "tags", "proxy_url", "proxy_is_rotating",
         "rotation_api_url", "rotation_provider", "rotation_api_key",
         "notes", "use_script_on_launch",
+        # D1/D5 (Apr 2026): allow ops to clear or set the burn-block
+        # flag from the UI. Setting needs_attention=0 is the
+        # equivalent of "I fixed the proxy, please retry".
+        "needs_attention", "needs_attention_reason",
+        "needs_attention_at",
     }
     updates = {k: v for k, v in payload.items() if k in allowed}
     if updates:
         get_db().profile_meta_upsert(name, **updates)
     return jsonify(get_db().profile_meta_get(name))
+
+
+@app.route("/api/profiles/<name>/clear-attention", methods=["POST"])
+def api_profile_clear_attention(name: str):
+    """One-click 'I fixed the proxy / cleared cookies / regenerated
+    fingerprint, please retry' button. Resets the needs_attention triad
+    so the next scheduled run will fire normally.
+
+    Does NOT modify the underlying SessionQuality history — the
+    metric-based burn detection in main.py will simply re-evaluate on
+    the next run; if the profile is still genuinely burned, main.py
+    will set the flag again and exit 75.
+    """
+    try:
+        get_db().profile_meta_upsert(
+            name,
+            needs_attention        = 0,
+            needs_attention_reason = None,
+            needs_attention_at     = None,
+        )
+        return jsonify({
+            "ok":   True,
+            "meta": get_db().profile_meta_get(name),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/api/profiles/quality-batch", methods=["GET"])
@@ -2716,9 +2747,41 @@ def _launch_run_thread(slot: "RunnerSlot", proxy_url: str) -> None:
                 RUNNER_POOL.remove(run_id)
             threading.Thread(target=_gc, daemon=True).start()
 
-    t = threading.Thread(target=run_thread, daemon=True)
-    slot.thread = t
-    t.start()
+    # Slot-leak guard (audit #102 RC-10): if Thread() ctor or .start()
+    # fails (resource exhaustion, daemon-flag rejected on some OSes,
+    # interpreter shutdown race), the slot would otherwise stay in
+    # RUNNER_POOL with is_running=True forever — blocking all future
+    # launches of this profile until manual DB cleanup. Catch + clean
+    # up so a thread-creation hiccup doesn't permanently lock the
+    # profile out.
+    try:
+        t = threading.Thread(target=run_thread, daemon=True)
+        slot.thread = t
+        t.start()
+    except Exception as _start_err:
+        logging.error(
+            f"[run-launch] failed to start run_thread for "
+            f"profile={profile_name!r} run_id={run_id}: "
+            f"{type(_start_err).__name__}: {_start_err}"
+        )
+        # Best-effort cleanup so the slot doesn't leak.
+        try:
+            db.run_finish(run_id, exit_code=-1, error=f"thread start failed: {_start_err}")
+        except Exception:
+            pass
+        try:
+            RUNNER_POOL.mark_finished(run_id, exit_code=-1,
+                                      error=f"thread start failed: {_start_err}")
+        except Exception:
+            pass
+        try:
+            RUNNER_POOL.remove(run_id)
+        except Exception:
+            pass
+        # Re-raise so the API caller sees a 500 rather than a silent
+        # "ok": True with no actual subprocess. The dashboard surfaces
+        # this as a toast.
+        raise
 
 
 

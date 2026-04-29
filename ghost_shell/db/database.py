@@ -1039,6 +1039,29 @@ class DB:
         #      back to that profile via proxy_id
         # Idempotent — subsequent boots skip if proxies already has rows.
         self._ensure_column(conn, "profiles", "proxy_id", "INTEGER")
+
+        # Audit D1/D5 (Apr 2026): when a profile is burned (24h captcha
+        # rate ≥ critical threshold) AND the proxy is static, the
+        # recovery loop has nothing it can do — there is no rotation
+        # endpoint to call, FP regen alone won't unburn the IP, and
+        # silently "proceeding anyway" wastes runs and degrades
+        # Google's view of the proxy further. Three columns here let
+        # main.py BLOCK the run, surface a clear reason, and let the
+        # UI render a banner / scheduler skip the profile.
+        #
+        #   needs_attention         0/1  — set when run was aborted
+        #   needs_attention_reason  TEXT — short human reason
+        #   needs_attention_at      TEXT — ISO timestamp of the abort
+        #
+        # Flag is cleared automatically when a healthy run starts
+        # (status != critical) so transient blips heal themselves.
+        self._ensure_column(conn, "profiles",
+                            "needs_attention", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "profiles",
+                            "needs_attention_reason", "TEXT")
+        self._ensure_column(conn, "profiles",
+                            "needs_attention_at", "TEXT")
+
         existing_proxies = conn.execute(
             "SELECT COUNT(*) FROM proxies"
         ).fetchone()[0]
@@ -1194,12 +1217,33 @@ class DB:
     def _ensure_column(conn, table: str, col: str, type_sql: str):
         """Idempotent ALTER TABLE ADD COLUMN for schema migrations.
         SQLite has no `ADD COLUMN IF NOT EXISTS`, so we probe via
-        PRAGMA first. Safe to call repeatedly at startup."""
+        PRAGMA first. Safe to call repeatedly at startup.
+
+        Audit #106 #10 fix: when two Python processes (dashboard +
+        scheduler + monitor) start near-simultaneously, the
+        check-then-alter pattern races — both PRAGMA probes report
+        the column missing, both ALTER TABLE fire, the second one
+        raises `OperationalError: duplicate column name`. Previously
+        this killed schema bring-up for the loser. Wrap the ALTER
+        in try/except so a duplicate-column race surfaces as a
+        debug log instead of a crash.
+        """
         existing = {r["name"] for r in
                     conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if col not in existing:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_sql}")
-            logging.info(f"[DB] Migrated: added {table}.{col} ({type_sql})")
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {type_sql}")
+                logging.info(f"[DB] Migrated: added {table}.{col} ({type_sql})")
+            except sqlite3.OperationalError as _alter_err:
+                msg = str(_alter_err).lower()
+                if "duplicate column" in msg:
+                    logging.debug(
+                        f"[DB] _ensure_column race: {table}.{col} added "
+                        f"by another process between PRAGMA probe and "
+                        f"ALTER — safe to ignore."
+                    )
+                else:
+                    raise
 
     def config_get(self, key: str, default: Any = None) -> Any:
         row = self._get_conn().execute(
@@ -1539,8 +1583,25 @@ class DB:
                               cron_expr: str | None = None,
                               profiles: list | None = None,
                               name: str | None = None,
-                              enabled: bool | None = None) -> bool:
-        """Partial update of one scheduled task."""
+                              enabled: bool | None = None,
+                              last_run_at: str | None = None,
+                              next_run_at: str | None = None) -> bool:
+        """Partial update of one scheduled task.
+
+        AUDIT #104 #2 fix: scheduler.py was calling this with
+        last_run_at= / next_run_at= kwargs (lines 666, 682, 696, 745),
+        but the previous signature didn't accept them — every call
+        raised TypeError, was silently propagated up, and the cron
+        boundary was never advanced. Result: a cron-scheduled task
+        would re-fire every tick (every ~3-20 minutes) instead of at
+        its configured cadence, hammering CPU/logs and the dashboard's
+        run history with duplicates.
+
+        Both fields accept ISO-format strings (or None to leave
+        unchanged). next_run_at can be set to a literal empty string
+        via " " if the caller wants to clear it; we treat None as
+        "skip this column".
+        """
         conn = self._get_conn()
         cols = []
         params = []
@@ -1552,6 +1613,10 @@ class DB:
             cols.append("name = ?"); params.append(name)
         if enabled is not None:
             cols.append("enabled = ?"); params.append(1 if enabled else 0)
+        if last_run_at is not None:
+            cols.append("last_run_at = ?"); params.append(last_run_at)
+        if next_run_at is not None:
+            cols.append("next_run_at = ?"); params.append(next_run_at)
         if not cols:
             return False
         cols.append("updated_at = datetime('now')")
@@ -3012,9 +3077,54 @@ class DB:
                     f"keys: {list(payload.keys())[:10]}"
                 )
 
+        # Audit #106 #1+#4 fix: connection is autocommit
+        # (isolation_level=None), so `with conn:` is a no-op for
+        # transactionality. Without an explicit BEGIN IMMEDIATE,
+        # the demote-UPDATE and insert-INSERT can interleave with
+        # another caller — leaving TWO rows with is_current=1 (one
+        # from each writer's INSERT) or NONE (both demotes happened
+        # then both INSERTs raced for is_current=1 but constraint
+        # didn't catch it because no UNIQUE index on
+        # (profile_name, is_current=1)). Wrap in BEGIN IMMEDIATE so
+        # the demote+insert run atomically.
         conn = self._get_conn()
-        with conn:
-            # Demote previous current
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE fingerprints SET is_current = 0 WHERE profile_name = ?",
+                    (profile_name,),
+                )
+                cur = conn.execute("""
+                    INSERT INTO fingerprints (
+                        profile_name, timestamp, template_name, template_id,
+                        payload_json, is_current,
+                        coherence_score, coherence_report,
+                        locked_fields, source, reason
+                    ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                """, (
+                    profile_name,
+                    datetime.now().isoformat(timespec="seconds"),
+                    payload.get("template_label") or payload.get("template_name"),
+                    payload.get("template_id"),
+                    json.dumps(payload, ensure_ascii=False),
+                    coherence_score,
+                    json.dumps(coherence_report, ensure_ascii=False) if coherence_report else None,
+                    json.dumps(locked_fields, ensure_ascii=False) if locked_fields else None,
+                    source,
+                    reason,
+                ))
+                conn.execute("COMMIT")
+                return cur.lastrowid
+            except Exception:
+                try: conn.execute("ROLLBACK")
+                except Exception: pass
+                raise
+        except sqlite3.OperationalError as _opx:
+            logging.warning(
+                f"[db] fingerprint_save({profile_name!r}) BEGIN IMMEDIATE "
+                f"failed ({_opx}); falling back to autocommit"
+            )
             conn.execute(
                 "UPDATE fingerprints SET is_current = 0 WHERE profile_name = ?",
                 (profile_name,),
@@ -3991,6 +4101,11 @@ class DB:
             # changed in DB. The toggle appeared to "work" only on the
             # frontend's optimistic state, then reverted on reload.
             "use_script_on_launch", "script_id",
+            # D1/D5: needs_attention triad — set by main.py when a
+            # burned-profile + static-proxy run is aborted, cleared
+            # by the next healthy run. Surfaced by the UI banner.
+            "needs_attention", "needs_attention_reason",
+            "needs_attention_at",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -4002,17 +4117,57 @@ class DB:
         conn = self._get_conn()
         # INSERT OR IGNORE then UPDATE — sqlite3 < 3.24 doesn't support
         # ON CONFLICT gracefully, and we need to keep created_at untouched.
-        conn.execute(
-            "INSERT OR IGNORE INTO profiles(name) VALUES(?)", (name,)
-        )
-        cols = ", ".join(f"{k} = ?" for k in updates)
-        vals = list(updates.values()) + [name]
-        conn.execute(
-            f"UPDATE profiles SET {cols}, updated_at = datetime('now') "
-            f"WHERE name = ?",
-            vals,
-        )
-        conn.commit()
+        #
+        # Audit #106 #1+#4 fix: connection is in isolation_level=None
+        # (autocommit), so each statement auto-commits and the
+        # `with conn:` context manager is a no-op for transactionality.
+        # Without an explicit BEGIN IMMEDIATE here, two concurrent
+        # callers updating the same profile (e.g. dashboard's
+        # bulk-create + manual Edit Profile save firing in the same
+        # second) could interleave: A's INSERT runs, B's INSERT runs
+        # (no-op), A's UPDATE runs with stale `updates`, B's UPDATE
+        # runs with its own `updates`, last-writer wins and silently
+        # drops the other caller's edits.
+        # BEGIN IMMEDIATE acquires the SQLite reserved write-lock
+        # right away (instead of deferring until first DML), so the
+        # second caller blocks on busy_timeout=5s, retries, and ends
+        # up running its INSERT+UPDATE serially after A's COMMIT.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO profiles(name) VALUES(?)", (name,)
+                )
+                cols = ", ".join(f"{k} = ?" for k in updates)
+                vals = list(updates.values()) + [name]
+                conn.execute(
+                    f"UPDATE profiles SET {cols}, updated_at = datetime('now') "
+                    f"WHERE name = ?",
+                    vals,
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try: conn.execute("ROLLBACK")
+                except Exception: pass
+                raise
+        except sqlite3.OperationalError as _opx:
+            # If BEGIN IMMEDIATE itself raised (extremely rare with our
+            # 5s busy_timeout), fall through to a best-effort
+            # autocommit version — better than dropping the call.
+            logging.warning(
+                f"[db] profile_meta_upsert({name!r}) BEGIN IMMEDIATE "
+                f"failed ({_opx}); falling back to autocommit"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO profiles(name) VALUES(?)", (name,)
+            )
+            cols = ", ".join(f"{k} = ?" for k in updates)
+            vals = list(updates.values()) + [name]
+            conn.execute(
+                f"UPDATE profiles SET {cols}, updated_at = datetime('now') "
+                f"WHERE name = ?",
+                vals,
+            )
 
     # ──────────────────────────────────────────────────────────
     # Profile health canary timeline

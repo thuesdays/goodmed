@@ -184,6 +184,91 @@ const ProfileDetail = {
     }
   },
 
+  /**
+   * D5-UI: render the needs_attention banner for the given profile
+   * + meta payload. Toggles visibility based on meta.needs_attention,
+   * fills the reason / timestamp from meta.needs_attention_reason /
+   * meta.needs_attention_at, and wires the "Clear attention" button
+   * to /api/profiles/<name>/clear-attention.
+   *
+   * Defensive: if any DOM hook is missing (page never rendered the
+   * banner template), this silently no-ops.
+   */
+  _renderAttentionBanner(name, meta) {
+    const banner = document.getElementById("pp-attention-banner");
+    const reason = document.getElementById("pp-attention-reason");
+    const when   = document.getElementById("pp-attention-when");
+    const btn    = document.getElementById("pp-attention-clear-btn");
+    const status = document.getElementById("pp-attention-clear-status");
+    if (!banner || !reason || !when || !btn) return;
+
+    const flag = !!(meta && Number(meta.needs_attention) === 1);
+    if (!flag) {
+      banner.style.display = "none";
+      return;
+    }
+
+    reason.textContent = (meta.needs_attention_reason
+                          || "Profile flagged — see logs for details.");
+    if (meta.needs_attention_at) {
+      // ISO timestamp from main.py: "2026-04-29T10:51:15".
+      // Render it readably without leaking the seconds noise.
+      try {
+        const d = new Date(meta.needs_attention_at);
+        if (!isNaN(d.getTime())) {
+          when.textContent = "Flagged at: " + d.toLocaleString();
+        } else {
+          when.textContent = "Flagged at: " + meta.needs_attention_at;
+        }
+      } catch (_e) {
+        when.textContent = "Flagged at: " + meta.needs_attention_at;
+      }
+    } else {
+      when.textContent = "";
+    }
+    banner.style.display = "";
+
+    // Wire the Clear button — idempotent: tag once, never re-bind.
+    // Re-binding on every meta-load (which happens whenever the page
+    // re-renders) would stack handlers and POST N times per click.
+    if (btn.dataset._wired === "1") return;
+    btn.dataset._wired = "1";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      if (status) { status.textContent = "Clearing…"; status.style.color = ""; }
+      try {
+        const r = await api(
+          `/api/profiles/${encodeURIComponent(name)}/clear-attention`,
+          { method: "POST" }
+        );
+        if (r && r.ok) {
+          if (status) {
+            status.textContent = "Cleared. Scheduler will retry on the "
+                                 + "next tick.";
+            status.style.color = "#7fff7f";
+          }
+          // Hide banner after a short pause so the user sees the
+          // confirmation; a fresh page load (or next meta load) will
+          // pick up the new state from the server.
+          setTimeout(() => { banner.style.display = "none"; }, 1500);
+        } else {
+          if (status) {
+            status.textContent = "Clear failed: "
+                                 + ((r && r.error) || "unknown error");
+            status.style.color = "#ff8080";
+          }
+          btn.disabled = false;
+        }
+      } catch (e) {
+        if (status) {
+          status.textContent = "Clear failed: " + (e?.message || e);
+          status.style.color = "#ff8080";
+        }
+        btn.disabled = false;
+      }
+    });
+  },
+
   /** Test button on the Proxy card. Just hits ipinfo via the existing
    *  /api/proxy/test endpoint, passing the proxy URL we have in the form
    *  rather than the global one. */
@@ -1889,6 +1974,13 @@ const ProfileDetail = {
       if (byId("pp-rotation-provider")) byId("pp-rotation-provider").value = meta.rotation_provider || "";
       if (byId("pp-rotation-api-key"))  byId("pp-rotation-api-key").value  = meta.rotation_api_key  || "";
       if (byId("pp-notes"))             byId("pp-notes").value             = meta.notes             || "";
+
+      // D5-UI: render the needs_attention banner if main.py blocked
+      // a run because of static-proxy + burn. The banner shows the
+      // reason (e.g. "Captcha in 100% of searches (24h) — profile
+      // burned") + when it happened + a button to clear the flag.
+      // Hidden when needs_attention=0/null.
+      this._renderAttentionBanner(name, meta);
 
       // Restore the "rotating proxy" checkbox state — was missing entirely,
       // so the toggle visually reset to OFF after every reload regardless

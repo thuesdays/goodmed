@@ -21,6 +21,56 @@
     </div>
   </div>
 
+  <!-- ─── NEEDS-ATTENTION BANNER (D1/D5) ──────────────────────
+       Surfaced when main.py blocked a run because the profile is burned
+       AND the proxy is static (no rotation endpoint, no recovery path).
+       Hidden by default; profile-detail.js toggles display + fills the
+       reason after meta loads. The Clear button POSTs to
+       /api/profiles/<name>/clear-attention so ops can retry once the
+       proxy is replaced or storage cleared. Styled inline so it works
+       even if attention.css hasn't been added yet. -->
+  <div id="pp-attention-banner"
+       class="card"
+       role="alert"
+       style="display:none; border:2px solid #ff6b6b;
+              background:#2a1414; color:#ffd6d6;
+              padding:14px 16px; margin-bottom:16px;
+              border-radius:8px;">
+    <div style="display:flex; align-items:flex-start; gap:12px;">
+      <div style="font-size:22px; line-height:1;">⚠</div>
+      <div style="flex:1; min-width:0;">
+        <div style="font-weight:600; font-size:15px; margin-bottom:4px;">
+          Run blocked — profile needs attention
+        </div>
+        <div id="pp-attention-reason"
+             style="font-size:13px; line-height:1.45;
+                    word-break:break-word; margin-bottom:6px;">
+          <!-- filled in by profile-detail.js -->
+        </div>
+        <div id="pp-attention-when"
+             style="font-size:12px; opacity:0.7; margin-bottom:10px;">
+          <!-- filled in by profile-detail.js -->
+        </div>
+        <div style="font-size:12px; opacity:0.85; margin-bottom:10px;">
+          The scheduler is skipping this profile until the flag is
+          cleared. Replace the proxy, regenerate the fingerprint, or
+          clear cookies — then click below to retry.
+        </div>
+        <button id="pp-attention-clear-btn"
+                class="btn btn-warning"
+                type="button"
+                style="background:#ff6b6b; color:#1a0808;
+                       border:none; padding:8px 14px;
+                       border-radius:6px; cursor:pointer;
+                       font-weight:600;">
+          Clear attention &amp; retry
+        </button>
+        <span id="pp-attention-clear-status"
+              style="margin-left:10px; font-size:12px; opacity:0.8;"></span>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── IDENTITY: tags, notes, language, session toggle ──────
        Per-profile metadata. Keep this near the top so the human-readable
        labels are the first thing the user sees on the edit page. -->

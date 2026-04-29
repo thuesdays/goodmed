@@ -203,6 +203,64 @@ def _random_sleep(lo: float, hi: float):
 
 
 # ──────────────────────────────────────────────────────────────
+# Watchdog interlock — protect long blocking ops
+# ──────────────────────────────────────────────────────────────
+#
+# Audit footgun #2 mitigation. The watchdog probes driver.title every
+# 30s and force-kills Chrome after 3 consecutive 20s-timeouts (see
+# runtime.py WATCHDOG_*). Several action handlers do blocking
+# operations 10-30s long without yielding to the watchdog, so on a
+# slow proxy or heavy landing page the probe can fail mid-dwell and
+# the run gets killed. Wrapping the blocking section in this context
+# manager pauses the watchdog probe loop for the duration, then
+# resumes it — ALWAYS via finally, so an exception inside the
+# protected block doesn't leave the watchdog disabled forever.
+#
+# The browser handle lives at ctx.browser (RunContext) or
+# loop_ctx["browser"] (legacy bridge). Both must support
+# .watchdog_pause(reason)/.watchdog_resume(); if neither is reachable
+# (legacy callers, tests), the wrapper degrades to a no-op.
+class _WatchdogShield:
+    def __init__(self, ctx_or_loopctx, reason: str):
+        self.browser = None
+        self.reason = reason or "action-handler"
+        # Resolve browser from either RunContext (.browser attr) or
+        # legacy loop_ctx dict ("browser" key) — both shapes appear
+        # at different call-sites depending on dispatcher path.
+        if ctx_or_loopctx is None:
+            return
+        b = getattr(ctx_or_loopctx, "browser", None)
+        if b is None and isinstance(ctx_or_loopctx, dict):
+            b = ctx_or_loopctx.get("browser")
+        if b is None:
+            # Legacy ctx dict carries loop_ctx → browser
+            try:
+                b = (ctx_or_loopctx.get("loop_ctx") or {}).get("browser")
+            except Exception:
+                b = None
+        # Sanity: browser must have both watchdog_pause + resume methods
+        if b is not None and hasattr(b, "watchdog_pause") and \
+                hasattr(b, "watchdog_resume"):
+            self.browser = b
+
+    def __enter__(self):
+        if self.browser is not None:
+            try:
+                self.browser.watchdog_pause(reason=self.reason)
+            except Exception as e:
+                log.debug(f"[watchdog-shield] pause failed: {e}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.browser is not None:
+            try:
+                self.browser.watchdog_resume()
+            except Exception as e:
+                log.debug(f"[watchdog-shield] resume failed: {e}")
+        return False  # don't swallow exceptions
+
+
+# ──────────────────────────────────────────────────────────────
 # HUMAN-LIKE SCROLL
 # ──────────────────────────────────────────────────────────────
 
@@ -257,10 +315,28 @@ def _act_click_ad(driver, action: dict, ctx: dict):
     own_domains = [d.lower() for d in (ctx.get("my_domains") or []) if d]
 
     def _href_is_own(href: str) -> bool:
+        # Audit footgun #1 fix: use hostname-aware comparison instead
+        # of substring `in`. Substring matched "a.com" against URLs
+        # like "https://x.com/?ref=a.com" or "a.com.evil.example",
+        # bailing on legitimate competitor clicks. Now: parse URL,
+        # take hostname, do exact-or-subdomain match against each
+        # own_domain.
         if not href:
             return False
-        h = href.lower()
-        return any(d in h for d in own_domains)
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(href).hostname or "").lower()
+        except Exception:
+            return False
+        if not host:
+            return False
+        for d in own_domains:
+            d = d.strip().lower()
+            if not d:
+                continue
+            if host == d or host.endswith("." + d):
+                return True
+        return False
 
     anchor = None
 
@@ -309,28 +385,59 @@ def _act_click_ad(driver, action: dict, ctx: dict):
         ad_domain = (ad.get("domain") or "").lower().strip()
         if ad_domain:
             try:
+                # Audit footgun #5: previously picked the FIRST anchor
+                # matching the domain. If two ads from the same domain
+                # rendered on the SERP (rare but possible — second-tier
+                # PLA carousel + text ad), this could grab the WRONG
+                # one. Now: prefer anchors that are NOT already stamped
+                # with a data-gs-ad-id (those are claimed by other
+                # planned clicks in this foreach_ad iteration), AND
+                # use proper hostname matching (urlparse) instead of
+                # substring `in` to avoid `?ref=domain.com` false hits.
                 candidate = driver.execute_script(r"""
                     const dom = arguments[0].toLowerCase();
                     const own = arguments[1] || [];
                     const all = document.querySelectorAll('a[href]');
-                    for (const a of all) {
-                        const href = (a.href || '').toLowerCase();
-                        if (!href.includes(dom)) continue;
-                        // Must be an ad anchor (Google routes ads through
-                        // /aclk or googleadservices). Organic results
-                        // pointing to the same domain are skipped here.
-                        const isAd = href.includes('/aclk?') ||
-                                     href.includes('googleadservices') ||
-                                     href.includes('googlesyndication');
-                        if (!isAd) continue;
-                        // Skip own-domain-shaped destinations.
-                        if (own.some(d => href.includes(d.toLowerCase()))) continue;
-                        // Skip maps / google-internal landings.
-                        if (href.includes('google.com/maps') ||
-                            href.includes('maps.google.com')) continue;
-                        return a;
+
+                    // Hostname match (audit footgun #1 + #5):
+                    // exact-or-subdomain check via URL parsing, not
+                    // substring `in` href.
+                    function hostMatches(host, target) {
+                        if (!host || !target) return false;
+                        return host === target ||
+                               host.endsWith('.' + target);
                     }
-                    return null;
+                    function hostOfHref(href) {
+                        try { return new URL(href, location.origin).hostname.toLowerCase(); }
+                        catch (e) { return ''; }
+                    }
+                    function isOwn(host) {
+                        return own.some(d => hostMatches(host, (d || '').toLowerCase()));
+                    }
+
+                    // First pass: prefer candidates NOT already
+                    // claimed by another planned click (no
+                    // data-gs-ad-id). Second pass: anything goes.
+                    function pick(predicate) {
+                        for (const a of all) {
+                            const href = (a.href || '').toLowerCase();
+                            const host = hostOfHref(a.href || '');
+                            if (!hostMatches(host, dom)) continue;
+                            const isAd = href.includes('/aclk?') ||
+                                         href.includes('googleadservices') ||
+                                         href.includes('googlesyndication');
+                            if (!isAd) continue;
+                            if (isOwn(host)) continue;
+                            if (href.includes('google.com/maps') ||
+                                href.includes('maps.google.com')) continue;
+                            if (!predicate(a)) continue;
+                            return a;
+                        }
+                        return null;
+                    }
+
+                    return pick(a => !a.hasAttribute('data-gs-ad-id'))
+                        || pick(_ => true);
                 """, ad_domain, own_domains)
                 if candidate:
                     anchor = candidate
@@ -340,6 +447,76 @@ def _act_click_ad(driver, action: dict, ctx: dict):
                     )
             except Exception as _ds_err:
                 log.debug(f"    click_ad: domain-match scan failed: {_ds_err}")
+
+    # ── FALLBACK 3 (Fix B, Apr 2026): full re-parse of the SERP ──
+    # Reached when all three fallbacks above missed. Most common
+    # cause: Google's PLA carousel re-rendered between parse_ads
+    # and click_ad (lazy-load on scroll, dynamic refresh on
+    # visibility change, or post_ads_behavior scrolling — Fix A
+    # addresses the latter, but Google can do this on its own
+    # any time too). Re-running parse_ads on the live DOM stamps
+    # fresh data-gs-ad-id values; we then look up by domain.
+    #
+    # Cost: ~1.5s for the JS scan. Only paid when normal lookups
+    # fail, so worst-case adds the cost to a click that would
+    # otherwise have aborted with "couldn't locate ad anchor".
+    # Strict: only matches when the re-parsed ad has the SAME
+    # domain we expected — never silently grabs a different ad.
+    if anchor is None:
+        ad_domain = (ad.get("domain") or "").lower().strip()
+        if ad_domain:
+            try:
+                # Lazy import — main.py registers itself in
+                # sys.modules under both '__main__' and
+                # 'ghost_shell.main' (alias near top of main.py)
+                # so this is a cache hit, not a fresh execution.
+                from ghost_shell.main import parse_ads as _reparse_ads
+                # The re-parse re-stamps the DOM; we ignore its
+                # return value's anchor_ids (the strings differ
+                # from the parser's first scan since each scan
+                # uses its own scanId prefix) and look up by
+                # domain on the freshly-stamped document.
+                fresh_ads = _reparse_ads(driver, ctx.get("query") or "") or []
+                match = None
+                for fa in fresh_ads:
+                    fd = (fa.get("domain") or "").lower().strip()
+                    if fd == ad_domain:
+                        match = fa
+                        break
+                if match and match.get("anchor_id"):
+                    new_aid = match["anchor_id"]
+                    try:
+                        anchor = driver.find_element(
+                            By.CSS_SELECTOR,
+                            f'a[data-gs-ad-id="{new_aid}"]'
+                        )
+                        log.info(
+                            f"    click_ad: full re-parse recovered "
+                            f"anchor for domain={ad_domain!r} "
+                            f"(new anchor_id={new_aid!r}, original "
+                            f"{anchor_id!r} was stale)"
+                        )
+                        # Update ad dict so post-click bookkeeping
+                        # uses the fresh URL/clicks-through.
+                        ad["anchor_id"] = new_aid
+                        if match.get("clean_url"):
+                            ad["clean_url"] = match["clean_url"]
+                        if match.get("google_click_url"):
+                            ad["google_click_url"] = match["google_click_url"]
+                    except Exception as _fe:
+                        log.debug(
+                            f"    click_ad: re-parse stamped fresh "
+                            f"id but find_element still missed: {_fe}"
+                        )
+                else:
+                    log.debug(
+                        f"    click_ad: re-parse found "
+                        f"{len(fresh_ads)} ad(s) but none matched "
+                        f"domain={ad_domain!r} — Google likely "
+                        f"removed this ad from current SERP"
+                    )
+            except Exception as _re_err:
+                log.debug(f"    click_ad: re-parse fallback failed: {_re_err}")
 
     if anchor is None:
         log.warning(
@@ -496,10 +673,39 @@ def _act_click_ad(driver, action: dict, ctx: dict):
     # antifraud setups serve a JS-driven `window.close()` to bots).
     dwell_lo = float(action.get("dwell_min", 6))
     dwell_hi = float(action.get("dwell_max", 18))
+    # Audit footgun #2: dwell can be up to 18s, watchdog probes every
+    # 30s — without pausing, two consecutive probes can fall during
+    # one dwell on a flaky proxy and trigger a kill mid-action. Pause
+    # for the duration; auto-resume via finally inside _WatchdogShield.
+    with _WatchdogShield(ctx, reason="click_ad-dwell"):
+        try:
+            _random_sleep(dwell_lo, dwell_hi)
+        except Exception:
+            pass
+
+    # Audit footgun #6: captcha on click_ad landing site previously
+    # didn't update ctx.flags["captcha_present"] — only search_query
+    # / catch_ads did. So a script with `if captcha_present ->
+    # rotate_ip` after click_ad would never trigger. Refresh the
+    # flag now that we've finished the dwell on the landing page.
+    # Try-context: ctx may be a RunContext (unified) or a legacy
+    # dict. Both shapes support .flags reading via getattr/dict.
     try:
-        _random_sleep(dwell_lo, dwell_hi)
-    except Exception:
-        pass
+        from ghost_shell.main import is_captcha_page
+        captcha_now = bool(is_captcha_page(driver))
+        flags = getattr(ctx, "flags", None)
+        if flags is None and isinstance(ctx, dict):
+            flags = ctx.get("flags") or ctx.setdefault("flags", {})
+        if isinstance(flags, dict):
+            flags["captcha_present"] = captcha_now
+        if captcha_now:
+            log.warning(
+                f"    click_ad: CAPTCHA detected on landing site — "
+                f"ctx.flags['captcha_present']=True so subsequent "
+                f"`if captcha_present -> rotate_ip` steps will fire"
+            )
+    except Exception as _cf_err:
+        log.debug(f"    click_ad: captcha refresh skipped: {_cf_err}")
 
     # Mid-dwell health-probe: if the window vanished while sleeping,
     # bail out cleanly so the parent foreach_ad picks up the next ad.
@@ -589,6 +795,36 @@ def _act_click_ad(driver, action: dict, ctx: dict):
                     break
                 log.info(f"    ↪ deep_dive[{step_i}/{depth}]: → {clicked_href[:80]}")
                 _random_sleep(inner_lo, inner_hi)
+
+                # Audit footgun #8: post-click hostname verification.
+                # The JS picker filters by location.hostname BEFORE
+                # clicking, but the click itself can still navigate
+                # off-host if the link target uses iframe-window
+                # tricks, server-side 302 to another domain, or the
+                # picker picked a link inside a 3rd-party iframe
+                # that we mis-attributed to the main frame's host.
+                # If we ended up off the original landing host,
+                # bail out of deep_dive — we don't want to add
+                # browsing-context to Facebook / Twitter / wherever.
+                try:
+                    from urllib.parse import urlparse
+                    cur_host = urlparse(driver.current_url or "").hostname or ""
+                    pick_host = urlparse(clicked_href or "").hostname or ""
+                    landing_host = urlparse(landed_url or "").hostname or ""
+                    if cur_host and landing_host and \
+                       cur_host != landing_host and \
+                       not cur_host.endswith("." + landing_host) and \
+                       not landing_host.endswith("." + cur_host):
+                        log.warning(
+                            f"    ↪ deep_dive[{step_i}/{depth}]: "
+                            f"redirect/iframe sent us off-host "
+                            f"({landing_host} → {cur_host}); "
+                            f"stopping deep_dive"
+                        )
+                        break
+                except Exception:
+                    pass
+
                 # Light scroll on the inner page
                 try:
                     _human_scroll(driver)
@@ -1248,18 +1484,45 @@ def _act_visit_external_fp_tester(driver, action: dict, ctx: dict):
 
     extractor = _EXTRACTORS.get(tester_id, _EXTRACTOR_GENERIC)
 
+    # Audit footgun #4: fingerprint testers (creepjs, pixelscan,
+    # browserleaks) have notoriously slow JS bundles — 10-30s+ before
+    # the page completes. Without a per-action page_load_timeout the
+    # navigation inherits Chrome's default 300s, and the runner thread
+    # can block 5 minutes on a single tester visit. Cap at 45s — the
+    # tester either renders enough by then OR the proxy is too slow
+    # for this site, in which case we'd rather give up and continue.
     nav_error = None
+    _previous_pageload = None
     try:
-        driver.get(url)
-    except Exception as e:
-        nav_error = f"{type(e).__name__}: {str(e)[:200]}"
-        log.warning(f"    fp-tester '{tester_id}' navigation failed: {nav_error}")
+        try:
+            _previous_pageload = 60  # restored below regardless
+            driver.set_page_load_timeout(45)
+        except Exception:
+            pass
+        try:
+            driver.get(url)
+        except Exception as e:
+            nav_error = f"{type(e).__name__}: {str(e)[:200]}"
+            log.warning(f"    fp-tester '{tester_id}' navigation failed "
+                        f"(45s cap, slow tester / blocked proxy): {nav_error}")
+            try: driver.execute_script("window.stop();")
+            except Exception: pass
+    finally:
+        # Restore default-ish page-load timeout so subsequent
+        # actions in the flow inherit normal behavior.
+        try:
+            driver.set_page_load_timeout(_previous_pageload or 60)
+        except Exception:
+            pass
 
     # Dwell while the tester's JS computes scores. Some testers (CreepJS)
     # show a partial result quickly then refine it — we still wait the
-    # full window so the saved score is the final one.
+    # full window so the saved score is the final one. Wrap in
+    # watchdog shield (footgun #2) — dwell is 18-32s by default, well
+    # over the 30s probe window.
     if not nav_error:
-        _random_sleep(dwell_lo, dwell_hi)
+        with _WatchdogShield(ctx, reason=f"fp-tester-dwell-{tester_id}"):
+            _random_sleep(dwell_lo, dwell_hi)
         if action.get("scroll"):
             try:
                 for _ in range(4):
@@ -1502,7 +1765,14 @@ def _act_commercial_inflate(driver, action: dict, ctx: dict):
 
     import urllib.parse as _up
     from selenium.common.exceptions import TimeoutException as _TimeoutExc
-    for i, q in enumerate(queries, 1):
+    # Audit footgun #2: commercial_inflate per-query is page_load_timeout
+    # (15s) + dwell (8-15s) + scrolls (~1s) + optional organic click +
+    # tab cleanup. Total per-query 30-60s, multiplied by n=2-3 queries.
+    # On a slow proxy this comfortably exceeds the watchdog's 30s probe
+    # window. Pause watchdog for the duration of the loop so a slow
+    # google.com pageload doesn't get the run killed mid-warmup.
+    with _WatchdogShield(ctx, reason="commercial_inflate-loop"):
+     for i, q in enumerate(queries, 1):
         try:
             url = "https://www.google.com/search?q=" + _up.quote(q)
             log.info(f"      [{i}/{n}] inflate query: {q!r}")
@@ -1854,7 +2124,17 @@ def _act_screenshot(driver, action: dict, ctx: dict):
 
 def _act_wait_for_url(driver, action: dict, ctx: dict):
     """Pause until the browser URL matches a substring or regex.
-    Useful after OAuth redirects, form submits, SPA route changes."""
+    Useful after OAuth redirects, form submits, SPA route changes.
+
+    Audit footgun #3: previously the polling loop did `current_url`
+    every 0.4s for up to 15s. If timeout was raised by user beyond
+    30s (the watchdog probe interval), and current_url calls hung
+    due to CDP backlog, the watchdog could fail probes during the
+    wait and kill Chrome. Now: timeouts >25s are wrapped in
+    _WatchdogShield to suspend probing for the duration. Short
+    waits (<25s) stay unprotected since the watchdog can't accumulate
+    3 fails in that window.
+    """
     target = _subst(action.get("contains") or action.get("regex") or "", ctx)
     if not target:
         log.warning("    wait_for_url: no pattern given")
@@ -1863,20 +2143,31 @@ def _act_wait_for_url(driver, action: dict, ctx: dict):
     use_regex = bool(action.get("regex"))
 
     pattern = re.compile(target) if use_regex else None
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            cur = driver.current_url or ""
-        except Exception:
-            cur = ""
-        if use_regex and pattern.search(cur):
-            log.info(f"    → url matched: {cur}")
-            return
-        if not use_regex and target in cur:
-            log.info(f"    → url matched: {cur}")
-            return
-        time.sleep(0.4)
-    log.warning(f"    wait_for_url timed out after {timeout}s (wanted {target!r})")
+
+    def _poll_loop():
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
+            if use_regex and pattern.search(cur):
+                log.info(f"    → url matched: {cur}")
+                return True
+            if not use_regex and target in cur:
+                log.info(f"    → url matched: {cur}")
+                return True
+            time.sleep(0.4)
+        return False
+
+    if timeout > 25.0:
+        with _WatchdogShield(ctx, reason="wait_for_url-long"):
+            matched = _poll_loop()
+    else:
+        matched = _poll_loop()
+
+    if not matched:
+        log.warning(f"    wait_for_url timed out after {timeout}s (wanted {target!r})")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -3415,14 +3706,35 @@ def _eval_condition_raw(kind: str, cond: dict, ctx: RunContext) -> bool:
         needle = _interpolate(cond.get("value", ""), ctx)
         return bool(needle) and needle in url
     if kind == "element_exists":
+        # Bound the implicit-wait window (audit #103 #4): selenium's
+        # `find_elements` honors the driver's IMPLICIT_WAIT setting,
+        # which is 30s by default for our driver. So a script that
+        # branches on `if element_exists -> A else -> B` can BLOCK 30s
+        # on every false branch. Override with a tight per-call
+        # implicit_wait via the cond dict (default 1s — element either
+        # exists right now or it doesn't, this is a sync probe), then
+        # restore to whatever the runtime configured.
         if not ctx.driver:
             return False
         sel = _interpolate(cond.get("selector", ""), ctx)
         if not sel:
             return False
+        timeout_sec = float(cond.get("timeout") or 1.0)
         try:
             from selenium.webdriver.common.by import By
-            return len(ctx.driver.find_elements(By.CSS_SELECTOR, sel)) > 0
+            try:
+                ctx.driver.implicitly_wait(max(0.0, timeout_sec))
+            except Exception:
+                pass
+            try:
+                return len(ctx.driver.find_elements(By.CSS_SELECTOR, sel)) > 0
+            finally:
+                # Restore the long implicit wait that the rest of the
+                # runtime relies on.
+                try:
+                    ctx.driver.implicitly_wait(30)
+                except Exception:
+                    pass
         except Exception:
             return False
 
@@ -3711,6 +4023,13 @@ def _flow_foreach_ad(step: dict, ctx: RunContext):
         if child.should_break:
             ctx.should_break = True
             break
+    # Audit #103 #10: clear our own break flag once the loop has
+    # exited so an INNER break doesn't accidentally short-circuit an
+    # OUTER non-loop sibling. break is consumed by the loop it
+    # targeted; once we leave that scope, downstream steps in the
+    # parent should run normally.
+    ctx.should_break = False
+    ctx.should_continue = False
 
 
 def _foreach_ad_scan_pause(ctx: RunContext, dwell_min: float, dwell_max: float,
@@ -3787,6 +4106,9 @@ def _flow_foreach(step: dict, ctx: RunContext):
         if child.should_break:
             ctx.should_break = True
             break
+    # Audit #103 #10: same break-flag reset as foreach_ad.
+    ctx.should_break = False
+    ctx.should_continue = False
 
 
 def _flow_loop_legacy(step: dict, ctx: RunContext):
@@ -3800,9 +4122,18 @@ def _flow_loop_legacy(step: dict, ctx: RunContext):
 def _flow_catch_ads(step: dict, ctx: RunContext):
     """Parse ads on the current page into ctx.ads. Separate from
     search_query so users can visit a page manually, then collect
-    whatever ads happen to be there."""
+    whatever ads happen to be there.
+
+    Also refresh ctx.flags["captcha_present"] (audit #103 #3): the
+    `if captcha_present` condition was previously dangling — defined
+    in _eval_condition_raw but never written by any flow handler, so
+    user scripts that branched on it were silently broken. catch_ads
+    is a natural sync point: we just inspected the current page, so
+    if it's a captcha gate we want any subsequent `if captcha_present
+    -> rotate_ip` step to actually fire.
+    """
     try:
-        from ghost_shell.main import parse_ads
+        from ghost_shell.main import parse_ads, is_captcha_page
     except ImportError:
         log.warning("  [catch_ads] main.parse_ads not available")
         return
@@ -3810,7 +4141,14 @@ def _flow_catch_ads(step: dict, ctx: RunContext):
     ads = parse_ads(ctx.driver, query) or []
     ctx.ads = ads
     ctx.flags["ads_found"] = len(ads) > 0
-    log.info(f"  [catch_ads] collected {len(ads)} ad(s)")
+    try:
+        ctx.flags["captcha_present"] = bool(
+            is_captcha_page(ctx.driver) if ctx.driver else False
+        )
+    except Exception:
+        ctx.flags["captcha_present"] = False
+    log.info(f"  [catch_ads] collected {len(ads)} ad(s)"
+             + (" — CAPTCHA detected" if ctx.flags.get("captcha_present") else ""))
 
 
 # ── search_query (unified wrapper) ────────────────────────────────
@@ -3873,6 +4211,18 @@ def _flow_search_query(step: dict, ctx: RunContext):
     ads = search_fn(q) or []
     ctx.ads = ads
     ctx.flags["ads_found"] = len(ads) > 0
+    # Refresh captcha flag (audit #103 #3) so downstream
+    # `if captcha_present -> rotate_ip` branches actually fire.
+    try:
+        from ghost_shell.main import is_captcha_page
+        ctx.flags["captcha_present"] = bool(
+            is_captcha_page(ctx.driver) if ctx.driver else False
+        )
+    except Exception:
+        ctx.flags["captcha_present"] = False
+    if ctx.flags.get("captcha_present"):
+        log.warning(f"  [search_query] CAPTCHA detected on result page "
+                    f"for query {q!r} — captcha_present flag set")
 
     # Back-compat: if the step has `auto_foreach` (legacy behavior),
     # also run the per_ad_runner for each ad right here. The migration
@@ -3887,17 +4237,68 @@ def _flow_search_query(step: dict, ctx: RunContext):
 
 # ── save_var ───────────────────────────────────────────────────────
 
+# Audit #103 #7: whitelist for save_var/extract_text variable names.
+# Reject empty / dotted / prototype-pollution-shaped keys so a
+# malformed step can't shadow ctx.vars structural keys (e.g. "vault",
+# "ad", "item") or inject keys with "." that confuse the resolve_path
+# walker into hitting ctx.ad / ctx.ads accidentally.
+_VAR_NAME_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_VAR_NAME_RESERVED = {"vault", "ad", "ads", "item", "query", "profile",
+                      "flag", "var", "_runtime_raw"}
+# Audit #103 #8: cap individual var values to 100 KB so a runaway
+# extract_text on a giant page (or a save_var literal from a
+# user-pasted blob) doesn't bloat ctx.vars.
+_VAR_VALUE_CAP_BYTES = 100 * 1024
+
+def _validate_var_name(name) -> str | None:
+    """Return the validated name, or None if it should be rejected."""
+    if not isinstance(name, str) or not name:
+        return None
+    if not _VAR_NAME_PATTERN.match(name):
+        return None
+    if name in _VAR_NAME_RESERVED:
+        return None
+    return name
+
+def _cap_var_value(val):
+    """Truncate string values that exceed the per-var cap. Lists of
+    strings get per-element truncation; nested dicts pass through
+    unchanged (callers should size-check before passing)."""
+    if isinstance(val, str):
+        if len(val) > _VAR_VALUE_CAP_BYTES:
+            return val[:_VAR_VALUE_CAP_BYTES] + " …(truncated)"
+        return val
+    if isinstance(val, list):
+        out = []
+        for v in val:
+            if isinstance(v, str) and len(v) > _VAR_VALUE_CAP_BYTES:
+                out.append(v[:_VAR_VALUE_CAP_BYTES] + " …(truncated)")
+            else:
+                out.append(v)
+        return out
+    return val
+
+
 def _flow_save_var(step: dict, ctx: RunContext):
     """Save a literal or computed value into ctx.vars[name]. Useful
     for counters, flags, or pre-computed paths that downstream steps
-    reference via {var.name}."""
-    name = step.get("name")
+    reference via {var.name}.
+
+    Validates `name` (audit #103 #7) so a malformed step can't pollute
+    ctx with reserved keys or path-fragmenting strings.
+    """
+    raw_name = step.get("name")
+    name = _validate_var_name(raw_name)
     if not name:
-        log.warning("  [save_var] missing `name`")
+        log.warning(
+            f"  [save_var] rejected name {raw_name!r}: must match "
+            f"[a-zA-Z_][a-zA-Z0-9_]* and not be a reserved key "
+            f"({', '.join(sorted(_VAR_NAME_RESERVED))})"
+        )
         return
     # `value` is interpolated already by _exec_steps, so {ad.domain}
     # and friends resolve before we store them.
-    ctx.vars[name] = step.get("value")
+    ctx.vars[name] = _cap_var_value(step.get("value"))
     log.info(f"  [save_var] {name} = {str(ctx.vars[name])[:80]!r}")
 
 
@@ -3905,14 +4306,25 @@ def _flow_save_var(step: dict, ctx: RunContext):
 
 def _flow_extract_text(step: dict, ctx: RunContext):
     """Run a CSS selector, take .textContent of the first (or all)
-    matching element(s), save into ctx.vars under `save_as`."""
+    matching element(s), save into ctx.vars under `save_as`.
+
+    Caps extracted text size (audit #103 #8) so a page with multiple
+    megabytes of hidden DOM doesn't blow ctx.vars.
+    """
     if not ctx.driver:
         return
     sel = step.get("selector") or ""
     if not sel:
         log.warning("  [extract_text] missing selector")
         return
-    save_as = step.get("save_as") or "extracted"
+    raw_save_as = step.get("save_as") or "extracted"
+    save_as = _validate_var_name(raw_save_as)
+    if not save_as:
+        log.warning(
+            f"  [extract_text] rejected save_as={raw_save_as!r} "
+            f"(invalid var name)"
+        )
+        return
     multi   = bool(step.get("all"))
     try:
         from selenium.webdriver.common.by import By
@@ -3925,8 +4337,9 @@ def _flow_extract_text(step: dict, ctx: RunContext):
     except Exception as e:
         log.warning(f"  [extract_text] {sel!r}: {e}")
         val = "" if not multi else []
-    ctx.vars[save_as] = val
-    shown = str(val)[:80] if isinstance(val, str) else f"list({len(val)})"
+    ctx.vars[save_as] = _cap_var_value(val)
+    shown = str(ctx.vars[save_as])[:80] if isinstance(ctx.vars[save_as], str) \
+            else f"list({len(ctx.vars[save_as])})"
     log.info(f"  [extract_text] {save_as} = {shown}")
 
 
@@ -3952,31 +4365,112 @@ def _flow_http_request(step: dict, ctx: RunContext):
     if not url:
         log.warning("  [http_request] missing url")
         return
+
+    # Audit #103 #5: validate URL — reject schemes other than http(s),
+    # block localhost / loopback / link-local / RFC1918 internal IPs.
+    # Without this, a user-authored script could exfiltrate data from
+    # internal services (Redis on :6379, Elasticsearch on :9200, etc.)
+    # accessible from the runner host. The flow runtime is essentially
+    # arbitrary code from the user, but we still want this defensive
+    # because scripts get IMPORTED from .json files, run on schedule,
+    # and operators don't always read the bodies before importing.
+    import urllib.parse as _up
+    try:
+        _parsed = _up.urlparse(url)
+    except Exception:
+        log.warning(f"  [http_request] url failed to parse: {url[:80]!r}")
+        return
+    if _parsed.scheme.lower() not in ("http", "https"):
+        log.warning(
+            f"  [http_request] rejected non-http(s) scheme "
+            f"{_parsed.scheme!r} in {url[:80]!r}"
+        )
+        return
+    _host = (_parsed.hostname or "").lower()
+    _blocked_host_prefixes = (
+        "localhost", "127.", "0.0.0.0", "::1",
+        "169.254.",                                  # link-local / cloud metadata
+        "10.", "192.168.",                           # RFC1918
+    )
+    _blocked_host_exact = {
+        "localhost.localdomain", "broadcasthost",
+    }
+    if (_host in _blocked_host_exact or
+            any(_host.startswith(p) for p in _blocked_host_prefixes) or
+            (_host.startswith("172.") and _host.split(".")[1].isdigit() and
+             16 <= int(_host.split(".")[1]) <= 31)):
+        log.warning(
+            f"  [http_request] rejected internal/loopback host "
+            f"{_host!r} in {url[:80]!r} — http_request is for external "
+            f"webhooks only, internal services would exfiltrate data"
+        )
+        return
+
     headers = step.get("headers") or {}
     # Body can be a dict (auto-JSON) or a raw string
     body = step.get("body")
     timeout = float(step.get("timeout", 15))
     save_as = step.get("save_as")
+    # Audit #103 #6: cap response size at 1 MB. Without this, a
+    # webhook target that returns a 500 MB JSON blob would pull the
+    # whole thing into memory and store it in ctx.vars. Use
+    # stream=True + Read up to a hard limit, fail loud if exceeded.
+    MAX_RESP_BYTES = 1 * 1024 * 1024  # 1 MB
 
     try:
-        kwargs = {"headers": headers, "timeout": timeout}
+        kwargs = {"headers": headers, "timeout": timeout, "stream": True}
         if isinstance(body, dict):
             kwargs["json"] = body
         elif body is not None:
             kwargs["data"] = body
 
-        resp = requests.request(method, url, **kwargs)
-        log.info(f"  [http_request] {method} {url[:60]} → {resp.status_code}")
+        with requests.request(method, url, **kwargs) as resp:
+            log.info(f"  [http_request] {method} {url[:60]} → {resp.status_code}")
 
-        if save_as:
-            # Try JSON first, fall back to text
+            # Streamed read with hard cap.
+            chunks = []
+            total = 0
             try:
-                ctx.vars[save_as] = resp.json()
+                for chunk in resp.iter_content(chunk_size=8192,
+                                                decode_unicode=False):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_RESP_BYTES:
+                        log.warning(
+                            f"  [http_request] response > {MAX_RESP_BYTES} "
+                            f"bytes — truncating (use a smaller endpoint)"
+                        )
+                        break
+                    chunks.append(chunk)
+            except Exception as _re:
+                log.debug(f"  [http_request] body read aborted: {_re}")
+
+            raw = b"".join(chunks)
+            text = ""
+            try:
+                text = raw.decode(resp.encoding or "utf-8", errors="replace")
             except Exception:
-                ctx.vars[save_as] = {
-                    "status": resp.status_code,
-                    "text":   resp.text[:10000],   # cap at 10 KB
-                }
+                text = raw.decode("utf-8", errors="replace")
+
+            if save_as:
+                # Try JSON first only if it doesn't bloat ctx.vars too
+                # much; cap text fallback at 10 KB as before.
+                try:
+                    import json as _json
+                    parsed = _json.loads(text) if text else None
+                    if parsed is not None:
+                        ctx.vars[save_as] = parsed
+                    else:
+                        ctx.vars[save_as] = {
+                            "status": resp.status_code,
+                            "text":   text[:10000],
+                        }
+                except Exception:
+                    ctx.vars[save_as] = {
+                        "status": resp.status_code,
+                        "text":   text[:10000],
+                    }
     except Exception as e:
         log.warning(f"  [http_request] {type(e).__name__}: {e}")
         if step.get("abort_on_error"):

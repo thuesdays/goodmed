@@ -633,7 +633,34 @@ def _fire_scheduled_tasks():
     override, NOT a permanent re-bind). If the dashboard is offline
     we skip the row this tick — next_run_at is preserved across
     restarts in the DB. Misfires are NOT replayed: cron matches are
-    wall-clock events, not jobs in a queue."""
+    wall-clock events, not jobs in a queue.
+
+    Defensive features applied per audit #104 #4-#10:
+
+      • Clock-skew guard (#4): if stored next_run_at is more than
+        25 hours in the future, treat it as "stuck" — recompute from
+        the cron expression. Catches the case where the system clock
+        jumped backward (NTP correction, manual set), leaving
+        next_run_at far ahead of the new now.
+
+      • Re-read-before-fire (#5, #6): the row was loaded at the top
+        of this tick. Between then and the actual fire, the user
+        could have disabled / deleted / edited the row from the
+        dashboard. Re-read just before firing; if the row is gone
+        (deleted) we log + skip; if disabled or its enabled flag
+        flipped we skip silently.
+
+      • Profile-missing warning (#8): if the schedule references a
+        profile that no longer exists in the profiles table, log a
+        warning naming each missing profile so the user can see WHY
+        their schedule isn't producing runs.
+
+      • Timezone documentation (#10): cron expressions are evaluated
+        against `datetime.now()` in the LOCAL timezone of the host
+        running the scheduler. If you move the host between
+        timezones, scheduled times shift accordingly. DST is honored
+        because Python's datetime.now() follows the system clock.
+    """
     import json as _json
     import urllib.request
     import urllib.error
@@ -648,7 +675,37 @@ def _fire_scheduled_tasks():
     if not rows:
         return
 
+    # Cache of known profile names — used by the missing-profile guard
+    # below. Loaded once per tick, ok if it's a few seconds stale (a
+    # profile deleted mid-tick won't fire, which is the desired
+    # behaviour anyway).
+    known_profiles = set()
+    try:
+        if hasattr(db, "profiles_list"):
+            for _p in (db.profiles_list() or []):
+                _name = _p.get("name") if isinstance(_p, dict) else _p
+                if _name:
+                    known_profiles.add(str(_name))
+    except Exception as _le:
+        logging.debug(f"[scheduled_tasks] profile list lookup failed: {_le}")
+
+    # Helper: re-read a single row by id. Returns None if the row was
+    # deleted or unreadable (which is treated as "skip this tick").
+    def _reread(row_id):
+        try:
+            for cur_row in (db.scheduled_tasks_list() or []):
+                if cur_row.get("id") == row_id:
+                    return cur_row
+        except Exception:
+            return None
+        return None
+
     now = datetime.now()
+    # Audit #104 #4: anchor for "unreasonably far future" detection.
+    # 25h covers the longest practical cron cadence (daily). Anything
+    # beyond that is almost certainly stale clock-skew artefact, not
+    # a legitimate cron match.
+    CLOCK_SKEW_FUTURE_THRESHOLD = timedelta(hours=25)
     fired = 0
     for r in rows:
         if not r.get("enabled"):
@@ -684,6 +741,30 @@ def _fire_scheduled_tasks():
             except Exception:
                 pass
             continue
+
+        # Audit #104 #4: clock-skew guard. If due_at sits more than
+        # CLOCK_SKEW_FUTURE_THRESHOLD ahead of now, the most likely
+        # explanation is that the system clock jumped backward and
+        # the previously-stored next_run_at is now stale. Recompute
+        # from cron+now and use that — otherwise the schedule would
+        # remain wedged for hours/days waiting for `now` to catch up.
+        if due_at - now > CLOCK_SKEW_FUTURE_THRESHOLD:
+            logging.warning(
+                f"[scheduled_tasks] row {r['id']} next_run_at "
+                f"{next_run_at!r} is {(due_at-now).total_seconds()/3600:.1f}h "
+                f"in the future — likely a clock-skew artefact. "
+                f"Recomputing from cron {cron!r}."
+            )
+            try:
+                nxt = _cron_next(cron, now)
+                if nxt:
+                    db.scheduled_task_update(
+                        r["id"],
+                        next_run_at=nxt.isoformat(timespec="seconds"),
+                    )
+                    due_at = nxt
+            except Exception:
+                continue
         if due_at > now:
             continue
 
@@ -699,15 +780,117 @@ def _fire_scheduled_tasks():
                 pass
             continue
 
+        # Audit #104 #5+#6: re-read row immediately before firing so
+        # we catch deletions / edits that happened between the
+        # top-of-tick snapshot and now. Tiny window, but it's exactly
+        # the window where a user clicks "Disable" / "Delete" in the
+        # UI thinking the next fire won't happen.
+        cur_row = _reread(r["id"])
+        if cur_row is None:
+            logging.info(
+                f"[scheduled_tasks] row {r['id']} was deleted between "
+                f"snapshot and fire — skipping"
+            )
+            continue
+        if not cur_row.get("enabled"):
+            logging.info(
+                f"[scheduled_tasks] row {r['id']} was disabled between "
+                f"snapshot and fire — skipping"
+            )
+            continue
+        # Use the freshly-read profiles + script_id so an edit
+        # mid-tick takes effect immediately.
+        profiles = cur_row.get("profiles") or profiles
+        live_script_id = cur_row.get("script_id") or r.get("script_id")
+
+        # Audit #104 #8: warn loudly if any profile referenced by the
+        # schedule no longer exists. Without this, the dashboard
+        # silently skips missing profiles and the user wonders why
+        # their schedule produces 0 runs.
+        if known_profiles:
+            missing = [p for p in profiles if p not in known_profiles]
+            if missing:
+                logging.warning(
+                    f"[scheduled_tasks] row {r['id']}: profile(s) "
+                    f"{missing!r} no longer exist in DB — they will "
+                    f"be silently skipped by the dashboard. Edit the "
+                    f"schedule (Settings → Scheduler) to remove them "
+                    f"or recreate the profile."
+                )
+                # If EVERY profile in the schedule is missing, this
+                # row is effectively a no-op — disable it so it stops
+                # consuming tick budget. User can re-enable after
+                # adding profiles.
+                if len(missing) == len(profiles):
+                    try:
+                        db.scheduled_task_update(r["id"], enabled=False)
+                        logging.warning(
+                            f"[scheduled_tasks] row {r['id']}: all "
+                            f"profiles missing — auto-disabled."
+                        )
+                    except Exception:
+                        pass
+                    continue
+
+        # Audit D5 (Apr 2026): skip profiles flagged needs_attention=1.
+        # main.py sets this flag when a static-proxy profile is burned
+        # (no rotation endpoint → recovery loop has nothing to do, each
+        # subsequent run just re-detects the burn and exits). Firing
+        # them again on schedule wastes runs and degrades the proxy's
+        # Google score further. The flag is auto-cleared by main.py
+        # when a healthy run starts (status != critical).
+        if hasattr(db, "profile_meta_get"):
+            healthy_profiles = []
+            blocked = []
+            for pn in profiles:
+                try:
+                    meta = db.profile_meta_get(pn) or {}
+                    if int(meta.get("needs_attention") or 0) == 1:
+                        reason = (meta.get("needs_attention_reason")
+                                  or "needs_attention=1").strip()
+                        blocked.append(f"{pn} ({reason})")
+                        continue
+                    healthy_profiles.append(pn)
+                except Exception:
+                    # On read failure, default to allowing the profile
+                    # — better to fire than to skip silently.
+                    healthy_profiles.append(pn)
+            if blocked:
+                logging.warning(
+                    f"[scheduled_tasks] row {r['id']}: skipping "
+                    f"{len(blocked)} profile(s) flagged needs_attention: "
+                    f"{', '.join(blocked)}"
+                )
+            if not healthy_profiles:
+                logging.warning(
+                    f"[scheduled_tasks] row {r['id']}: ALL "
+                    f"{len(profiles)} profile(s) flagged "
+                    f"needs_attention — bumping next_run_at without "
+                    f"firing. Clear the flag in the dashboard or run "
+                    f"GHOST_SHELL_FORCE_BURNED_RUN=1 manually."
+                )
+                try:
+                    nxt = _cron_next(cron, now)
+                    db.scheduled_task_update(
+                        r["id"],
+                        last_run_at=now.isoformat(timespec="seconds"),
+                        next_run_at=(nxt.isoformat(timespec="seconds")
+                                     if nxt else None),
+                    )
+                except Exception:
+                    pass
+                continue
+            profiles = healthy_profiles
+
         logging.info(
             f"[scheduled_tasks] firing row {r['id']} "
-            f"(script {r.get('script_id')}, {len(profiles)} profile(s))"
+            f"(script {live_script_id}, {len(profiles)} profile(s))"
         )
 
         try:
             req = urllib.request.Request(
                 f"{DASHBOARD_BASE_URL}/api/scripts/"
-                f"{int(r['script_id'])}/run",
+                f"{int(live_script_id)}/run",
                 data=_json.dumps({
                     "profiles": list(profiles),
                     "assign": False,
@@ -836,17 +1019,33 @@ def main():
         _iter_no = 0
         while not _shutdown:
             _iter_no += 1
-            cfg = load_cfg()
-            heartbeat()
-            # Verbose tick header so the user can grep "tick #" in
-            # logs and see exactly when each iteration starts + what
-            # the gates evaluate to.
-            logging.info(
-                f"-- tick #{_iter_no} at "
-                f"{datetime.now().strftime('%H:%M:%S')} "
-                f"target={cfg['target_runs']} "
-                f"hours={cfg['active_hours']}"
-            )
+            # AUDIT #104 #3 fix: each tick body MUST be wrapped in its
+            # own try/except. Previously a transient SQLite "database
+            # is locked" or a single bad cron expression in one row
+            # would propagate up and kill the entire scheduler — the
+            # outer try/finally catches it but the WHILE loop exits.
+            # Now the loop survives bad ticks; we just log + sleep +
+            # retry on the next interval.
+            try:
+                cfg = load_cfg()
+                heartbeat()
+                # Verbose tick header so the user can grep "tick #" in
+                # logs and see exactly when each iteration starts + what
+                # the gates evaluate to.
+                logging.info(
+                    f"-- tick #{_iter_no} at "
+                    f"{datetime.now().strftime('%H:%M:%S')} "
+                    f"target={cfg['target_runs']} "
+                    f"hours={cfg['active_hours']}"
+                )
+            except Exception as _tick_err:
+                logging.warning(
+                    f"[scheduler] tick #{_iter_no} setup failed: "
+                    f"{type(_tick_err).__name__}: {_tick_err} — "
+                    f"sleeping 30s and retrying"
+                )
+                time.sleep(30)
+                continue
 
             # Sprint 10.1 (ARCH-01): fire any per-script scheduled_tasks
             # whose next_run_at has elapsed. Previously the table was
@@ -1050,11 +1249,22 @@ def main():
             if _shutdown:
                 break
 
-            interval = next_fire_delay(cfg, runs_today())
+            try:
+                interval = next_fire_delay(cfg, runs_today())
+            except Exception as _delay_err:
+                logging.warning(
+                    f"[scheduler] next_fire_delay failed "
+                    f"({type(_delay_err).__name__}: {_delay_err}) — "
+                    f"defaulting to 5min retry interval"
+                )
+                interval = 300
             if interval <= 0:
                 continue
             wake_at = datetime.now() + timedelta(seconds=interval)
-            heartbeat({"next_run_at": wake_at.isoformat(timespec="seconds")})
+            try:
+                heartbeat({"next_run_at": wake_at.isoformat(timespec="seconds")})
+            except Exception:
+                pass
             logging.info(
                 f"⏰ Next run at {wake_at.strftime('%H:%M:%S')} "
                 f"(in {interval/60:.1f}min)"

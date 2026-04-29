@@ -36,6 +36,28 @@ import atexit
 import threading
 import requests
 from datetime import datetime
+
+# ──────────────────────────────────────────────────────────────
+# sys.modules alias — fix double-execution of module-level code.
+# ──────────────────────────────────────────────────────────────
+# When main.py is launched via `python -m ghost_shell monitor`,
+# ghost_shell/__main__.py calls
+#   runpy.run_module("ghost_shell.main", run_name="__main__")
+# Python registers this module under sys.modules['__main__'], NOT
+# under 'ghost_shell.main'. So when other modules later do
+#   from ghost_shell.main import parse_ads, is_captcha_page
+# (we have 3 such imports in actions/runner.py), Python doesn't
+# find 'ghost_shell.main' in sys.modules and triggers a FRESH
+# import — re-running every module-level statement: logging
+# config, [main] log lines, RUN_ID resolution, AND a brand-new
+# heartbeat thread. Symptoms in the log are duplicate
+#   [main] Proxy from GHOST_SHELL_PROXY_URL env: ...
+#   [main] Started run #N for profile '...'
+# lines mid-run, plus two pings per heartbeat interval.
+# Registering the alias right after import-time identity is known
+# means later `from ghost_shell.main import X` is a cache hit.
+if __name__ == "__main__":
+    sys.modules.setdefault("ghost_shell.main", sys.modules[__name__])
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -781,6 +803,11 @@ def parse_ads(driver, query: str) -> list[dict]:
     in the DOM itself so we can refer to the same element later by
     querySelector(`[data-gs-ad-id="..."]`).
     """
+    # D2: declare upfront so both branches below can write to the
+    # module-level scratchpad without per-branch `global` statements
+    # (which Python rejects when an assignment precedes the declaration
+    # in the same function scope).
+    global _LAST_SERP_DIAG
     js_script = r"""
     const SPONSORED_MARKERS = [
         'Sponsored', 'Реклама', 'Спонсировано', 'Спонсоване',
@@ -1173,6 +1200,12 @@ def parse_ads(driver, query: str) -> list[dict]:
         fmt_counts[f] = fmt_counts.get(f, 0) + 1
 
     if raw_ads:
+        # D2: non-empty SERP — clear the silent-demotion scratchpad so
+        # the loop doesn't carry stale diag forward. Note this fires
+        # on RAW candidates (before own-domain filter); a SERP that
+        # had only own-domain candidates (all dropped) is still a
+        # "real" SERP from Google's POV, not a silent demotion.
+        _LAST_SERP_DIAG = None
         bits = []
         for f in ("text", "shopping_carousel", "pla_grid"):
             if fmt_counts.get(f):
@@ -1200,6 +1233,10 @@ def parse_ads(driver, query: str) -> list[dict]:
                     (document.body.innerText || '').includes(m)).join(',') || 'none';
                 return out;
             """) or {}
+            # D2: stash for the search loop's silent-demotion check.
+            # Only meaningful on the 0-candidates path; non-empty
+            # SERPs reset this scratchpad explicitly below.
+            _LAST_SERP_DIAG = dict(diag) if isinstance(diag, dict) else None
             msg = (
                 f"  parser: 0 candidates — organic={diag.get('organic')} "
                 f"didyoumean={diag.get('didyoumean')} no_results={diag.get('results0')} "
@@ -1327,7 +1364,14 @@ def parse_ads(driver, query: str) -> list[dict]:
             # the single source of truth for "is this ad ours". click_ad
             # then trusts this list and clicks ONLY ads that came
             # through this filter — no independent DOM scan.
-            if any(my.lower() in domain.lower() for my in MY_DOMAINS):
+            #
+            # Audit footgun #1 fix: previously used substring `in`
+            # which had false-positives — `MY_DOMAINS=["a.com"]`
+            # blocked "a.com.evil" or "?ref=a.com" in URL. Use proper
+            # subdomain semantics: exact match OR endswith "." + my.
+            d_low = domain.lower()
+            if any(d_low == my.lower() or d_low.endswith("." + my.lower())
+                   for my in MY_DOMAINS):
                 own_filtered_count += 1
                 fmt_tag = f" [{ad_format}]" if ad_format != "text" else ""
                 logging.info(f"  - [own]{fmt_tag} {domain} — {title[:50]}")
@@ -1377,7 +1421,115 @@ def parse_ads(driver, query: str) -> list[dict]:
         else:
             logging.debug(msg)
 
+    # ── D6: cross-border TLD warning ─────────────────────────────
+    # If the profile's expected_country is set (e.g. Ukraine) but
+    # ALL kept ads have foreign TLDs (e.g. only .nl/.de/.com — no
+    # .ua), Google is showing this proxy international PLAs instead
+    # of local inventory. That's the giveaway that the IP is
+    # classified as datacenter / non-residential / out-of-geo. The
+    # warning makes this visible in the funnel without the operator
+    # having to dig through ipapi diagnostics.
+    if ads:
+        try:
+            cb = _cross_border_tld_check(ads, EXPECTED_COUNTRY)
+            if cb:
+                logging.warning(f"  parser: ⚠ {cb}")
+        except Exception as _e:
+            logging.debug(f"  cross-border tld check skipped: {_e}")
+
     return ads
+
+
+# ──────────────────────────────────────────────────────────────
+# D6: country → expected-TLD whitelist for cross-border detection
+# ──────────────────────────────────────────────────────────────
+# Map of expected-country → TLDs that count as "local" inventory.
+# We treat .com/.org/.net/.eu as country-neutral so they DON'T fire
+# the warning by themselves (most multi-country brands use .com).
+# The warning fires only when EVERY kept ad has a non-local TLD that
+# is also country-coded (e.g. .nl/.de/.fr) — that's the unambiguous
+# "Google gave us another country's inventory" signal.
+_COUNTRY_LOCAL_TLDS = {
+    "ukraine":         (".ua", ".com.ua", ".kiev.ua", ".dp.ua",
+                        ".lviv.ua", ".kh.ua", ".odessa.ua"),
+    "poland":          (".pl", ".com.pl"),
+    "germany":         (".de",),
+    "netherlands":     (".nl",),
+    "france":          (".fr",),
+    "spain":           (".es",),
+    "italy":           (".it",),
+    "united kingdom":  (".uk", ".co.uk"),
+    "united states":   (".us",),
+    "russia":          (".ru", ".рф"),
+    "belarus":         (".by",),
+    "kazakhstan":      (".kz",),
+}
+# Country-neutral TLDs — presence of any of these in the kept ads
+# means we shouldn't fire the warning (the inventory is plausibly
+# local even if no ccTLD matches).
+_COUNTRY_NEUTRAL_TLDS = (
+    ".com", ".org", ".net", ".info", ".biz", ".eu", ".io",
+    ".store", ".shop", ".online", ".site",
+)
+
+
+def _cross_border_tld_check(ads: list[dict], expected_country: str) -> str | None:
+    """Return a warning message if ALL kept ads have non-local
+    country-coded TLDs while expected_country has a known whitelist.
+    Returns None if everything looks fine, the country is unknown,
+    or any neutral/local TLD is present.
+    """
+    if not ads or not expected_country:
+        return None
+    locals_ = _COUNTRY_LOCAL_TLDS.get(expected_country.lower())
+    if not locals_:
+        return None  # unknown country mapping — silently skip
+
+    foreign_ccTLDs = []   # list of (domain, foreign_tld) for the warning
+    has_neutral_or_local = False
+    for ad in ads:
+        d = (ad.get("domain") or "").lower().rstrip(".")
+        if not d:
+            continue
+        # Match local first (longest match wins via `endswith`).
+        if any(d.endswith(t) for t in locals_):
+            has_neutral_or_local = True
+            break
+        # Foreign country-coded? Check all OTHER countries first —
+        # if a foreign ccTLD matches, that wins over a neutral suffix
+        # check (e.g. "praxisdienst.com" doesn't match a foreign
+        # ccTLD but should be treated as neutral; "merkala.nl" must
+        # be classified as foreign-NL even though it ends in a TLD).
+        matched_foreign = False
+        for cc, tlds in _COUNTRY_LOCAL_TLDS.items():
+            if cc == expected_country.lower():
+                continue
+            for t in tlds:
+                if d.endswith(t):
+                    foreign_ccTLDs.append((d, t))
+                    matched_foreign = True
+                    break
+            if matched_foreign:
+                break
+        if matched_foreign:
+            continue
+        # Country-neutral TLD? Treat as plausibly local.
+        if any(d.endswith(t) for t in _COUNTRY_NEUTRAL_TLDS):
+            has_neutral_or_local = True
+            break
+    if has_neutral_or_local:
+        return None
+    if not foreign_ccTLDs:
+        return None
+    # All kept ads are foreign-ccTLD — fire the warning.
+    sample = ", ".join(f"{d}({t})" for d, t in foreign_ccTLDs[:3])
+    more = f" (+{len(foreign_ccTLDs) - 3} more)" if len(foreign_ccTLDs) > 3 else ""
+    return (
+        f"cross-border SERP: expected {expected_country} but ALL "
+        f"{len(foreign_ccTLDs)} kept ad(s) have foreign ccTLDs — "
+        f"{sample}{more}. Likely datacenter / non-residential IP. "
+        f"Check proxy provider."
+    )
 
 
 # ── Per-scan log dedupe ──────────────────────────────────────
@@ -1510,13 +1662,22 @@ def run_post_ad_pipeline(browser, ad: dict, query: str = None):
 # ──────────────────────────────────────────────────────────────
 
 def search_query(browser, query: str, sqm: SessionQualityMonitor,
-                 current_ip: str = None, watchdog=None) -> list[dict]:
+                 current_ip: str = None, watchdog=None,
+                 defer_serp_behavior: bool = False) -> list[dict]:
     """
     Single query execution:
     - Open direct search URL (eager page load — returns at DOMContentLoaded)
     - Try to parse ads immediately; poll briefly if SERP still rendering
     - Refresh-loop until ads appear (or max attempts)
     - Parse & return ads
+
+    `defer_serp_behavior=True` (set by callers that will run a click
+    pipeline on the returned ads) skips the post-parse SERP behavior
+    block — scroll/dwell/organic-click. Without this, scrolling the
+    SERP after parse_ads re-renders Google's PLA carousel and wipes
+    the data-gs-ad-id stamps we just placed, breaking click_ad
+    anchor lookup. Caller should run post_ads_behavior() ITSELF
+    after the click pipeline finishes (see Fix A April 2026).
 
     Why this is fast now:
       • page_load_strategy='eager' cuts 5-10s by not waiting for tracker
@@ -1629,10 +1790,48 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
                     # plausible browsing context (referer chain,
                     # cookies, request volume) before we go back to
                     # the SERP.
+                    # Audit #105 #6: warmup failure was previously
+                    # logged at DEBUG and the run continued straight
+                    # to the SERP — exactly the "cold IP + no
+                    # browsing context" pattern Recovery #3 was
+                    # designed to prevent. Bump to WARNING so the
+                    # operator sees it, AND fall back to a single
+                    # lightweight HTTPS visit if the multi-site
+                    # warmup pool failed entirely (geo-blocked / all
+                    # sites down for this exit IP).
+                    _warmup_visited = False
                     try:
-                        _post_rotation_warmup(driver, browser=browser)
+                        _warmup_visited = bool(
+                            _post_rotation_warmup(driver, browser=browser)
+                        )
                     except Exception as e:
-                        logging.debug(f"  warmup error (non-fatal): {e}")
+                        logging.warning(
+                            f"  ⚠ post-rotation warmup raised "
+                            f"({type(e).__name__}: {e}) — Recovery #3 "
+                            f"degraded; cold-IP signal possible on "
+                            f"next request"
+                        )
+                    if not _warmup_visited:
+                        try:
+                            # Last-ditch fallback: visit www.google.com
+                            # itself (HTTPS, lightweight homepage,
+                            # already in our cookie jar). At least
+                            # primes one TCP connection + HTTP cookie
+                            # round-trip on the new IP before the
+                            # SERP query lands.
+                            driver.set_page_load_timeout(8)
+                            driver.get("https://www.google.com/robots.txt")
+                            time.sleep(random.uniform(1.0, 2.5))
+                            logging.info(
+                                f"  Recovery #3 fallback: visited "
+                                f"google.com/robots.txt to warm new IP"
+                            )
+                        except Exception as _wf_err:
+                            logging.warning(
+                                f"  ⚠ warmup fallback also failed "
+                                f"({type(_wf_err).__name__}); "
+                                f"proceeding with cold IP"
+                            )
                     try:
                         driver.get(search_url)
                         time.sleep(random.uniform(1.5, 3.0))
@@ -1825,15 +2024,26 @@ def search_query(browser, query: str, sqm: SessionQualityMonitor,
             # them would DEFEAT the research purpose: organic-click
             # on a target is exactly the high-signal engagement we
             # want to occasionally generate for them.
-            try:
-                from ghost_shell.browser.serp_behavior import post_ads_behavior
-                post_ads_behavior(
-                    driver, DB,
-                    exclude_domains=list(MY_DOMAINS or []),
-                    watchdog=watchdog,
-                )
-            except Exception as e:
-                logging.debug(f"  SERP behavior failed: {e}")
+            # Fix A (Apr 2026): when callers will run a click pipeline
+            # on these ads (foreach_ad → click_ad), do NOT scroll the
+            # SERP yet. scroll_through_serp re-renders Google's PLA
+            # carousels, replacing the <a> elements parse_ads just
+            # stamped with data-gs-ad-id. The result was 7/7 click_ad
+            # failures with "couldn't locate ad anchor" 30s after
+            # parse. The caller is responsible for invoking
+            # post_ads_behavior AFTER its click pipeline finishes (or
+            # not at all, if the unified-flow script has its own
+            # human-shaped behavior steps).
+            if not defer_serp_behavior:
+                try:
+                    from ghost_shell.browser.serp_behavior import post_ads_behavior
+                    post_ads_behavior(
+                        driver, DB,
+                        exclude_domains=list(MY_DOMAINS or []),
+                        watchdog=watchdog,
+                    )
+                except Exception as e:
+                    logging.debug(f"  SERP behavior failed: {e}")
 
             return ads
 
@@ -1995,7 +2205,31 @@ RUN_COUNTERS = {
     "total_queries":  0,   # Successful queries (ads > 0)
     "total_empty":    0,   # Queries that returned no ads
     "total_captchas": 0,   # Captcha hits (any recovery action)
+    # Audit D2 (Apr 2026): silent demotion = SERP looks healthy
+    # (organic results present, no recaptcha, not a "did you mean"
+    # spelling rescue) but parser found 0 ads. Different from
+    # genuine "no advertisers in this market" because we can't tell
+    # them apart from a single sample — only the streak gives it away.
+    # When this counter hits SILENT_DEMOTION_BURN_THRESHOLD inside
+    # one run, we synthesize a captcha-equivalent event so Recovery #4
+    # (FP regen after N captcha) and the burn-detection logic can
+    # react. Resets to 0 on the first non-empty SERP.
+    "consecutive_silent_demotions":  0,
+    "total_silent_demotions":        0,
 }
+
+# Module-level scratchpad: parse_ads stashes its zero-ads diag dict
+# here (organic count, recaptcha state, etc.) so the search loop can
+# decide whether the empty SERP was a silent demotion or a genuine
+# "no advertisers" outcome. Filled only on the 0-candidates path,
+# cleared on any non-empty SERP. Safe in single-process main.py.
+_LAST_SERP_DIAG: dict | None = None
+
+# Threshold for silent-demotion burn synthesis. 3 consecutive empties
+# with healthy organic feels right for the GoodMedika case (every
+# search returned 0 ads despite full SERP). Keep low because waiting
+# 5+ runs to react means 5+ wasted queries on a flagged IP.
+SILENT_DEMOTION_BURN_THRESHOLD = 3
 
 
 def run_monitor():
@@ -2216,12 +2450,111 @@ def run_monitor():
                 f"normal cadence still every {selfcheck_every} runs"
             )
 
-        # 1. Profile health sanity check (soft: never aborts on first runs)
+        # 1. Profile health sanity check
+        # ────────────────────────────────────────────────────────
+        # Audit D1 (Apr 2026): the previous behaviour ("proceeding
+        # anyway — disable this check if too strict") meant that a
+        # critically burned profile (e.g. 100% captcha rate over 24h)
+        # kept hammering the same dead IP run after run, every search
+        # returned 0 ads, and Google's bad-IP score for the proxy got
+        # WORSE. The block is now hard:
+        #
+        #   • IS_ROTATING_PROXY=true  →  proceed. The burn-aware
+        #     override above (line ~2172) already forced should_rotate
+        #     this run, so by the time we get here we have a fresh IP
+        #     and the burn diagnosis is from the OLD IP — safe to run.
+        #
+        #   • IS_ROTATING_PROXY=false (static proxy) →  ABORT. There
+        #     is no rotation endpoint for the recovery loop to call,
+        #     so each subsequent run will just re-detect the same
+        #     burn. Set profiles.needs_attention=1 with a reason so
+        #     the dashboard can render a banner and the scheduler can
+        #     skip this profile until the user fixes the proxy or
+        #     manually clears the flag.
+        #
+        #   • Override:  GHOST_SHELL_FORCE_BURNED_RUN=1 in env lets
+        #     ops force a single run for diagnostics (e.g. "I just
+        #     swapped the proxy, let me prove the new one works").
+        #     The override does NOT clear needs_attention — only a
+        #     subsequent healthy run does that.
         sqm = SessionQualityMonitor(browser.user_data_path)
         should_abort, reason = sqm.should_abort()
+        force_burned_run = os.environ.get(
+            "GHOST_SHELL_FORCE_BURNED_RUN"
+        ) in ("1", "true", "yes")
         if should_abort:
             logging.warning(f"  ⚠ profile health: {reason}")
-            logging.warning(f"    (proceeding anyway — disable this check if too strict)")
+            if IS_ROTATING_PROXY:
+                # The override at line ~2172 already forced rotation
+                # for THIS run, so we now sit on a fresh exit IP.
+                # The burn judgement was from the OLD IP — proceed.
+                logging.info(
+                    "    rotating proxy → already rotated to a fresh IP "
+                    "above; proceeding (status will reset as healthy "
+                    "runs accumulate)"
+                )
+                # Persist the diagnosis but don't block: needs_attention
+                # stays 0 because we have a recovery path.
+            elif force_burned_run:
+                logging.warning(
+                    "    GHOST_SHELL_FORCE_BURNED_RUN=1 → proceeding "
+                    "despite static proxy + burned profile (one-shot "
+                    "diagnostic override). Flag persists until next "
+                    "healthy run."
+                )
+                try:
+                    DB.profile_meta_upsert(
+                        PROFILE_NAME,
+                        needs_attention        = 1,
+                        needs_attention_reason = (reason or "burned")[:240],
+                        needs_attention_at     = datetime.now().isoformat(
+                            timespec="seconds"
+                        ),
+                    )
+                except Exception as _e:
+                    logging.debug(f"  needs_attention persist skipped: {_e}")
+            else:
+                # Hard block: static proxy + burned + no override.
+                blk_msg = (
+                    f"profile burned and proxy is static (no rotation "
+                    f"endpoint). Recovery loop has nothing it can do. "
+                    f"Reason: {reason}. To force one diagnostic run set "
+                    f"GHOST_SHELL_FORCE_BURNED_RUN=1 in env."
+                )
+                log_error_banner("RUN BLOCKED — needs attention", blk_msg)
+                try:
+                    DB.profile_meta_upsert(
+                        PROFILE_NAME,
+                        needs_attention        = 1,
+                        needs_attention_reason = (reason or "burned")[:240],
+                        needs_attention_at     = datetime.now().isoformat(
+                            timespec="seconds"
+                        ),
+                    )
+                except Exception as _e:
+                    logging.debug(f"  needs_attention persist skipped: {_e}")
+                # Exit code 75 = EX_TEMPFAIL (BSD sysexits convention,
+                # widely used to signal "service unavailable, retry
+                # later or fix config"). Scheduler already treats
+                # non-zero as failure; UI will show needs_attention.
+                sys.exit(75)
+        else:
+            # Healthy run — auto-clear any stale needs_attention flag.
+            # We only do this when we ALREADY have data (not on first
+            # run where total_in_log<3) so we don't clear flags before
+            # the metrics catch up.
+            try:
+                _h = sqm.get_health()
+                if _h.get("status") in ("healthy", "warning") and \
+                   _h.get("total_in_log", 0) >= 3:
+                    DB.profile_meta_upsert(
+                        PROFILE_NAME,
+                        needs_attention        = 0,
+                        needs_attention_reason = None,
+                        needs_attention_at     = None,
+                    )
+            except Exception as _e:
+                logging.debug(f"  needs_attention clear skipped: {_e}")
 
         if should_selfcheck:
             # 2. Fingerprint self-check (writes to DB + profile file)
@@ -2447,10 +2780,32 @@ def run_monitor():
                             DB._get_conn().commit()
                         except Exception as e:
                             logging.debug(f"  warmup_runs insert: {e}")
-                    logging.info(
-                        f"  ✓ warmup completed: visited "
-                        f"{res.get('sites_visited', 0)} sites"
-                    )
+                    # D3: log full visit outcome including reasons.
+                    # Previously this line always said "visited 0
+                    # sites" because hybrid_warmup() returned None
+                    # and res.get('sites_visited', 0) defaulted to 0.
+                    # Now we surface succeeded/visited/planned + the
+                    # `notes` reason string for any non-perfect run.
+                    visited_n   = res.get("sites_visited", 0)
+                    succeeded_n = res.get("sites_succeeded", visited_n)
+                    planned_n   = res.get("sites_planned", 0)
+                    notes       = (res.get("notes") or "").strip()
+                    if planned_n and succeeded_n == planned_n:
+                        logging.info(
+                            f"  ✓ warmup completed: {succeeded_n}/"
+                            f"{planned_n} sites ok"
+                        )
+                    elif planned_n:
+                        # Partial / failed warmup — log at WARNING so
+                        # ops sees the reason without DEBUG enabled.
+                        logging.warning(
+                            f"  ⚠ warmup partial: {succeeded_n}/"
+                            f"{planned_n} sites ok ({notes})"
+                        )
+                    else:
+                        # 0 planned visits (e.g. short_visits=False
+                        # or skip path). Log notes verbatim.
+                        logging.info(f"  ✓ warmup: {notes or 'cookies-only'}")
                 except Exception as e:
                     logging.warning(f"  ✗ warmup failed: {e}")
                     if warmup_id:
@@ -2565,12 +2920,22 @@ def run_monitor():
 
             def _cb_search(q: str):
                 """Callback for search_query step — returns the ads list.
-                Shared between unified and legacy paths."""
+                Shared between unified and legacy paths.
+
+                Fix A (Apr 2026): pass defer_serp_behavior=True so
+                search_query skips its own scroll/dwell pass. The
+                unified-flow / main_script path that called us will
+                run its own click pipeline next, and PLA carousels
+                must remain stamped until those clicks resolve.
+                Scripts that want post-click human behavior should
+                add explicit `dwell` / `scroll` steps after foreach_ad.
+                """
                 try:
                     ads = search_query(
                         browser, q, sqm,
                         current_ip=current_ip,
                         watchdog=dog,
+                        defer_serp_behavior=True,
                     )
                     if ads:
                         save_ads(ads)
@@ -2679,10 +3044,18 @@ def run_monitor():
                         break
 
                 t0 = time.time()
+                # Fix A (Apr 2026): only defer SERP behavior when we
+                # actually have a click pipeline that will run after
+                # parse. Empty pipeline → harmless to scroll, and
+                # legacy users without scripts still want the
+                # human-shaped post-parse behavior to fire.
+                _legacy_will_click = bool(POST_AD_ACTIONS) or \
+                                     bool(ON_TARGET_DOMAIN_ACTIONS)
                 try:
                     ads = search_query(browser, query, sqm,
                                        current_ip=current_ip,
-                                       watchdog=dog)
+                                       watchdog=dog,
+                                       defer_serp_behavior=_legacy_will_click)
                 except Exception as e:
                     # Catch "chrome not reachable" / "session deleted" / etc
                     # — these mean the browser died mid-query. Try to
@@ -2758,9 +3131,97 @@ def run_monitor():
                     RUN_COUNTERS["total_ads"] += len(ads)
                     if IS_ROTATING_PROXY and current_ip:
                         browser.report_rotating(current_ip, success=True)
+                    # D2: non-empty result — break any silent-demotion streak.
+                    RUN_COUNTERS["consecutive_silent_demotions"] = 0
                 else:
                     sqm.record("search_empty", query=query, duration_sec=duration)
                     RUN_COUNTERS["total_empty"] += 1
+
+                    # ── D2: silent demotion detector ────────────────────
+                    # An empty-but-healthy SERP is the giveaway for an IP
+                    # that Google has silently demoted (no captcha, no
+                    # block screen, just no PLA / sponsored slots given
+                    # to this datacenter / fingerprint). The signature:
+                    #
+                    #   • parser found 0 ads
+                    #   • organic results are plentiful (>= 5)
+                    #   • no recaptcha iframe
+                    #   • not a "did you mean" spelling rescue page
+                    #   • no "0 results" no-match message
+                    #
+                    # Single empty SERP can be legitimate (niche query,
+                    # no advertisers). The streak across multiple
+                    # different queries is what makes it diagnostic.
+                    # Once SILENT_DEMOTION_BURN_THRESHOLD is hit we
+                    # synthesize a captcha event so Recovery #4 (FP
+                    # regen after N captcha) can react, AND we bump
+                    # total_captchas so the post-run health snapshot
+                    # records the burn signal.
+                    try:
+                        d = _LAST_SERP_DIAG or {}
+                        organic_n = int(d.get("organic") or 0)
+                        is_silent = (
+                            organic_n >= 5
+                            and not d.get("recaptcha")
+                            and not d.get("didyoumean")
+                            and not d.get("results0")
+                        )
+                        if is_silent:
+                            RUN_COUNTERS["consecutive_silent_demotions"] += 1
+                            RUN_COUNTERS["total_silent_demotions"] += 1
+                            streak = RUN_COUNTERS["consecutive_silent_demotions"]
+                            logging.warning(
+                                f"  ⚠ silent demotion streak {streak}/"
+                                f"{SILENT_DEMOTION_BURN_THRESHOLD} "
+                                f"(empty ads but organic={organic_n}, no "
+                                f"captcha) — IP likely shadow-banned for "
+                                f"ads inventory"
+                            )
+                            if streak == SILENT_DEMOTION_BURN_THRESHOLD:
+                                logging.warning(
+                                    "  ⚠ silent demotion threshold reached "
+                                    "— synthesizing captcha event so Recovery "
+                                    "loop and burn-detection can react. "
+                                    "Recommend manual proxy swap if streak "
+                                    "doesn't break."
+                                )
+                                # Synthetic captcha event — feeds:
+                                #   1) sqm.captcha_rate_24h (used by
+                                #      should_abort + needs_attention)
+                                #   2) RUN_COUNTERS.total_captchas (the
+                                #      run-summary banner + Recovery #4
+                                #      threshold check)
+                                #   3) silent_demotion event (new) for
+                                #      timeline / forensics on the
+                                #      health page.
+                                try:
+                                    sqm.record(
+                                        "silent_demotion",
+                                        query=query,
+                                        details=(
+                                            f"streak={streak} "
+                                            f"organic={organic_n}"
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    sqm.record(
+                                        "captcha",
+                                        query=query,
+                                        details="synthesized:silent_demotion",
+                                    )
+                                except Exception:
+                                    pass
+                                RUN_COUNTERS["total_captchas"] += 1
+                        else:
+                            # Empty SERP but NOT silent demotion (genuine
+                            # niche / no-results / captcha-already-fired).
+                            # Reset streak so a single off-pattern empty
+                            # doesn't re-trigger threshold next loop.
+                            RUN_COUNTERS["consecutive_silent_demotions"] = 0
+                    except Exception as _e:
+                        logging.debug(f"  silent-demotion check skipped: {_e}")
 
                 # Save and run action pipeline per ad (can take a while → pause)
                 save_ads(ads)
@@ -2770,6 +3231,25 @@ def run_monitor():
                             run_post_ad_pipeline(browser, ad, query=query)
 
                 all_ads.extend(ads)
+
+                # Fix A (Apr 2026): if we deferred SERP behavior so
+                # the click pipeline could run on still-stamped DOM,
+                # run it NOW (after clicks). This preserves the
+                # human-shaped "read SERP / scroll / occasional
+                # organic click" pattern between queries without
+                # destroying parse_ads stamps before they get used.
+                # No-op when defer didn't fire (search_query
+                # already ran post_ads_behavior internally).
+                if _legacy_will_click and ads:
+                    try:
+                        from ghost_shell.browser.serp_behavior import post_ads_behavior
+                        post_ads_behavior(
+                            browser.driver, DB,
+                            exclude_domains=list(MY_DOMAINS or []),
+                            watchdog=dog,
+                        )
+                    except Exception as e:
+                        logging.debug(f"  post-pipeline SERP behavior failed: {e}")
 
                 # Gap between queries
                 if i < len(SEARCH_QUERIES):
@@ -2837,6 +3317,24 @@ if __name__ == "__main__":
         exit_code = 130
         error_msg = "Interrupted by user (Ctrl+C)"
         logging.warning(error_msg)
+    except SystemExit as _se:
+        # Audit D1 fix (Apr 2026): the burned-profile block uses
+        # sys.exit(75) inside run_monitor() to signal "needs attention,
+        # do not retry until human intervenes". SystemExit doesn't
+        # inherit from Exception, so the `except Exception` arm below
+        # would NOT catch it — and the original exit_code=0 would
+        # leak through to DB.run_finish(), making the dashboard show
+        # the run as successful. Capture the code here and let the
+        # finally block record it correctly.
+        try:
+            exit_code = int(_se.code) if _se.code is not None else 0
+        except (TypeError, ValueError):
+            # sys.exit("string") sets code to the string, not an int.
+            # Fall back to 1 and stash the message for run_finish.
+            exit_code = 1
+            error_msg = str(_se.code)[:240]
+        if exit_code == 75 and not error_msg:
+            error_msg = "blocked: profile needs attention (D1)"
     except Exception as e:
         exit_code = 1
         error_msg = f"{type(e).__name__}: {e}"

@@ -160,30 +160,144 @@ class ProxyDiagnostics:
 
     def ip_reputation_hint(self, ip_info: dict) -> dict:
         """
-        Simple heuristic: if org/ASN contains 'hosting', 'cloud',
-        'datacenter' — proxy на датацентровом IP (high detection risk)
+        Audit D4 (Apr 2026): two-layer datacenter detection.
+
+        Layer 1 — substring match on org/ISP string. Catches the
+        obvious ones (AWS, OVH, Hetzner, etc.).
+
+        Layer 2 — explicit blacklist of known datacenter providers
+        whose names DON'T contain any of the generic markers in
+        Layer 1. The motivating example: "HIVELOCITY, Inc." doesn't
+        match "hosting", "cloud", "data center" or any other generic
+        marker, so the previous code returned "unknown" despite
+        Hivelocity being a major US colocation/dedicated-server
+        provider whose UA-located IPs Google reliably classifies as
+        datacenter and demotes ad inventory for. This was the exact
+        cause of the 2026-04-29 GoodMedika incident: UA-located
+        proxy, but the IP was on a Hivelocity rack and Google
+        served Dutch (NL) PLA inventory as a soft demotion.
         """
         if not ip_info.get("ok"):
             return {"hint": "unknown", "risk": "unknown"}
 
         org = (ip_info.get("org") or "").lower()
+        asn = (ip_info.get("asn") or "").lower()
+
+        # Generic markers — catch obviously-named hosts.
         datacenter_markers = [
             "hosting", "cloud", "datacenter", "data center", "dedicated",
-            "server", "vps", "ovh", "amazon", "aws", "digitalocean",
-            "vultr", "linode", "hetzner", "leaseweb",
+            "server", "vps", "vds", "colocation", "colo",
+            # Big-name providers people actually use:
+            "amazon", "aws", "google llc", "gcp", "azure", "microsoft",
+            "oracle", "alibaba",
+            "ovh", "ovhcloud", "digitalocean", "vultr", "linode",
+            "hetzner", "leaseweb", "scaleway", "online sas",
+            "contabo", "kamatera", "upcloud", "softlayer",
+            "akamai", "cloudflare", "fastly",
         ]
+
+        # Layer 2: explicit blacklist of known datacenter networks that
+        # don't match the generic markers above. ASN, name fragment,
+        # and short rationale paired so we can log WHICH entry tripped
+        # the warning. Lowercase substrings — matched against org+asn
+        # concatenation. Add new entries as ops encounters them.
+        explicit_datacenter_blacklist = [
+            ("hivelocity",      "Hivelocity (US colocation/dedicated)"),
+            ("m247",            "M247 (UK datacenter, frequent VPN backbone)"),
+            ("colocrossing",    "ColoCrossing (US colocation)"),
+            ("quadranet",       "QuadraNet (US datacenter)"),
+            ("psychz",          "Psychz Networks (US datacenter)"),
+            ("nexeon",          "Nexeon Technologies (US datacenter)"),
+            ("hostway",         "Hostway (US datacenter)"),
+            ("inmotion",        "InMotion Hosting"),
+            ("rackspace",       "Rackspace"),
+            ("liquidweb",       "Liquid Web"),
+            ("limestone",       "Limestone Networks"),
+            ("incero",          "Incero LLC (datacenter)"),
+            ("iomart",          "iomart (UK datacenter)"),
+            ("netcup",          "netcup GmbH (DE datacenter)"),
+            ("ionos",           "IONOS / 1&1"),
+            ("worldstream",     "WorldStream (NL datacenter)"),
+            ("serverius",       "Serverius (NL datacenter)"),
+            ("evoxt",           "Evoxt (datacenter)"),
+            ("greencloud",      "GreenCloud"),
+            ("buyvm",           "BuyVM / Frantech (datacenter)"),
+            ("frantech",        "Frantech / BuyVM"),
+            ("choopa",          "Choopa LLC (datacenter, Vultr parent)"),
+            ("constant company","Constant Company / Vultr"),
+            ("turnkey internet","TurnKey Internet (datacenter)"),
+            ("microsoft corporation", "Microsoft Azure"),
+            # Common ASN prefixes for cloud (caught via asn field too):
+            ("as14061",         "DigitalOcean (ASN match)"),
+            ("as16509",         "Amazon AWS (ASN match)"),
+            ("as14618",         "Amazon AWS (ASN match)"),
+            ("as15169",         "Google Cloud / GCP (ASN match)"),
+            ("as8075",          "Microsoft Azure (ASN match)"),
+            ("as20473",         "Choopa / Vultr (ASN match)"),
+            ("as63949",         "Akamai Linode (ASN match)"),
+            ("as24940",         "Hetzner (ASN match)"),
+            ("as16276",         "OVH (ASN match)"),
+            ("as29761",         "Hivelocity (ASN match)"),
+        ]
+
         residential_markers = [
             "telecom", "broadband", "communications", "mobile", "cable",
             "kyivstar", "lifecell", "vodafone", "ukrtelecom", "localnet",
             "triolan", "volia", "fregat", "maxnet", "inet", "datagroup",
             "intertelecom", "megaphone", "mts", "rostelecom", "beeline",
+            "isp", "fttx", "fiber",
         ]
 
-        if any(m in org for m in datacenter_markers):
-            return {"hint": "datacenter", "risk": "high", "org": ip_info.get("org")}
+        org_asn = f"{org} {asn}"
+
+        # Layer 1: generic substring match.
+        for m in datacenter_markers:
+            if m in org_asn:
+                return {
+                    "hint":     "datacenter",
+                    "risk":     "high",
+                    "org":      ip_info.get("org"),
+                    "matched":  m,
+                    "warning":  (
+                        f"Datacenter IP detected (matched marker {m!r} "
+                        f"in {ip_info.get('org')!r}). Google reliably "
+                        f"demotes ad inventory for datacenter ranges — "
+                        f"expect 0-ad SERPs and cross-border PLAs. "
+                        f"Switch to residential or mobile proxy."
+                    ),
+                }
+
+        # Layer 2: explicit blacklist by name/ASN.
+        for needle, rationale in explicit_datacenter_blacklist:
+            if needle in org_asn:
+                return {
+                    "hint":     "datacenter",
+                    "risk":     "high",
+                    "org":      ip_info.get("org"),
+                    "matched":  needle,
+                    "warning":  (
+                        f"Datacenter IP detected: {rationale}. Google "
+                        f"reliably demotes ad inventory for these "
+                        f"ranges. Switch to residential or mobile proxy."
+                    ),
+                }
+
         if any(m in org for m in residential_markers):
-            return {"hint": "residential", "risk": "low", "org": ip_info.get("org")}
-        return {"hint": "unknown", "risk": "medium", "org": ip_info.get("org")}
+            return {
+                "hint":  "residential",
+                "risk":  "low",
+                "org":   ip_info.get("org"),
+            }
+        return {
+            "hint":     "unknown",
+            "risk":     "medium",
+            "org":      ip_info.get("org"),
+            "warning":  (
+                "Provider not classified as residential or datacenter. "
+                "If the same proxy keeps yielding cross-border / 0-ad "
+                "SERPs, treat it as datacenter and replace it."
+            ),
+        }
 
     # ──────────────────────────────────────────────────────────
     # FULL CHECK
@@ -261,6 +375,9 @@ class ProxyDiagnostics:
         rep = report.get("reputation", {})
         rep_icon = {"low": "✓", "medium": "⚠", "high": "✗"}.get(rep.get("risk"), "?")
         print(f"\n {rep_icon} IP Type:     {rep.get('hint')} (detection risk: {rep.get('risk')})")
+        # D4: surface the actionable warning line if present.
+        if rep.get("warning"):
+            print(f"   {rep['warning']}")
 
         tz = report.get("timezone", {})
         tz_icon = "✓" if tz.get("ok") else "✗"
@@ -358,6 +475,33 @@ def test_proxy(proxy_url: str, timeout: float = 10.0) -> dict:
             ip_type = "residential"
         else:
             ip_type = "residential"
+
+        # D4 (Apr 2026): ip-api.com's `hosting` flag misses some big
+        # colocation providers (e.g. Hivelocity, M247, Choopa) that
+        # Google treats as datacenter. Cross-check the org/ISP/AS
+        # string against an explicit blacklist and force-promote
+        # ip_type=datacenter when matched.
+        try:
+            org_str = (
+                f"{data.get('isp') or ''} "
+                f"{data.get('org') or ''} "
+                f"{data.get('as')  or ''}"
+            ).lower()
+            DATACENTER_BLACKLIST = (
+                "hivelocity", "m247", "colocrossing", "quadranet",
+                "psychz", "choopa", "constant company", "frantech",
+                "buyvm", "leaseweb", "worldstream", "serverius",
+                "incero", "limestone", "nexeon", "hostway",
+                "rackspace", "liquidweb", "iomart", "netcup",
+                "ionos", "1&1", "as14061", "as16509", "as15169",
+                "as8075", "as20473", "as24940", "as16276", "as29761",
+            )
+            for needle in DATACENTER_BLACKLIST:
+                if needle in org_str:
+                    ip_type = "datacenter"
+                    break
+        except Exception:
+            pass
 
         # Detection risk heuristic — consumers see this as a traffic
         # light. Datacenter or known-proxy = high risk for stealth work;

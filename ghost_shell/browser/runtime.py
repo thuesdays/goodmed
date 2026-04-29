@@ -92,15 +92,29 @@ def _read_gs_lock(lock_path):
 
 def _heartbeat_age_sec(lock_data, lock_path):
     """Seconds since last heartbeat. Falls back to file mtime for
-    legacy plain-PID locks. None if unknown."""
+    legacy plain-PID locks. None if unknown.
+
+    Clock-skew guard (audit #102 RC-04): if the system clock jumped
+    backwards (NTP correction, manual set, hibernate-resume drift),
+    a freshly-written heartbeat could land in the "future" and the
+    naive subtraction returns a negative age. _is_lock_live() then
+    sees age < STALE_THRESHOLD and reports the lock as live forever
+    even when the process is actually dead — every subsequent launch
+    fails with "active run" until the clock catches up. Clamp to 0
+    so a future-dated heartbeat is treated as "just now" (still
+    considered live, but it'll age out normally in the next 180s
+    instead of indefinitely).
+    """
     hb = (lock_data or {}).get("heartbeat_at")
     if hb:
         try:
-            return (datetime.now() - datetime.fromisoformat(hb)).total_seconds()
+            age = (datetime.now() - datetime.fromisoformat(hb)).total_seconds()
+            return max(age, 0.0)
         except (ValueError, TypeError):
             pass
     try:
-        return time.time() - os.path.getmtime(lock_path)
+        age = time.time() - os.path.getmtime(lock_path)
+        return max(age, 0.0)
     except OSError:
         return None
 
@@ -754,6 +768,23 @@ class GhostShellBrowser:
                 pass
             self._traffic_collector = None
 
+        # Stop watchdog daemon thread (audit #102 RC-07): _watchdog_thread
+        # was started by _start_once() before the failure point, but
+        # never explicitly stopped on the failed-start path. Each retry
+        # spawned a NEW watchdog thread without terminating the old one,
+        # so on a 3-attempt loop with 2 failures we ended up with 3
+        # daemon threads racing to ping a dead driver. Setting the stop
+        # event here lets the existing thread exit on its next tick;
+        # daemon=True still ensures process-exit cleanup, but this
+        # closes the window during long-running parent processes
+        # (dashboard, scheduler) where retries accumulate.
+        try:
+            if getattr(self, "_watchdog_stop", None) is not None:
+                self._watchdog_stop.set()
+            self._watchdog_thread = None
+        except Exception:
+            pass
+
     # ──────────────────────────────────────────────────────────
     # Lock heartbeat — keeps .ghost_shell.lock fresh while we run
     # ──────────────────────────────────────────────────────────
@@ -1394,6 +1425,28 @@ class GhostShellBrowser:
                         f"[GhostShellBrowser] extension {row.get('extension_id')!r} "
                         f"has no pool_path or it doesn't exist on disk -- skipping"
                     )
+            # Final existence check (audit #102 RC-10): between the
+            # earlier per-extension validation and Chrome actually
+            # spawning, another process (extension pool GC, manual
+            # delete, bulk-create cleanup) could remove the directory.
+            # Chrome would then silently fail to load the extension, or
+            # SessionNotCreatedException at launch, both invisible to
+            # the user. Re-stat right before building the flag so we
+            # drop ghost paths instead of feeding them to Chrome.
+            if ext_paths:
+                _alive_paths = []
+                for _pp in ext_paths:
+                    if os.path.isdir(_pp) and os.path.isfile(
+                            os.path.join(_pp, "manifest.json")):
+                        _alive_paths.append(_pp)
+                    else:
+                        logging.warning(
+                            f"[GhostShellBrowser] extension dir vanished "
+                            f"between validation and launch: {_pp!r} — "
+                            f"dropping (the pool entry got cleaned up by "
+                            f"another process while we were preparing)"
+                        )
+                ext_paths = _alive_paths
             if ext_paths:
                 joined = ",".join(ext_paths)
                 options.add_argument(f"--load-extension={joined}")
@@ -1659,11 +1712,32 @@ class GhostShellBrowser:
         # All language handling goes through the C++ payload →
         # GhostShellConfig::{language_, languages_, accept_language_}.
 
-        # Local Proxy Forwarder
+        # Local Proxy Forwarder.
+        # Bind-failure guard (audit #102 RC-05): if ProxyForwarder.start()
+        # raises before successfully binding (port collision, permission
+        # denied, transient socket error), the half-initialised
+        # forwarder object would otherwise be stored in
+        # self._proxy_forwarder and cleanup couldn't always stop() it
+        # cleanly — leading to port-exhaustion across retries on flaky
+        # systems. Wrap so that on exception we clear the attribute
+        # AND propagate (so the start() loop can fail-fast / quarantine).
         if self.proxy_str:
             from ghost_shell.proxy.forwarder import ProxyForwarder
             self._proxy_forwarder = ProxyForwarder(self.proxy_str)
-            local_port = self._proxy_forwarder.start()
+            try:
+                local_port = self._proxy_forwarder.start()
+            except Exception as _pf_err:
+                logging.warning(
+                    f"[GhostShellBrowser] proxy forwarder failed to start "
+                    f"({type(_pf_err).__name__}: {_pf_err}); clearing "
+                    f"reference so cleanup doesn't get a stuck handle"
+                )
+                try:
+                    self._proxy_forwarder.stop()
+                except Exception:
+                    pass
+                self._proxy_forwarder = None
+                raise
             options.add_argument(f"--proxy-server=http://127.0.0.1:{local_port}")
             options.add_argument("--proxy-bypass-list=<-loopback>")
 
@@ -3122,18 +3196,53 @@ class GhostShellBrowser:
         return new_ip
 
     def check_and_rotate_if_burned(self) -> str | None:
-        """Evaluates current IP status and forces rotation if blacklisted."""
+        """Evaluates current IP status and forces rotation if blacklisted.
+
+        Audit #105 fixes:
+          • #1 (CRITICAL): wrap wait_for_rotation in
+            watchdog_pause/resume — the 60s blocking call here was
+            not protected, so the watchdog's 30s page-title probe
+            could legitimately fail 3× in a row mid-rotation and
+            kill Chrome. force_rotate_ip got the same fix earlier;
+            this code path was missed.
+          • #3 (HIGH): fall back to last_known_ip when live probe
+            fails, same as force_rotate_ip — preserves Recovery #1
+            contract on the burn-detection path.
+        """
         tracker = self.get_rotating_tracker()
         if not tracker: return None
 
         current_ip = tracker.get_current_ip(self.driver)
-        if not current_ip: return None
+        if not current_ip:
+            # Audit #105 #3: live probe failed — fall back to the
+            # tracker's last known IP so burn-detection logic has
+            # SOMETHING to compare against. Without this, a transient
+            # ipify hiccup on a captcha-burned IP made us return
+            # None and continue the run on the dead IP.
+            current_ip = tracker.get_last_known_ip()
+            if current_ip:
+                logging.info(
+                    f"[GhostShellBrowser] live IP probe failed in "
+                    f"check_and_rotate_if_burned — falling back to "
+                    f"last_known_ip={current_ip}"
+                )
+            else:
+                return None
 
         if tracker.is_ip_burned(current_ip):
             logging.warning(f"[GhostShellBrowser] IP {current_ip} flagged as burned. Rotating...")
-            tracker.force_rotate()
-            time.sleep(random.uniform(3, 8))
-            new_ip = tracker.wait_for_rotation(self.driver, current_ip, timeout=60)
+            # Audit #105 #1: pause watchdog for the 60s rotation
+            # window, mirroring force_rotate_ip's pattern. Without
+            # this the watchdog could decide Chrome is unresponsive
+            # while wait_for_rotation legitimately blocks the main
+            # thread, then kill the run mid-rotation.
+            self.watchdog_pause(reason="check_and_rotate_if_burned")
+            try:
+                tracker.force_rotate()
+                time.sleep(random.uniform(3, 8))
+                new_ip = tracker.wait_for_rotation(self.driver, current_ip, timeout=60)
+            finally:
+                self.watchdog_resume()
             if new_ip: current_ip = new_ip
 
         tracker.enrich_ip(current_ip, self.driver)
@@ -3967,11 +4076,18 @@ class GhostShellBrowser:
         # never got that chance — its Preferences still has
         # exited_cleanly=false. On next launch Chrome treats that as a
         # crash and tries to restore tabs (the "9 tabs pile up" bug).
+        # Audit #102 fix: there used to be a duplicate `json.load(f)`
+        # call here (both on the same file pointer). The second call
+        # consumed an already-exhausted stream and raised
+        # JSONDecodeError, which the outer except swallowed silently —
+        # so the exit-cleanly stamp NEVER landed. Result: every run
+        # left exited_cleanly=false in Preferences, and Chrome on the
+        # next launch decided the previous session crashed and
+        # restored tabs (the "9 tabs pile up" symptom users saw).
         try:
             pref_path = os.path.join(self.user_data_path, "Default", "Preferences")
             if os.path.exists(pref_path):
                 with open(pref_path, "r", encoding="utf-8") as f:
-                    prefs = json.load(f)
                     prefs = json.load(f)
                 if isinstance(prefs, dict):
                     prefs.setdefault("profile", {})

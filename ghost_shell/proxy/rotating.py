@@ -370,10 +370,48 @@ class RotatingProxyTracker:
                 )
                 return True
 
-            logging.warning(
-                f"[RotatingProxy] rotation API returned HTTP {r.status_code}: "
-                f"{r.text[:200]}"
-            )
+            # Audit #105 #4: classify error category — auth (4xx
+            # client) vs availability (5xx server) — and surface a
+            # specific actionable hint to the user. Previously every
+            # non-2xx logged the same opaque "rotation API returned
+            # HTTP X" line, which buried things like 401/403 (token
+            # expired) under transient noise.
+            sc = r.status_code
+            body_preview = (r.text or "")[:200]
+            if sc in (401, 403):
+                logging.error(
+                    f"[RotatingProxy] ✗ rotation API auth failed "
+                    f"({sc}) — your API token / API key for "
+                    f"{self.rotation_provider!r} appears to be "
+                    f"INVALID or EXPIRED. Open Dashboard → Proxy → "
+                    f"Edit and refresh the rotation credentials. "
+                    f"Response body: {body_preview!r}"
+                )
+            elif sc == 404:
+                logging.error(
+                    f"[RotatingProxy] ✗ rotation API endpoint not found "
+                    f"({sc}) — check rotation_api_url in Proxy settings "
+                    f"matches your provider's docs. Body: {body_preview!r}"
+                )
+            elif sc == 429:
+                logging.warning(
+                    f"[RotatingProxy] ⚠ rotation rate-limited (429) by "
+                    f"{self.rotation_provider!r} — back off, the next "
+                    f"attempt will retry after the normal cadence. "
+                    f"Body: {body_preview!r}"
+                )
+            elif 500 <= sc < 600:
+                logging.warning(
+                    f"[RotatingProxy] rotation provider transient "
+                    f"error ({sc}) — usually self-resolves; will "
+                    f"retry on the next rotation trigger. "
+                    f"Body: {body_preview!r}"
+                )
+            else:
+                logging.warning(
+                    f"[RotatingProxy] rotation API returned HTTP {sc}: "
+                    f"{body_preview}"
+                )
         except Exception as e:
             logging.error(f"[RotatingProxy] rotation failed: {e}")
         return False
@@ -401,6 +439,21 @@ class RotatingProxyTracker:
         # Exponential-ish backoff: 0.5s, 1s, 2s, 3s, 5s, 5s, ...
         intervals = [0.5, 1.0, 2.0, 3.0, 5.0]
         i = 0
+        # Audit #105 #7: small-pool / sticky-IP early detection.
+        # Some providers serve the SAME exit IP after a rotation
+        # request (small pools, sticky configs). Without this, we
+        # poll for the full timeout (60s) and return None, then
+        # main.py kicks off ANOTHER 60s rotation cycle, totalling
+        # 180s of wait per captcha when CAPTCHA_ROTATE_MAX=3.
+        #
+        # Heuristic: after `same_ip_confidence` (3) consecutive
+        # polls report the same IP at low-back-off intervals (≥3
+        # seconds elapsed), assume the provider re-issued the same
+        # exit and bail early. Caller treats this as "rotation
+        # didn't happen" and can decide to retry with a new
+        # rotation request rather than waiting out the full window.
+        same_ip_streak = 0
+        SAME_IP_BAIL_AFTER = 3
 
         while time.time() - started < timeout:
             wait = intervals[min(i, len(intervals) - 1)]
@@ -410,6 +463,25 @@ class RotatingProxyTracker:
                 logging.info(f"[RotatingProxy] ✓ IP changed: {old_ip} → {current} "
                              f"(in {time.time() - started:.1f}s)")
                 return current
+            if current and current == old_ip:
+                same_ip_streak += 1
+                # Only bail after the provider has had a few seconds
+                # to settle — protects against the "rotated but ipify
+                # cached old answer for 1s" scenario.
+                if (same_ip_streak >= SAME_IP_BAIL_AFTER and
+                        time.time() - started >= 3.0):
+                    logging.warning(
+                        f"[RotatingProxy] same-IP detection: provider "
+                        f"re-issued {old_ip} on {same_ip_streak} "
+                        f"consecutive polls — pool likely sticky / "
+                        f"too small. Bailing after {time.time()-started:.1f}s "
+                        f"instead of waiting out {timeout}s."
+                    )
+                    return None
+            else:
+                # current is None (probe failed) — don't count as
+                # same-ip; let the loop back off and retry.
+                same_ip_streak = 0
             i += 1
 
         logging.warning(f"[RotatingProxy] IP did not change within {timeout}s")
